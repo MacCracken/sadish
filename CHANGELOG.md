@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   verb + point arrays double on overflow instead of capping at
   `SD_PATH_CAP` (256). Verified in `programs/grow_test.cyr` (1000 verbs across
   several grows, data preserved).
+- **Stroking** (`sd_canvas_stroke_path`, `sd_isqrt`, `sd_canvas_fill_union`) —
+  strokes a path with round caps + round joins: a rectangle per flattened
+  segment (perpendicular offset via integer sqrt) + a disc per vertex,
+  MAX-unioned into the coverage so overlaps combine regardless of winding.
+  Curves flatten first; subpaths + close are honored. Verified in
+  `programs/stroke_test.cyr`. (Miter/bevel joins + butt/square caps + piece
+  batching are TODO(v0.5).)
 
 ## [0.3.0] - 2026-07-05
 

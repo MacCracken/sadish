@@ -1,0 +1,54 @@
+# programs/stroke_test.cyr — RUN test for the round-cap/round-join stroker.
+#
+# Strokes a horizontal line and asserts: the stroke band is fully covered at
+# its center, points beyond the band are clear, and the round cap extends past
+# the segment rectangle. Also checks that a zero-width stroke paints nothing.
+# Exit code = failed checks.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # horizontal line (2,4)->(6,4), width 2 (hw=1) -> band y in [3,5] + round caps
+    var cv = sd_canvas_new(8, 8);
+    var p = sd_path_new();
+    sd_path_moveto(p, 2 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(p, 6 * SD_ONE, 4 * SD_ONE);
+    check(sd_canvas_stroke_path(cv, p, 2 * SD_ONE), SADISH_OK);
+
+    check(sd_canvas_coverage_at(cv, 4, 4), 255);   # stroke center
+    check(sd_canvas_coverage_at(cv, 3, 4), 255);
+    check(sd_canvas_coverage_at(cv, 5, 4), 255);
+    check(sd_canvas_coverage_at(cv, 4, 7), 0);     # below the band
+    check(sd_canvas_coverage_at(cv, 4, 0), 0);     # above the band
+
+    # round cap: the disc at (2,4) reaches left of the rect (x < 2)
+    var cap = sd_canvas_coverage_at(cv, 1, 4);
+    if (cap <= 0) { g_fails = g_fails + 1; }
+
+    # zero width strokes nothing
+    var cv2 = sd_canvas_new(8, 8);
+    check(sd_canvas_stroke_path(cv2, p, 0), SADISH_OK);
+    check(sd_canvas_coverage_at(cv2, 4, 4), 0);
+
+    if (g_fails == 0) {
+        var ok = "stroke_test: PASS (round-cap/join stroker)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "stroke_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

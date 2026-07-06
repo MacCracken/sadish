@@ -553,6 +553,20 @@ fn sd_abs(v): i64 {
     return v;
 }
 
+# @public — integer floor square root (Newton's method). n <= 0 -> 0. Note:
+# isqrt of a raw `dx*dx + dy*dy` (16.16 deltas) yields the length in 16.16
+# directly, since (L·2^16)^2 = L^2·2^32 = the raw squared-length.
+fn sd_isqrt(n): i64 {
+    if (n <= 0) { return 0; }
+    var x = n;
+    var y = (x + 1) >> 1;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) >> 1;
+    }
+    return x;
+}
+
 # Multiply two 16.16 fixed-point values -> 16.16. (a*b) has 32 fractional
 # bits; drop back down by SD_SHIFT via the SIGNED shift (sd_asr) so negative
 # products — mirrors, rotations, below-origin coordinates — stay correct.
@@ -1242,8 +1256,20 @@ fn sd_ray_cross(edges, n_edges, sx, sy, signed): i64 {
 # SS*SS grid and cast a +x winding ray per sub-sample; coverage is the
 # fraction of sub-samples inside.
 # ================================================================
-# @public
+# @public — fill `path`'s AA coverage into `cv`, OVERWRITING the buffer.
 fn sd_canvas_fill_path(cv, path, rule): i64 {
+    return sd_fill_impl(cv, path, rule, 0);
+}
+
+# @public — fill `path`'s AA coverage, MAX-combined into the existing coverage
+# (a union of shapes — orientation-independent for convex pieces; used by the
+# stroker to accumulate overlapping segment rects + join discs).
+fn sd_canvas_fill_union(cv, path, rule): i64 {
+    return sd_fill_impl(cv, path, rule, 1);
+}
+
+# combine: 0 = overwrite the coverage buffer, 1 = max into it (union).
+fn sd_fill_impl(cv, path, rule, combine): i64 {
     if (cv == 0) { return SADISH_ERR_BOUNDS; }
     if (path == 0) { return SADISH_ERR_EMPTY_PATH; }
     var n_verbs = sd_path_verb_count(path);
@@ -1356,7 +1382,12 @@ fn sd_canvas_fill_path(cv, path, rule): i64 {
                 }
                 syi = syi + 1;
             }
-            store8(cov + py * stride + px, (incount * 255) / samples);
+            var c = (incount * 255) / samples;
+            if (combine != 0) {
+                var oldc = load8(cov + py * stride + px);
+                if (c < oldc) { c = oldc; }
+            }
+            store8(cov + py * stride + px, c);
             px = px + 1;
         }
         py = py + 1;
@@ -1497,6 +1528,168 @@ fn sd_canvas_blit_gradient(cv, surface, x0, y0, c0, x1, y1, c1): i64 {
         }
         y = y + 1;
     }
+    return SADISH_OK;
+}
+
+# ---- stroking (v0.4.0) -----------------------------------------
+# A segment's rectangle: offset both endpoints by `hw` along the segment's
+# perpendicular (magnitude via sd_isqrt), fill-union it. Round caps + round
+# joins come from a disc at every vertex, so no bevel/miter math is needed.
+# Each piece is MAX-unioned so overlaps combine regardless of winding.
+fn sd_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
+    var dx = bx - ax;
+    var dy = by - ay;
+    var len2 = dx * dx + dy * dy;
+    if (len2 == 0) { return 0; }     # zero-length -> the vertex disc covers it
+    var l = sd_isqrt(len2);          # length in 16.16
+    if (l == 0) { return 0; }
+    var ox = ((0 - dy) * hw) / l;    # perpendicular offset, magnitude hw
+    var oy = (dx * hw) / l;
+    var rp = sd_path_new();
+    sd_path_moveto(rp, ax + ox, ay + oy);
+    sd_path_lineto(rp, bx + ox, by + oy);
+    sd_path_lineto(rp, bx - ox, by - oy);
+    sd_path_lineto(rp, ax - ox, ay - oy);
+    sd_path_close(rp);
+    sd_canvas_fill_union(cv, rp, SD_FILL_NONZERO);
+    return 0;
+}
+
+# A radius-hw disc (16-gon) at (cx, cy) — round cap / round join filler.
+fn sd_stroke_disc(cv, cx, cy, hw): i64 {
+    var dp = sd_path_new();
+    var step = 411775 / 16;          # 2*pi / 16 in 16.16
+    var k = 0;
+    while (k < 16) {
+        var ang = k * step;
+        var px = cx + sd_fixed_mul(hw, sd_cos(ang));
+        var py = cy + sd_fixed_mul(hw, sd_sin(ang));
+        if (k == 0) { sd_path_moveto(dp, px, py); } else { sd_path_lineto(dp, px, py); }
+        k = k + 1;
+    }
+    sd_path_close(dp);
+    sd_canvas_fill_union(cv, dp, SD_FILL_NONZERO);
+    return 0;
+}
+
+# Append a flatten ctx's points to the run buffer (bounded by SD_FLATTEN_CAP).
+fn sd_stroke_append(run, run_n, fctx): i64 {
+    var pts = load64(fctx + 0);
+    var n = load64(fctx + 8);
+    var i = 0;
+    while (i < n) {
+        if (run_n < SD_FLATTEN_CAP) {
+            store64(run + run_n * 8, load64(pts + i * 8));
+            run_n = run_n + 1;
+        }
+        i = i + 1;
+    }
+    return run_n;
+}
+
+# Stroke one flattened subpath run: a rect per segment + a disc per vertex.
+fn sd_stroke_run(cv, run, n, closed, hw): i64 {
+    var i = 0;
+    while (i < n - 1) {
+        var a = load64(run + i * 8);
+        var b = load64(run + (i + 1) * 8);
+        sd_stroke_seg(cv, sd_point_x(a), sd_point_y(a), sd_point_x(b), sd_point_y(b), hw);
+        i = i + 1;
+    }
+    if (closed != 0) {
+        if (n > 1) {
+            var a2 = load64(run + (n - 1) * 8);
+            var b2 = load64(run + 0);
+            sd_stroke_seg(cv, sd_point_x(a2), sd_point_y(a2), sd_point_x(b2), sd_point_y(b2), hw);
+        }
+    }
+    var k = 0;
+    while (k < n) {
+        var v = load64(run + k * 8);
+        sd_stroke_disc(cv, sd_point_x(v), sd_point_y(v), hw);
+        k = k + 1;
+    }
+    return 0;
+}
+
+# ================================================================
+# sd_canvas_stroke_path — stroke `path` with the given `width` (16.16) onto
+# `cv`'s coverage, with round caps + round joins. Flattens curves, then per
+# subpath draws a rectangle per segment and a disc per vertex, MAX-combined
+# into the coverage buffer.
+#
+# TODO(v0.5): miter/bevel joins + butt/square caps; batch the pieces — this
+# allocs a path + a fill pass per segment/vertex (correctness-first).
+# ================================================================
+# @public
+fn sd_canvas_stroke_path(cv, path, width): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (path == 0) { return SADISH_ERR_EMPTY_PATH; }
+    var n_verbs = sd_path_verb_count(path);
+    if (n_verbs == 0) { return SADISH_ERR_EMPTY_PATH; }
+    var hw = sd_asr(width, 1);
+    if (hw <= 0) { return SADISH_OK; }
+    var tol = SD_ONE >> 2;
+
+    var run = alloc(SD_FLATTEN_CAP * 8);
+    var run_n = 0;
+    var fbuf = alloc(SD_FLATTEN_CAP * 8);
+    var fctx = alloc(24);
+
+    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
+    var points = load64(path + SD_PATH_POINTS_OFFSET);
+    var cur = 0;
+    var closed = 0;
+    var vi = 0;
+    var pi = 0;
+    while (vi < n_verbs) {
+        var verb = load64(verbs + vi * 8);
+        if (verb == SD_VERB_MOVETO) {
+            if (run_n > 0) { sd_stroke_run(cv, run, run_n, closed, hw); }
+            run_n = 0;
+            closed = 0;
+            cur = load64(points + pi * 8);
+            store64(run + run_n * 8, cur);
+            run_n = run_n + 1;
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_LINETO) {
+            cur = load64(points + pi * 8);
+            if (run_n < SD_FLATTEN_CAP) {
+                store64(run + run_n * 8, cur);
+                run_n = run_n + 1;
+            }
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_QUADTO) {
+            var qc = load64(points + pi * 8);
+            var qe = load64(points + (pi + 1) * 8);
+            store64(fctx + 0, fbuf);
+            store64(fctx + 8, 0);
+            store64(fctx + 16, SD_FLATTEN_CAP);
+            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
+            run_n = sd_stroke_append(run, run_n, fctx);
+            cur = qe;
+            pi = pi + 2;
+        }
+        if (verb == SD_VERB_CUBICTO) {
+            var k1 = load64(points + pi * 8);
+            var k2 = load64(points + (pi + 1) * 8);
+            var ke = load64(points + (pi + 2) * 8);
+            store64(fctx + 0, fbuf);
+            store64(fctx + 8, 0);
+            store64(fctx + 16, SD_FLATTEN_CAP);
+            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
+            run_n = sd_stroke_append(run, run_n, fctx);
+            cur = ke;
+            pi = pi + 3;
+        }
+        if (verb == SD_VERB_CLOSE) {
+            closed = 1;
+        }
+        vi = vi + 1;
+    }
+    if (run_n > 0) { sd_stroke_run(cv, run, run_n, closed, hw); }
     return SADISH_OK;
 }
 

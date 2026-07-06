@@ -30,6 +30,20 @@ fn sd_abs(v): i64 {
     return v;
 }
 
+# @public — integer floor square root (Newton's method). n <= 0 -> 0. Note:
+# isqrt of a raw `dx*dx + dy*dy` (16.16 deltas) yields the length in 16.16
+# directly, since (L·2^16)^2 = L^2·2^32 = the raw squared-length.
+fn sd_isqrt(n): i64 {
+    if (n <= 0) { return 0; }
+    var x = n;
+    var y = (x + 1) >> 1;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) >> 1;
+    }
+    return x;
+}
+
 # Multiply two 16.16 fixed-point values -> 16.16. (a*b) has 32 fractional
 # bits; drop back down by SD_SHIFT via the SIGNED shift (sd_asr) so negative
 # products — mirrors, rotations, below-origin coordinates — stay correct.
