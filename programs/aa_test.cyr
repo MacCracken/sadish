@@ -1,0 +1,60 @@
+# programs/aa_test.cyr — RUN test proving analytic sub-pixel horizontal AA.
+#
+# A vertical edge at a fractional x gives that pixel a coverage equal to the
+# exact covered fraction — values the old 4x4 supersampler (quantized to 1/4
+# steps: 0, 63, 127, 191, 255) could not produce. Exit code = failed checks.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn between(got, lo, hi): i64 {
+    if (got < lo) { g_fails = g_fails + 1; return 1; }
+    if (got > hi) { g_fails = g_fails + 1; return 1; }
+    return 0;
+}
+
+# a rectangle [0 .. edge] x [0 .. 8]
+fn vbar(edge): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0, 0);
+    sd_path_lineto(p, edge, 0);
+    sd_path_lineto(p, edge, 8 * SD_ONE);
+    sd_path_lineto(p, 0, 8 * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # right edge at x = 4.3 -> pixel 4 is 0.3 covered -> ~76 (0.3 * 255)
+    var cv = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(cv, vbar(4 * SD_ONE + (3 * SD_ONE) / 10), SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(cv, 3, 4), 255);   # fully inside
+    check(sd_canvas_coverage_at(cv, 5, 4), 0);     # fully outside
+    between(sd_canvas_coverage_at(cv, 4, 4), 70, 82);   # ~76, NOT 63
+
+    # right edge at x = 4.7 -> pixel 4 is 0.7 covered -> ~178
+    var cv2 = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(cv2, vbar(4 * SD_ONE + (7 * SD_ONE) / 10), SD_FILL_NONZERO);
+    between(sd_canvas_coverage_at(cv2, 4, 4), 170, 185);   # ~178, NOT 191
+
+    if (g_fails == 0) {
+        var ok = "aa_test: PASS (analytic sub-pixel coverage)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "aa_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

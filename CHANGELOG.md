@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   path into the active clip, fills + strokes are multiplied by the mask, pop
   restores. Verified in `programs/clip_test.cyr` (nested intersect + pop).
 
+### Changed
+- **Analytic coverage rasterizer** — the fill core (`sd_fill_impl`) now
+  computes coverage ANALYTICALLY in x (exact horizontal span overlap via
+  `sd_span_add`) across `SD_FILL_SS` vertical sub-scanlines, replacing the 4×4
+  point supersampling. Smoother sub-pixel AA (no longer quantized to 17 levels)
+  and much cheaper — edge crossings are computed per row, not per pixel. Every
+  fill / stroke / clip inherits it; the whole suite stays green. Verified in
+  `programs/aa_test.cyr` (0.3 and 0.7 edge coverage → 76 / 178, which the
+  supersampler could not produce). Full 2-axis signed-area accumulation is
+  TODO(v0.5).
+
 ## [0.3.0] - 2026-07-05
 
 The rasterizer — the vector core comes alive. Paths now flatten, fill to

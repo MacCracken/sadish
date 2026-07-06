@@ -1179,9 +1179,11 @@ fn sd_canvas_clear(cv): i64 {
 }
 
 # ---- fill internals --------------------------------------------
-# Supersampling factor per axis (SS*SS samples/pixel -> 0..255 coverage).
-# TODO(v0.4): replace supersampling with an analytic signed-area cell
-# accumulator (stb_truetype / FreeType-smooth) for smoother AA at lower cost.
+# Vertical sub-scanlines per pixel row. Coverage is ANALYTIC in x (exact
+# horizontal span overlap per sub-scanline) and sampled in y at SD_FILL_SS
+# sub-scanlines — smoother AND far cheaper than the old SS*SS point sampling
+# (edge crossings are computed per row, not per pixel).
+# TODO(v0.5): full 2-axis analytic signed-area cell accumulation.
 var SD_FILL_SS = 4;
 
 # Edge builder ctx: +0 edges(ptr, 4 i64/edge: ax,ay,bx,by)  +8 count  +16 cap.
@@ -1247,6 +1249,43 @@ fn sd_ray_cross(edges, n_edges, sx, sy, signed): i64 {
         ei = ei + 1;
     }
     return acc;
+}
+
+# Add analytic horizontal coverage for a covered span [xs, xe] (16.16 pixel-x)
+# to the per-row accumulator `accrow`, weighted by `weight` (coverage per full
+# pixel for one sub-scanline). Each touched pixel gets weight * overlap-width.
+fn sd_span_add(accrow, w, xs, xe, weight): i64 {
+    if (xe <= xs) { return 0; }
+    var lo = xs;
+    if (lo < 0) { lo = 0; }
+    var wmax = w << SD_SHIFT;
+    var hi = xe;
+    if (hi > wmax) { hi = wmax; }
+    if (hi <= lo) { return 0; }
+    var px = lo >> SD_SHIFT;
+    var stop = 0;
+    while (stop == 0) {
+        if (px >= w) {
+            stop = 1;
+        } else {
+            var pl = px << SD_SHIFT;
+            if (pl >= hi) {
+                stop = 1;
+            } else {
+                var pr = (px + 1) << SD_SHIFT;
+                var a = lo;
+                if (a < pl) { a = pl; }
+                var b = hi;
+                if (b > pr) { b = pr; }
+                if (b > a) {
+                    var add = sd_fixed_mul(weight, b - a);
+                    store64(accrow + px * 8, load64(accrow + px * 8) + add);
+                }
+                px = px + 1;
+            }
+        }
+    }
+    return 0;
 }
 
 # ================================================================
@@ -1356,36 +1395,101 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     var edges = load64(ectx + 0);
     if (n_edges == 0) { return SADISH_OK; }
 
-    # ---- supersampled coverage ----
+    # ---- analytic-horizontal coverage, SD_FILL_SS vertical sub-scanlines ----
     var want_signed = 0;
     if (rule == SD_FILL_NONZERO) { want_signed = 1; }
-    var ss = SD_FILL_SS;
-    var samples = ss * ss;
+    var ssy = SD_FILL_SS;
+    var weight = SD_ONE / ssy;         # coverage per full pixel per sub-scanline
+    var accrow = alloc(w * 8);          # per-row fractional coverage (16.16)
+    var cross = alloc(n_edges * 16);    # (x, dir) crossings per sub-scanline
 
     var py = 0;
     while (py < h) {
+        var zi = 0;
+        while (zi < w) {
+            store64(accrow + zi * 8, 0);
+            zi = zi + 1;
+        }
+
+        var s = 0;
+        while (s < ssy) {
+            var sy = (py << SD_SHIFT) + (s * SD_ONE + (SD_ONE >> 1)) / ssy;
+            # gather crossings at this sub-scanline
+            var nc = 0;
+            var ei = 0;
+            while (ei < n_edges) {
+                var e = edges + ei * 32;
+                var ay = load64(e + 8);
+                var by = load64(e + 24);
+                var ylo = ay;
+                var yhi = by;
+                var dir = 1;
+                if (ay > by) { ylo = by; yhi = ay; dir = 0 - 1; }
+                if (sy >= ylo) {
+                    if (sy < yhi) {
+                        var ax = load64(e + 0);
+                        var bx = load64(e + 16);
+                        var xx = ax + ((bx - ax) * (sy - ay)) / (by - ay);
+                        store64(cross + nc * 16, xx);
+                        store64(cross + nc * 16 + 8, dir);
+                        nc = nc + 1;
+                    }
+                }
+                ei = ei + 1;
+            }
+            # insertion sort crossings by x
+            var a = 1;
+            while (a < nc) {
+                var kx = load64(cross + a * 16);
+                var kd = load64(cross + a * 16 + 8);
+                var b = a - 1;
+                var stop = 0;
+                while (stop == 0) {
+                    if (b < 0) {
+                        stop = 1;
+                    } else {
+                        if (load64(cross + b * 16) > kx) {
+                            store64(cross + (b + 1) * 16, load64(cross + b * 16));
+                            store64(cross + (b + 1) * 16 + 8, load64(cross + b * 16 + 8));
+                            b = b - 1;
+                        } else {
+                            stop = 1;
+                        }
+                    }
+                }
+                store64(cross + (b + 1) * 16, kx);
+                store64(cross + (b + 1) * 16 + 8, kd);
+                a = a + 1;
+            }
+            # walk crossings -> covered spans -> analytic horizontal coverage
+            var wind = 0;
+            var ci = 0;
+            while (ci < nc - 1) {
+                if (want_signed != 0) {
+                    wind = wind + load64(cross + ci * 16 + 8);
+                } else {
+                    wind = wind + 1;
+                }
+                var inside = 0;
+                if (want_signed != 0) {
+                    if (wind != 0) { inside = 1; }
+                } else {
+                    if ((wind & 1) != 0) { inside = 1; }
+                }
+                if (inside != 0) {
+                    sd_span_add(accrow, w, load64(cross + ci * 16), load64(cross + (ci + 1) * 16), weight);
+                }
+                ci = ci + 1;
+            }
+            s = s + 1;
+        }
+
+        # accumulator row -> coverage bytes (with clip + combine)
         var px = 0;
         while (px < w) {
-            var incount = 0;
-            var syi = 0;
-            while (syi < ss) {
-                var sy = (py << SD_SHIFT) + (syi * SD_ONE + (SD_ONE >> 1)) / ss;
-                var sxi = 0;
-                while (sxi < ss) {
-                    var sx = (px << SD_SHIFT) + (sxi * SD_ONE + (SD_ONE >> 1)) / ss;
-                    var acc = sd_ray_cross(edges, n_edges, sx, sy, want_signed);
-                    var inside = 0;
-                    if (want_signed != 0) {
-                        if (acc != 0) { inside = 1; }
-                    } else {
-                        if ((acc & 1) != 0) { inside = 1; }
-                    }
-                    incount = incount + inside;
-                    sxi = sxi + 1;
-                }
-                syi = syi + 1;
-            }
-            var c = (incount * 255) / samples;
+            var cvg = load64(accrow + px * 8);
+            var c = (cvg * 255) >> SD_SHIFT;
+            if (c > 255) { c = 255; }
             var clipnode = load64(cv + SD_CANVAS_CLIP_OFFSET);
             if (clipnode != 0) {
                 c = (c * load8(load64(clipnode + 0) + py * stride + px)) / 255;
