@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.1.0
+Version: 0.2.0
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -26,33 +26,44 @@ toolkit are all **consumers**, not re-implementations.
   fn signatures compile and link), the algorithm bodies are stubs marked
   `# TODO(v0.x)`:
   - **`src/geom.cyr`** — `SdPoint` (x, y as 16.16 fixed-point) and
-    `SdMatrix` (2×3 affine a,b,c,d,e,f). `sd_point_new`/`_x`/`_y`;
-    `sd_matrix_identity`/`_translate`/`_scale`/`_mul`/`_apply`. Identity,
-    translate, scale, compose, and point-transform are **live** (exact
-    fixed-point). Rotate / skew are TODO(v0.2).
+    `SdMatrix` (2×3 affine a,b,c,d,e,f). Identity, translate, scale,
+    compose, and point-transform are **live** (exact fixed-point). Rotate
+    / skew are TODO(v0.3).
   - **`src/path.cyr`** — `SdPath` (growable verb + point streams).
     `sd_path_new`/`_moveto`/`_lineto`/`_quadto`/`_cubicto`/`_close`, all
     live. `sd_path_flatten(path, tol) -> SdPolyline` is a **stub** that
-    copies moveto/lineto anchors 1:1 and keeps curve end points without
-    subdivision. Adaptive Bézier subdivision (de Casteljau) is TODO(v0.2).
-  - **`src/raster.cyr`** — `SdCanvas` (width, height, owned width×height
-    coverage buffer). `sd_canvas_new`/`_clear`/`_coverage_at` are live;
-    `sd_canvas_fill_path(cv, path, rule)` flattens + validates then
-    returns `SADISH_OK` (no coverage written yet); `sd_canvas_blit` is a
-    validated no-op. Scanline coverage accumulation + AA and the src-over
-    / gradient blit are TODO(v0.2).
-  - **`src/error.cyr`** — `SadishErr` (16-byte record): `SADISH_OK` /
-    `_ERR_OOM` / `_ERR_EMPTY_PATH` / `_ERR_BOUNDS` / `_ERR_UNSUPPORTED` /
-    `_ERR_OTHER`, with `sadish_err_new`/`_err`/`_err_code`/`_err_detail`/
-    `_err_name`.
-  - **`programs/smoke.cyr`** — link-check entry proving the include chain
-    (stdlib + domain modules) parses and links; writes a banner, exits 0.
-- **v0.2.0 — the rasterizer.** Adaptive Bézier flattening, the scanline
+    copies moveto/lineto anchors without subdivision. Adaptive Bézier
+    subdivision (de Casteljau) is TODO(v0.3).
+  - **`src/raster.cyr`** — `SdCanvas` (owned width×height coverage
+    buffer). `sd_canvas_new`/`_clear`/`_coverage_at` are live;
+    `sd_canvas_fill_path` flattens + validates then returns `SADISH_OK`
+    (no coverage written yet); `sd_canvas_blit` is a validated no-op.
+    Scanline coverage accumulation + AA and the src-over / gradient blit
+    are TODO(v0.3).
+  - **`src/error.cyr`** — `SadishErr` (16-byte record) + the `SADISH_*`
+    codes and `sadish_err_*` helpers.
+  - **`programs/smoke.cyr`** — link-check entry.
+- **v0.2.0 — surface + direct primitives + present (shipped).** The
+  "easy 80%" lifted from the ecosystem's framebuffer games (see
+  `docs/development/prior-art.md`), CI-gated and RUN-tested:
+  - **`src/surface.cyr`** — `SdSurface`, a 32bpp BGRA pixel buffer (packed
+    `0x00RRGGBB`, top-left y-down), `sd_rgb` + channel extractors, pixel
+    readback.
+  - **`src/draw.cyr`** — the opaque integer-pixel primitives: `sd_plot`,
+    `sd_line` (integer Bresenham), `sd_hline`, `sd_vline`, `sd_rect`,
+    `sd_fill_rect`, `sd_clear`.
+  - **`src/present.cyr`** — `sd_surface_write_ppm` (P6 PPM, headless/CI)
+    and the Linux `/dev/fb0` `SdPresenter` (probe → integer-scale →
+    center-letterbox → pitch-honoring blit; 32bpp + RGB565).
+  - Tests: `programs/draw_test.cyr` (pixel-readback) and
+    `programs/present_test.cyr` (PPM write + readback).
+- **v0.3.0 — the rasterizer.** Adaptive Bézier flattening, the scanline
   signed-area coverage pass (even-odd + nonzero) with anti-aliased 0..255
-  coverage, and the src-over solid + gradient blit (with the AGNOS
-  `blit#39` fast path). This is where sadish stops being a scaffold.
+  coverage, and the src-over solid + gradient blit compositing coverage
+  onto an `SdSurface` (with the AGNOS `blit#39` fast path). This is where
+  the vector core (paths → coverage) comes alive.
 - **Later (tracked, not silently dropped):** matrix rotate/skew, clip
-  paths / clip stack, stroking (a stroke → fill-path expansion), and dash
+  paths / clip stack, stroking (stroke → fill-path expansion), and dash
   patterns.
 
 ## Place in the stack
@@ -63,14 +74,14 @@ stdlib). It is the bottom of the vector-graphics tower:
 ```
   dhancha (UI toolkit) ─┐
   SVG / canvas / compositing ─┤
-  rekha (font outlines) ──────┴─▶ sadish  (this repo: paths + rasterizer + coverage)
+  rekha (font outlines) ──────┴─▶ sadish  (this repo: surface + primitives + paths + rasterizer)
                                      │
                                      ▼
                           coverage buffer ─▶ blit#39 (AGNOS) / host framebuffer
 ```
 
-Everything above consumes sadish's path API and coverage buffer; none of
-them re-implement rasterization.
+Everything above consumes sadish's surface + path API and coverage buffer;
+none of them re-implement rasterization.
 
 ## Consumers
 
@@ -80,9 +91,10 @@ them re-implement rasterization.
 - A canvas / drawing API, compositing, and SVG layers (planned) sit on the
   same core.
 
-No live consumer depends on sadish yet (it is a fresh scaffold);
-downstream repos pull `dist/sadish.cyr` via a `[deps.sadish]` git-tag
-entry once the v0.2 rasterizer lands.
+No live consumer depends on sadish yet; downstream repos pull
+`dist/sadish.cyr` via a `[deps.sadish]` git-tag entry. The direct
+primitives + present backend are usable at **v0.2.0**; the vector
+rasterizer lands at **v0.3.0**.
 
 ## Dependencies
 
@@ -96,9 +108,14 @@ All deps are pinned in `cyrius.cyml`; the toolchain pin is
 ## Quick Start
 
 ```bash
-cyrius deps                                        # resolve stdlib into lib/
-cyrius build programs/smoke.cyr build/sadish-smoke  # link-check
-./build/sadish-smoke                                # prints the banner
+cyrius deps                                         # resolve stdlib into lib/
+cyrius build programs/smoke.cyr build/sadish-smoke   # link-check
+./build/sadish-smoke                                 # prints the banner
+
+cyrius build programs/draw_test.cyr build/draw_test  # primitives RUN test
+./build/draw_test                                    # -> draw_test: PASS
+cyrius build programs/present_test.cyr build/present_test
+./build/present_test                                 # -> present_test: PASS
 ```
 
 ## License
