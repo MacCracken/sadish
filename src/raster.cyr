@@ -1,0 +1,153 @@
+# @public — sadish rasterizer: path -> coverage buffer -> blit.
+#
+# raster.cyr — an SdCanvas owns a width*height coverage buffer (one byte
+# of anti-aliased coverage per pixel, 0..255). The fill entry takes a
+# flattened path and a winding rule and accumulates coverage; the blit
+# entry hands that coverage to a destination framebuffer (the kernel
+# blit#39 on AGNOS, or a host framebuffer under test).
+#
+# The coverage buffer is a separate, format-neutral stage on purpose: a
+# consumer (canvas/compositing/SVG/UI) chooses how to turn coverage +
+# a paint (solid color / gradient) into destination pixels. sadish's job
+# ends at coverage + a reference solid blit.
+
+# ---- winding rules ----------------------------------------------
+var SD_FILL_EVEN_ODD = 0;
+var SD_FILL_NONZERO  = 1;
+
+# ================================================================
+# SdCanvas (32 bytes):
+#   +0:  width      (i64 — pixels)
+#   +8:  height     (i64 — pixels)
+#   +16: coverage   (ptr — owned width*height bytes, one coverage per px)
+#   +24: stride     (i64 — bytes per row; == width for the packed buffer)
+# ================================================================
+var SD_CANVAS_WIDTH_OFFSET    = 0;
+var SD_CANVAS_HEIGHT_OFFSET   = 8;
+var SD_CANVAS_COVERAGE_OFFSET = 16;
+var SD_CANVAS_STRIDE_OFFSET   = 24;
+var SD_CANVAS_SIZE            = 32;
+
+# @public — allocate a w*h canvas with a zeroed coverage buffer.
+# Returns the SdCanvas ptr, or 0 on OOM / bad dimensions.
+fn sd_canvas_new(w, h): i64 {
+    if (w <= 0) { return 0; }
+    if (h <= 0) { return 0; }
+    var cv = alloc(SD_CANVAS_SIZE);
+    if (cv == 0) { return 0; }
+    var n = w * h;
+    var cov = alloc(n);
+    if (cov == 0) { return 0; }
+    # Zero the coverage buffer (alloc is not guaranteed zeroed).
+    var i = 0;
+    while (i < n) {
+        store8(cov + i, 0);
+        i = i + 1;
+    }
+    store64(cv + SD_CANVAS_WIDTH_OFFSET, w);
+    store64(cv + SD_CANVAS_HEIGHT_OFFSET, h);
+    store64(cv + SD_CANVAS_COVERAGE_OFFSET, cov);
+    store64(cv + SD_CANVAS_STRIDE_OFFSET, w);
+    return cv;
+}
+
+# ---- accessors --------------------------------------------------
+# @public
+fn sd_canvas_width(cv): i64    { return load64(cv + SD_CANVAS_WIDTH_OFFSET); }
+# @public
+fn sd_canvas_height(cv): i64   { return load64(cv + SD_CANVAS_HEIGHT_OFFSET); }
+# @public
+fn sd_canvas_coverage(cv): i64 { return load64(cv + SD_CANVAS_COVERAGE_OFFSET); }
+# @public
+fn sd_canvas_stride(cv): i64   { return load64(cv + SD_CANVAS_STRIDE_OFFSET); }
+
+# Coverage of one pixel (0 if out of bounds).
+fn sd_canvas_coverage_at(cv, x, y): i64 {
+    var w = load64(cv + SD_CANVAS_WIDTH_OFFSET);
+    var h = load64(cv + SD_CANVAS_HEIGHT_OFFSET);
+    if (x < 0) { return 0; }
+    if (y < 0) { return 0; }
+    if (x >= w) { return 0; }
+    if (y >= h) { return 0; }
+    var cov = load64(cv + SD_CANVAS_COVERAGE_OFFSET);
+    var stride = load64(cv + SD_CANVAS_STRIDE_OFFSET);
+    return load8(cov + y * stride + x);
+}
+
+# @public — zero the coverage buffer (reuse a canvas across draws).
+fn sd_canvas_clear(cv): i64 {
+    var w = load64(cv + SD_CANVAS_WIDTH_OFFSET);
+    var h = load64(cv + SD_CANVAS_HEIGHT_OFFSET);
+    var cov = load64(cv + SD_CANVAS_COVERAGE_OFFSET);
+    var n = w * h;
+    var i = 0;
+    while (i < n) {
+        store8(cov + i, 0);
+        i = i + 1;
+    }
+    return SADISH_OK;
+}
+
+# ================================================================
+# sd_canvas_fill_path — rasterize `path` into the canvas coverage buffer
+# under winding rule `rule` (SD_FILL_EVEN_ODD | SD_FILL_NONZERO).
+#
+# v0.1 STUB: flattens the path (proving the path->raster handoff links)
+# and returns SADISH_OK without writing coverage yet. An empty path is
+# reported as SADISH_ERR_EMPTY_PATH so the contract is real from day one.
+#
+# TODO(v0.2): the scanline coverage accumulator — build an active-edge
+# table from the flattened polyline, walk scanlines top-to-bottom,
+# compute per-pixel signed area coverage (a signed-area / cell approach in
+# the mould of stb_truetype's rasterizer and FreeType's smooth renderer),
+# apply the winding rule (even-odd = parity of crossings; nonzero = sum of
+# signed windings != 0), and store 0..255 anti-aliased coverage per pixel.
+# ================================================================
+# @public
+fn sd_canvas_fill_path(cv, path, rule): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (path == 0) { return SADISH_ERR_EMPTY_PATH; }
+    var n_verbs = sd_path_verb_count(path);
+    if (n_verbs == 0) { return SADISH_ERR_EMPTY_PATH; }
+
+    # Flatten to a polyline (curve verbs -> line segments). tol = 1/4 px.
+    var tol = SD_ONE >> 2;
+    var pl = sd_path_flatten(path, tol);
+    if (pl == 0) { return SADISH_ERR_EMPTY_PATH; }
+
+    # TODO(v0.2): consume `pl` + `rule` into the scanline coverage pass.
+    # For now the handoff is proven and coverage is left at its cleared
+    # state.
+    return SADISH_OK;
+}
+
+# ================================================================
+# sd_canvas_blit — composite the canvas coverage onto a destination
+# framebuffer `fb` (width*height packed pixels) using solid color `rgba`
+# (0xRRGGBBAA), coverage-scaling the source alpha.
+#
+# v0.1 STUB: validates the arguments and returns SADISH_OK. On AGNOS this
+# will drive the kernel blit#39; on a host it writes into a linear
+# framebuffer.
+#
+# TODO(v0.2): src-over composite of (rgba scaled by per-pixel coverage/255)
+# onto `fb`; add a gradient-paint variant (linear/radial) alongside the
+# solid path, and route the whole-canvas fast path through blit#39 on
+# AGNOS.
+# ================================================================
+# @public
+fn sd_canvas_blit(cv, fb, rgba): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (fb == 0) { return SADISH_ERR_BOUNDS; }
+    # TODO(v0.2): per-pixel src-over using coverage as alpha.
+    return SADISH_OK;
+}
+
+# ================================================================
+# Version probe — packed as major*10000 + minor*100 + patch.
+# 0.1.0 -> 100.
+# ================================================================
+# @public
+fn sadish_version(): i64 {
+    return 100;
+}

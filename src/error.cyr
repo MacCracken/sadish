@@ -1,0 +1,72 @@
+# @public — stable API surface for sadish error handling.
+# error.cyr — sadish vector-graphics error codes + Result helpers.
+#
+# SadishErr is a 16-byte record. Error codes are integer constants; for
+# errors that carry context (a message pointer), use sadish_err_new(code,
+# msg). The (ptr, err_out) Ok/Err split mirrors the ecosystem's raster
+# libs (chitra) so a consumer maps a failure cleanly onto its own error.
+#
+# SadishErr struct layout (16 bytes):
+#   +0: code    — error code constant (one of the SADISH_* below)
+#   +8: detail  — pointer to detail string (or 0)
+
+# ================================================================
+# Error code constants
+# ================================================================
+
+enum SadishErrCode {
+    SADISH_OK              = 0;   # no error
+    SADISH_ERR_OOM         = 1;   # allocation failed / capacity cap hit
+    SADISH_ERR_EMPTY_PATH  = 2;   # fill/flatten on a path with no verbs
+    SADISH_ERR_BOUNDS      = 3;   # coordinate / canvas index out of range
+    SADISH_ERR_UNSUPPORTED = 4;   # a valid request sadish can't yet honor
+    SADISH_ERR_OTHER       = 99;  # catch-all
+}
+
+# ================================================================
+# SadishErr struct
+# ================================================================
+
+# Create a SadishErr with code and an optional detail string (0 = none).
+fn sadish_err_new(code, detail): i64 {
+    var e = alloc(16);
+    store64(e, code);
+    store64(e + 8, detail);
+    return e;
+}
+
+# Create a SadishErr with code only (no detail).
+fn sadish_err(code): i64 {
+    return sadish_err_new(code, 0);
+}
+
+# Get the error code.
+fn sadish_err_code(e): i64 {
+    return load64(e);
+}
+
+# Get the detail string pointer (or 0).
+fn sadish_err_detail(e): i64 {
+    return load64(e + 8);
+}
+
+# ================================================================
+# Error name lookup — returns a cstring (never null).
+# ================================================================
+
+fn sadish_err_name(code): i64 {
+    if (code == SADISH_OK)              { return "ok"; }
+    if (code == SADISH_ERR_OOM)         { return "out of memory"; }
+    if (code == SADISH_ERR_EMPTY_PATH)  { return "empty path"; }
+    if (code == SADISH_ERR_BOUNDS)      { return "out of bounds"; }
+    if (code == SADISH_ERR_UNSUPPORTED) { return "unsupported feature"; }
+    if (code == SADISH_ERR_OTHER)       { return "other error"; }
+    return "unknown error";
+}
+
+# Print an error name to stderr (fd 2).
+fn sadish_err_print_name(code): i64 {
+    var name = sadish_err_name(code);
+    syscall(1, 2, name, strlen(name));
+    return 0;
+}

@@ -1,0 +1,132 @@
+# @public — sadish geometry primitives: points + affine matrices.
+#
+# geom.cyr — the fixed-point coordinate substrate for the whole
+# rasterizer. Everything-is-i64, so sub-pixel coordinates use 16.16
+# signed fixed-point: the low 16 bits are the fraction, the high bits the
+# integer part. 1.0 == SD_ONE (65536); an integer pixel n == n << 16.
+# This keeps the entire vector pipeline (paths, flattening, transforms,
+# scanline coverage) in exact integer arithmetic — no float in the core.
+
+# ---- 16.16 fixed-point scale ------------------------------------
+# 1.0 in 16.16. Shift a plain integer pixel value left by SD_SHIFT to
+# lift it into fixed-point; shift right to drop back to whole pixels.
+var SD_SHIFT = 16;
+var SD_ONE   = 65536;    # 1 << 16
+
+# Multiply two 16.16 fixed-point values -> 16.16.
+# (a*b) has 32 fractional bits; shift back down by SD_SHIFT.
+# TODO(v0.2): 64-bit intermediate is fine for on-canvas magnitudes; add a
+# saturating variant once large user transforms are in scope.
+fn sd_fixed_mul(a, b): i64 {
+    return (a * b) >> SD_SHIFT;
+}
+
+# ================================================================
+# SdPoint — a 2D point in 16.16 fixed-point (16 bytes).
+#   +0: x   (i64 — 16.16 fixed-point)
+#   +8: y   (i64 — 16.16 fixed-point)
+# ================================================================
+var SD_POINT_X_OFFSET = 0;
+var SD_POINT_Y_OFFSET = 8;
+var SD_POINT_SIZE     = 16;
+
+# @public
+fn sd_point_new(x, y): i64 {
+    var p = alloc(SD_POINT_SIZE);
+    store64(p + SD_POINT_X_OFFSET, x);
+    store64(p + SD_POINT_Y_OFFSET, y);
+    return p;
+}
+
+# @public
+fn sd_point_x(p): i64 { return load64(p + SD_POINT_X_OFFSET); }
+# @public
+fn sd_point_y(p): i64 { return load64(p + SD_POINT_Y_OFFSET); }
+
+# ================================================================
+# SdMatrix — a 2x3 affine transform (6 values, 48 bytes).
+# Maps (x, y) -> (a*x + c*y + e,  b*x + d*y + f). All values 16.16.
+#   +0:  a    +8:  b
+#   +16: c    +24: d
+#   +32: e    +40: f
+# The (a,b,c,d) 2x2 is the linear part; (e,f) the translation.
+# ================================================================
+var SD_MAT_A_OFFSET = 0;
+var SD_MAT_B_OFFSET = 8;
+var SD_MAT_C_OFFSET = 16;
+var SD_MAT_D_OFFSET = 24;
+var SD_MAT_E_OFFSET = 32;
+var SD_MAT_F_OFFSET = 40;
+var SD_MATRIX_SIZE  = 48;
+
+# Low-level constructor from all six 16.16 components.
+fn sd_matrix_new(a, b, c, d, e, f): i64 {
+    var m = alloc(SD_MATRIX_SIZE);
+    store64(m + SD_MAT_A_OFFSET, a);
+    store64(m + SD_MAT_B_OFFSET, b);
+    store64(m + SD_MAT_C_OFFSET, c);
+    store64(m + SD_MAT_D_OFFSET, d);
+    store64(m + SD_MAT_E_OFFSET, e);
+    store64(m + SD_MAT_F_OFFSET, f);
+    return m;
+}
+
+# @public — the identity matrix (a=d=1.0, all else 0).
+fn sd_matrix_identity(): i64 {
+    return sd_matrix_new(SD_ONE, 0, 0, SD_ONE, 0, 0);
+}
+
+# @public — a pure translation by (tx, ty), both 16.16.
+fn sd_matrix_translate(tx, ty): i64 {
+    return sd_matrix_new(SD_ONE, 0, 0, SD_ONE, tx, ty);
+}
+
+# @public — a pure scale by (sx, sy), both 16.16.
+fn sd_matrix_scale(sx, sy): i64 {
+    return sd_matrix_new(sx, 0, 0, sy, 0, 0);
+}
+
+# @public — compose two affine transforms: result applies `n` THEN `m`
+# (i.e. result(pt) == m(n(pt))). Standard 2x3 * 2x3 affine product.
+fn sd_matrix_mul(m, n): i64 {
+    var ma = load64(m + SD_MAT_A_OFFSET);
+    var mb = load64(m + SD_MAT_B_OFFSET);
+    var mc = load64(m + SD_MAT_C_OFFSET);
+    var md = load64(m + SD_MAT_D_OFFSET);
+    var me = load64(m + SD_MAT_E_OFFSET);
+    var mf = load64(m + SD_MAT_F_OFFSET);
+    var na = load64(n + SD_MAT_A_OFFSET);
+    var nb = load64(n + SD_MAT_B_OFFSET);
+    var nc = load64(n + SD_MAT_C_OFFSET);
+    var nd = load64(n + SD_MAT_D_OFFSET);
+    var ne = load64(n + SD_MAT_E_OFFSET);
+    var nf = load64(n + SD_MAT_F_OFFSET);
+    var ra = sd_fixed_mul(na, ma) + sd_fixed_mul(nb, mc);
+    var rb = sd_fixed_mul(na, mb) + sd_fixed_mul(nb, md);
+    var rc = sd_fixed_mul(nc, ma) + sd_fixed_mul(nd, mc);
+    var rd = sd_fixed_mul(nc, mb) + sd_fixed_mul(nd, md);
+    var re = sd_fixed_mul(ne, ma) + sd_fixed_mul(nf, mc) + me;
+    var rf = sd_fixed_mul(ne, mb) + sd_fixed_mul(nf, md) + mf;
+    return sd_matrix_new(ra, rb, rc, rd, re, rf);
+}
+
+# @public — apply an affine transform to a point, returning a new SdPoint.
+# (x, y) -> (a*x + c*y + e,  b*x + d*y + f). All 16.16.
+fn sd_matrix_apply(m, pt): i64 {
+    var x = sd_point_x(pt);
+    var y = sd_point_y(pt);
+    var a = load64(m + SD_MAT_A_OFFSET);
+    var b = load64(m + SD_MAT_B_OFFSET);
+    var c = load64(m + SD_MAT_C_OFFSET);
+    var d = load64(m + SD_MAT_D_OFFSET);
+    var e = load64(m + SD_MAT_E_OFFSET);
+    var f = load64(m + SD_MAT_F_OFFSET);
+    var nx = sd_fixed_mul(a, x) + sd_fixed_mul(c, y) + e;
+    var ny = sd_fixed_mul(b, x) + sd_fixed_mul(d, y) + f;
+    return sd_point_new(nx, ny);
+}
+
+# TODO(v0.2): sd_matrix_rotate(theta) + sd_matrix_skew(sx, sy) — need a
+# fixed-point sin/cos (CORDIC or a 16.16 lookup table) before rotate is
+# exact; skew is a straight shear (a=d=1, off-diagonals = tan). Both slot
+# in as sd_matrix_* constructors composed via sd_matrix_mul.

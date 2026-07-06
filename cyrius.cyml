@@ -1,0 +1,52 @@
+[package]
+name = "sadish"
+version = "${file:VERSION}"
+description = "sadish (सदिश — vector) — pure-Cyrius low-level 2D vector graphics core for AGNOS: path construction (line/quadratic+cubic Bézier), curve flattening, scanline fill (even-odd + nonzero winding) with anti-aliased coverage, affine transforms, clipping → a pixel/coverage buffer. The rasterizer foundation rekha/canvas/SVG/UI-toolkit consume."
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/sadish"
+language = "cyrius"
+cyrius = "6.4.7"
+
+# sadish is a library — no CLI binary. `cyrius build` targets a smoke
+# program that links the full include chain to prove lib.cyr parses clean.
+# Consumers (rekha for font outlines, a canvas/drawing API, SVG, and the
+# dhancha UI toolkit) pull `dist/sadish.cyr` via a `[deps.sadish]` entry
+# pointing at a git tag.
+#
+# Dependency direction: sadish is a LEAF — no upstream sadish deps (only
+# the Cyrius stdlib below). Downstream consumers: rekha, dhancha (and a
+# canvas/compositing/SVG layer). None of them are re-implementations; they
+# build ON this rasterizer core.
+[build]
+entry = "programs/smoke.cyr"
+output = "build/sadish-smoke"
+
+# `[lib]` feeds `cyrius distlib` — module order matters: stdlib first
+# (declared in src/lib.cyr), then domain modules in dependency order.
+# error.cyr is dep-free; geom.cyr uses it; path.cyr builds on geom;
+# raster.cyr consumes path. Don't reorder without re-running
+# `cyrius distlib` and verifying the concatenated bundle still compiles.
+[lib]
+modules = [
+    "src/error.cyr",
+    "src/geom.cyr",
+    "src/path.cyr",
+    "src/raster.cyr",
+]
+
+[deps]
+# Base stdlib set — the vector-graphics core is pure integer Cyrius
+# (16.16 fixed-point), no external crate deps (sadish is a leaf). `bench`
+# is carried now so the v0.2 rasterizer bites have a benchmarking harness
+# ready when scanline coverage lands.
+stdlib = [
+    "string",
+    "fmt",
+    "alloc",
+    "io",
+    "vec",
+    "str",
+    "syscalls",
+    "assert",
+    "bench",
+]

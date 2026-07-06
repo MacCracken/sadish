@@ -1,0 +1,40 @@
+# @public — sadish library include chain.
+# sadish (सदिश — vector) — pure-Cyrius low-level 2D vector graphics core.
+#
+# Provides: path construction (line/quadratic+cubic Bézier), curve
+# flattening, scanline fill (even-odd + nonzero winding) with
+# anti-aliased coverage, affine transforms, clipping → a pixel/coverage
+# buffer that blits via the kernel blit#39 (or a host framebuffer). The
+# low-level rasterizer foundation that rekha (font outlines), a
+# canvas/drawing API, compositing, SVG, and the dhancha UI toolkit are all
+# CONSUMERS of — not re-implementations.
+#
+# Stdlib includes live ONLY in this file — domain modules are flat,
+# which is what makes `cyrius distlib` (strip-include concatenation)
+# produce a compile-clean `dist/sadish.cyr`. Don't add stdlib includes
+# in individual src/*.cyr files.
+
+# ================================================================
+# Standard library
+# ================================================================
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+include "lib/bench.cyr"
+
+# ================================================================
+# sadish domain modules — flat, dependency order.
+# error.cyr is dep-free. geom.cyr (SdPoint 16.16 + SdMatrix affine) builds
+# on nothing but the fixed-point substrate; path.cyr (SdPath verbs+points
+# + flatten) consumes geom's SdPoint; raster.cyr (SdCanvas coverage buffer
+# + fill/blit) consumes path's flattened polyline and error.cyr's codes.
+# ================================================================
+include "src/error.cyr"
+include "src/geom.cyr"
+include "src/path.cyr"
+include "src/raster.cyr"

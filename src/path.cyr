@@ -1,0 +1,204 @@
+# @public — sadish path construction + curve flattening.
+#
+# path.cyr — an SdPath is a growable command list: a stream of verbs
+# (moveto / lineto / quadto / cubicto / close) plus a parallel stream of
+# control points. This is the resolution-independent geometry a consumer
+# builds; the rasterizer (raster.cyr) consumes the FLATTENED polyline the
+# curve verbs expand into.
+#
+# Storage model: two bump-allocated arrays sized at construction. Verbs
+# are one i64 each; points are SdPoint pointers (one i64 each). A quadto
+# consumes 2 points (control, end); a cubicto 3 (c1, c2, end); moveto and
+# lineto 1 (the target); close 0. TODO(v0.3): growable/re-alloc backing so
+# capacity isn't fixed — for now a path caps at SD_PATH_CAP verbs.
+
+# ---- verb tags --------------------------------------------------
+var SD_VERB_MOVETO = 0;
+var SD_VERB_LINETO = 1;
+var SD_VERB_QUADTO = 2;
+var SD_VERB_CUBICTO = 3;
+var SD_VERB_CLOSE  = 4;
+
+# Fixed capacity (verbs and, generously, points) for the v0.1 skeleton.
+# TODO(v0.3): replace with a growable vec-backed store.
+var SD_PATH_CAP = 256;
+
+# ================================================================
+# SdPath (48 bytes):
+#   +0:  verbs      (ptr — array of SD_PATH_CAP i64 verb tags)
+#   +8:  n_verbs    (i64 — verb count)
+#   +16: points     (ptr — array of SD_PATH_CAP i64 SdPoint ptrs)
+#   +24: n_points   (i64 — point count)
+#   +32: cap        (i64 — capacity, in verbs and points)
+#   +40: reserved   (i64 — 0; future flags: subpath-open, bounds-cached)
+# ================================================================
+var SD_PATH_VERBS_OFFSET    = 0;
+var SD_PATH_NVERBS_OFFSET   = 8;
+var SD_PATH_POINTS_OFFSET   = 16;
+var SD_PATH_NPOINTS_OFFSET  = 24;
+var SD_PATH_CAP_OFFSET      = 32;
+var SD_PATH_RESERVED_OFFSET = 40;
+var SD_PATH_SIZE            = 48;
+
+# @public — allocate an empty path.
+fn sd_path_new(): i64 {
+    var p = alloc(SD_PATH_SIZE);
+    if (p == 0) { return 0; }
+    var verbs = alloc(SD_PATH_CAP * 8);
+    var points = alloc(SD_PATH_CAP * 8);
+    store64(p + SD_PATH_VERBS_OFFSET, verbs);
+    store64(p + SD_PATH_NVERBS_OFFSET, 0);
+    store64(p + SD_PATH_POINTS_OFFSET, points);
+    store64(p + SD_PATH_NPOINTS_OFFSET, 0);
+    store64(p + SD_PATH_CAP_OFFSET, SD_PATH_CAP);
+    store64(p + SD_PATH_RESERVED_OFFSET, 0);
+    return p;
+}
+
+# ---- accessors --------------------------------------------------
+# @public
+fn sd_path_verb_count(path): i64  { return load64(path + SD_PATH_NVERBS_OFFSET); }
+# @public
+fn sd_path_point_count(path): i64 { return load64(path + SD_PATH_NPOINTS_OFFSET); }
+
+# Append one verb tag; returns SADISH_OK or SADISH_ERR_OOM at capacity.
+fn sd_path_push_verb(path, verb): i64 {
+    var n = load64(path + SD_PATH_NVERBS_OFFSET);
+    var cap = load64(path + SD_PATH_CAP_OFFSET);
+    if (n >= cap) { return SADISH_ERR_OOM; }
+    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
+    store64(verbs + n * 8, verb);
+    store64(path + SD_PATH_NVERBS_OFFSET, n + 1);
+    return SADISH_OK;
+}
+
+# Append one SdPoint ptr; returns SADISH_OK or SADISH_ERR_OOM at capacity.
+fn sd_path_push_point(path, pt): i64 {
+    var n = load64(path + SD_PATH_NPOINTS_OFFSET);
+    var cap = load64(path + SD_PATH_CAP_OFFSET);
+    if (n >= cap) { return SADISH_ERR_OOM; }
+    var points = load64(path + SD_PATH_POINTS_OFFSET);
+    store64(points + n * 8, pt);
+    store64(path + SD_PATH_NPOINTS_OFFSET, n + 1);
+    return SADISH_OK;
+}
+
+# @public — start a new subpath at (x, y) (16.16). Returns SADISH_OK / err.
+fn sd_path_moveto(path, x, y): i64 {
+    var r = sd_path_push_verb(path, SD_VERB_MOVETO);
+    if (r != SADISH_OK) { return r; }
+    return sd_path_push_point(path, sd_point_new(x, y));
+}
+
+# @public — straight line to (x, y) from the current point.
+fn sd_path_lineto(path, x, y): i64 {
+    var r = sd_path_push_verb(path, SD_VERB_LINETO);
+    if (r != SADISH_OK) { return r; }
+    return sd_path_push_point(path, sd_point_new(x, y));
+}
+
+# @public — quadratic Bézier: control (cx, cy), end (x, y).
+fn sd_path_quadto(path, cx, cy, x, y): i64 {
+    var r = sd_path_push_verb(path, SD_VERB_QUADTO);
+    if (r != SADISH_OK) { return r; }
+    var r1 = sd_path_push_point(path, sd_point_new(cx, cy));
+    if (r1 != SADISH_OK) { return r1; }
+    return sd_path_push_point(path, sd_point_new(x, y));
+}
+
+# @public — cubic Bézier: controls (c1x,c1y),(c2x,c2y), end (x, y).
+fn sd_path_cubicto(path, c1x, c1y, c2x, c2y, x, y): i64 {
+    var r = sd_path_push_verb(path, SD_VERB_CUBICTO);
+    if (r != SADISH_OK) { return r; }
+    var r1 = sd_path_push_point(path, sd_point_new(c1x, c1y));
+    if (r1 != SADISH_OK) { return r1; }
+    var r2 = sd_path_push_point(path, sd_point_new(c2x, c2y));
+    if (r2 != SADISH_OK) { return r2; }
+    return sd_path_push_point(path, sd_point_new(x, y));
+}
+
+# @public — close the current subpath (back to its moveto). No point.
+fn sd_path_close(path): i64 {
+    return sd_path_push_verb(path, SD_VERB_CLOSE);
+}
+
+# ================================================================
+# sd_path_flatten — expand curve verbs into a straight-line polyline
+# within `tol` (a 16.16 flatness tolerance) and return an SdPolyline: a
+# small header + an array of SdPoint ptrs.
+#
+# SdPolyline (16 bytes):
+#   +0: points   (ptr — array of i64 SdPoint ptrs)
+#   +8: count    (i64 — number of points)
+# ================================================================
+var SD_POLYLINE_POINTS_OFFSET = 0;
+var SD_POLYLINE_COUNT_OFFSET  = 8;
+var SD_POLYLINE_SIZE          = 16;
+
+# @public
+fn sd_polyline_count(pl): i64  { return load64(pl + SD_POLYLINE_COUNT_OFFSET); }
+# @public
+fn sd_polyline_points(pl): i64 { return load64(pl + SD_POLYLINE_POINTS_OFFSET); }
+
+# @public — flatten `path` to within `tol`.
+#
+# v0.1 STUB: this pass only copies the moveto/lineto anchor points through
+# 1:1 and drops the interior of quad/cubic curves (it keeps their end
+# point but does no subdivision), so a straight-edge polygon flattens
+# exactly and a curved path degrades to its control-polygon corners. Good
+# enough to link the pipeline and rasterize polygons.
+#
+# TODO(v0.2): adaptive Bézier subdivision — de Casteljau split while the
+# control polygon's deviation from the chord exceeds `tol`, emitting the
+# generated points. Quads and cubics both reduce to recursive halving with
+# a flatness test; `tol` sets the recursion floor.
+fn sd_path_flatten(path, tol): i64 {
+    var n_verbs = load64(path + SD_PATH_NVERBS_OFFSET);
+    if (n_verbs == 0) { return 0; }      # empty path — caller checks EMPTY_PATH
+
+    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
+    var points = load64(path + SD_PATH_POINTS_OFFSET);
+    var n_points = load64(path + SD_PATH_NPOINTS_OFFSET);
+
+    # Output can never exceed the input point count in this stub (no new
+    # interior points are generated yet), so size the buffer to n_points.
+    var out = alloc(n_points * 8);
+    var out_n = 0;
+
+    # Walk verbs, consuming points per verb arity, emitting the anchors.
+    var vi = 0;
+    var pi = 0;
+    while (vi < n_verbs) {
+        var verb = load64(verbs + vi * 8);
+        if (verb == SD_VERB_MOVETO) {
+            store64(out + out_n * 8, load64(points + pi * 8));
+            out_n = out_n + 1;
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_LINETO) {
+            store64(out + out_n * 8, load64(points + pi * 8));
+            out_n = out_n + 1;
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_QUADTO) {
+            # STUB: skip the control point, keep the end anchor.
+            store64(out + out_n * 8, load64(points + (pi + 1) * 8));
+            out_n = out_n + 1;
+            pi = pi + 2;
+        }
+        if (verb == SD_VERB_CUBICTO) {
+            # STUB: skip both control points, keep the end anchor.
+            store64(out + out_n * 8, load64(points + (pi + 2) * 8));
+            out_n = out_n + 1;
+            pi = pi + 3;
+        }
+        # SD_VERB_CLOSE consumes no point (the subpath's moveto anchor
+        # closes it in the rasterizer); nothing to emit here.
+        vi = vi + 1;
+    }
+
+    var pl = alloc(SD_POLYLINE_SIZE);
+    store64(pl + SD_POLYLINE_POINTS_OFFSET, out);
+    store64(pl + SD_POLYLINE_COUNT_OFFSET, out_n);
+    return pl;
+}
