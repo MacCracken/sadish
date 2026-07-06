@@ -5,7 +5,11 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.4.0] - unreleased
+## [0.4.0] - 2026-07-05
+
+The full 2D vector core: skew (affine set complete), gradient paint, unbounded
+paths, stroking, a clip stack, and an analytic coverage engine replacing the
+supersampler. 12 RUN tests.
 
 ### Added
 - **Matrix skew** (`sd_matrix_skew`, `sd_fixed_div`) — completes the affine
