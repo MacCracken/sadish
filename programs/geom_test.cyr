@@ -1,0 +1,56 @@
+# programs/geom_test.cyr — RUN test for the signed fixed-point substrate.
+#
+# Guards the `asr()` fix: every check here involves a NEGATIVE value and would
+# fail with the old logical `>>` in sd_fixed_mul. Exit code = failed checks.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # --- sd_asr: sign-preserving right shift ---
+    check(sd_asr(65536, 16), 1);          # positive path unchanged
+    check(sd_asr(0 - 65536, 16), 0 - 1);  # -1.0 -> -1 whole (floor)
+    check(sd_asr(0 - 3, 16), 0 - 1);      # floor(-3/65536) = -1
+    check(sd_asr(0 - 131072, 16), 0 - 2); # -2.0 -> -2
+    check(sd_asr(0 - 2, 1), 0 - 1);       # floor(-2/2) = -1
+    check(sd_asr(0 - 1, 63), 0 - 1);      # all-ones stays -1
+
+    # --- sd_fixed_mul with negatives (the corruption the fix targets) ---
+    check(sd_fixed_mul(SD_ONE, 0 - SD_ONE), 0 - SD_ONE);                 #  1.0 * -1.0 = -1.0
+    check(sd_fixed_mul(0 - SD_ONE, 0 - SD_ONE), SD_ONE);                 # -1.0 * -1.0 =  1.0
+    check(sd_fixed_mul(2 * SD_ONE, 0 - (3 * SD_ONE)), 0 - (6 * SD_ONE)); #  2   * -3   = -6
+    check(sd_fixed_mul(SD_ONE, SD_ONE), SD_ONE);                         #  1.0 *  1.0 =  1.0 (unchanged)
+
+    # --- sd_matrix_apply with a negative translate ---
+    var m = sd_matrix_translate(0 - (5 * SD_ONE), 0 - (2 * SD_ONE));
+    var q = sd_matrix_apply(m, sd_point_new(10 * SD_ONE, 10 * SD_ONE));
+    check(sd_point_x(q), 5 * SD_ONE);     # 10 + (-5) = 5
+    check(sd_point_y(q), 8 * SD_ONE);     # 10 + (-2) = 8
+
+    # --- negative scale (mirror) — exercises sd_fixed_mul(negative, ...) ---
+    var ms = sd_matrix_scale(0 - SD_ONE, SD_ONE);
+    var q2 = sd_matrix_apply(ms, sd_point_new(7 * SD_ONE, 3 * SD_ONE));
+    check(sd_point_x(q2), 0 - (7 * SD_ONE));  # x mirrored across the origin
+    check(sd_point_y(q2), 3 * SD_ONE);        # y unchanged
+
+    if (g_fails == 0) {
+        var ok = "geom_test: PASS (signed fixed-point)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "geom_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -13,12 +13,30 @@
 var SD_SHIFT = 16;
 var SD_ONE   = 65536;    # 1 << 16
 
-# Multiply two 16.16 fixed-point values -> 16.16.
-# (a*b) has 32 fractional bits; shift back down by SD_SHIFT.
-# TODO(v0.2): 64-bit intermediate is fine for on-canvas magnitudes; add a
-# saturating variant once large user transforms are in scope.
+# @public — Arithmetic (sign-preserving) right shift by n. Cyrius `>>` is
+# LOGICAL (zero-fill), so a plain `>>` on a negative value fills the sign
+# bits with 0 and corrupts it — load-bearing for every signed subpixel /
+# coverage / transform computation in the rasterizer. Valid for 0 <= n <= 63.
+fn sd_asr(x, n): i64 {
+    if (n <= 0) { return x; }
+    if (x >= 0) { return x >> n; }
+    var top = (0 - 1) << (64 - n);   # top n bits all-ones (sign extension)
+    return (x >> n) | top;
+}
+
+# @public — absolute value.
+fn sd_abs(v): i64 {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+# Multiply two 16.16 fixed-point values -> 16.16. (a*b) has 32 fractional
+# bits; drop back down by SD_SHIFT via the SIGNED shift (sd_asr) so negative
+# products — mirrors, rotations, below-origin coordinates — stay correct.
+# TODO(v0.x): the 64-bit intermediate is fine for on-canvas magnitudes; a
+# saturating variant is future work once large user transforms are in scope.
 fn sd_fixed_mul(a, b): i64 {
-    return (a * b) >> SD_SHIFT;
+    return sd_asr(a * b, SD_SHIFT);
 }
 
 # ================================================================

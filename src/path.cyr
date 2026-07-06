@@ -140,65 +140,147 @@ fn sd_polyline_count(pl): i64  { return load64(pl + SD_POLYLINE_COUNT_OFFSET); }
 # @public
 fn sd_polyline_points(pl): i64 { return load64(pl + SD_POLYLINE_POINTS_OFFSET); }
 
-# @public — flatten `path` to within `tol`.
-#
-# v0.1 STUB: this pass only copies the moveto/lineto anchor points through
-# 1:1 and drops the interior of quad/cubic curves (it keeps their end
-# point but does no subdivision), so a straight-edge polygon flattens
-# exactly and a curved path degrades to its control-polygon corners. Good
-# enough to link the pipeline and rasterize polygons.
-#
-# TODO(v0.2): adaptive Bézier subdivision — de Casteljau split while the
-# control polygon's deviation from the chord exceeds `tol`, emitting the
-# generated points. Quads and cubics both reduce to recursive halving with
-# a flatness test; `tol` sets the recursion floor.
+# ---- flatten internals (adaptive de Casteljau) ------------------
+# Output cap + recursion depth cap. A single curve subdivides to at most
+# 2^depth segments; the flatten output is bounded at SD_FLATTEN_CAP points
+# (excess is dropped — a path that hits this is pathological for v0.3; a
+# growable store is the same TODO(v0.4) as the path backing).
+var SD_FLATTEN_CAP       = 8192;
+var SD_FLATTEN_MAX_DEPTH = 8;
+
+# Emit accumulator ctx: +0 points(ptr)  +8 count  +16 cap.
+fn sd_flat_emit(ctx, pt): i64 {
+    var count = load64(ctx + 8);
+    var cap = load64(ctx + 16);
+    if (count >= cap) { return 0; }
+    var pts = load64(ctx + 0);
+    store64(pts + count * 8, pt);
+    store64(ctx + 8, count + 1);
+    return 0;
+}
+
+# Midpoint of two SdPoints (signed /2 via sd_asr — coords can be negative).
+fn sd_pt_mid(a, b): i64 {
+    var mx = sd_asr(sd_point_x(a) + sd_point_x(b), 1);
+    var my = sd_asr(sd_point_y(a) + sd_point_y(b), 1);
+    return sd_point_new(mx, my);
+}
+
+# Quadratic flatness: a quad's max deviation from its chord is
+# 0.25*|p0 - 2*p1 + p2|, so it is flat when |secondDiff| <= 4*tol. The
+# Manhattan magnitude (>= Euclidean) keeps this division/sqrt-free and only
+# ever over-tessellates, never under.
+fn sd_quad_flat(p0, p1, p2, tol): i64 {
+    var dx = sd_point_x(p0) - 2 * sd_point_x(p1) + sd_point_x(p2);
+    var dy = sd_point_y(p0) - 2 * sd_point_y(p1) + sd_point_y(p2);
+    if (sd_abs(dx) + sd_abs(dy) <= 4 * tol) { return 1; }
+    return 0;
+}
+
+# Recursively flatten a quad (p0,p1,p2). Emits every point AFTER p0 up to and
+# including p2 — p0 is already in the output from the previous segment.
+fn sd_flatten_quad(ctx, p0, p1, p2, tol, depth): i64 {
+    if (depth <= 0) { return sd_flat_emit(ctx, p2); }
+    if (sd_quad_flat(p0, p1, p2, tol) != 0) { return sd_flat_emit(ctx, p2); }
+    var p01 = sd_pt_mid(p0, p1);
+    var p12 = sd_pt_mid(p1, p2);
+    var p012 = sd_pt_mid(p01, p12);
+    sd_flatten_quad(ctx, p0, p01, p012, tol, depth - 1);
+    sd_flatten_quad(ctx, p012, p12, p2, tol, depth - 1);
+    return 0;
+}
+
+# Cubic flatness: both second differences (p0-2p1+p2) and (p1-2p2+p3) within
+# tolerance (same Manhattan bound as the quad).
+fn sd_cubic_flat(p0, p1, p2, p3, tol): i64 {
+    var d1x = sd_point_x(p0) - 2 * sd_point_x(p1) + sd_point_x(p2);
+    var d1y = sd_point_y(p0) - 2 * sd_point_y(p1) + sd_point_y(p2);
+    var d2x = sd_point_x(p1) - 2 * sd_point_x(p2) + sd_point_x(p3);
+    var d2y = sd_point_y(p1) - 2 * sd_point_y(p2) + sd_point_y(p3);
+    var m1 = sd_abs(d1x) + sd_abs(d1y);
+    var m2 = sd_abs(d2x) + sd_abs(d2y);
+    var m = m1;
+    if (m2 > m) { m = m2; }
+    if (m <= 4 * tol) { return 1; }
+    return 0;
+}
+
+# Recursively flatten a cubic (p0,p1,p2,p3). Emits every point after p0.
+fn sd_flatten_cubic(ctx, p0, p1, p2, p3, tol, depth): i64 {
+    if (depth <= 0) { return sd_flat_emit(ctx, p3); }
+    if (sd_cubic_flat(p0, p1, p2, p3, tol) != 0) { return sd_flat_emit(ctx, p3); }
+    var p01 = sd_pt_mid(p0, p1);
+    var p12 = sd_pt_mid(p1, p2);
+    var p23 = sd_pt_mid(p2, p3);
+    var p012 = sd_pt_mid(p01, p12);
+    var p123 = sd_pt_mid(p12, p23);
+    var p0123 = sd_pt_mid(p012, p123);
+    sd_flatten_cubic(ctx, p0, p01, p012, p0123, tol, depth - 1);
+    sd_flatten_cubic(ctx, p0123, p123, p23, p3, tol, depth - 1);
+    return 0;
+}
+
+# @public — flatten `path` into a straight-line polyline within `tol` (a
+# 16.16 flatness tolerance), returning an SdPolyline. Straight verbs pass
+# through as anchors; quad/cubic verbs are adaptively subdivided (de
+# Casteljau) until each segment's deviation from its chord is <= tol.
+# Returns 0 on an empty path (the caller reports EMPTY_PATH).
 fn sd_path_flatten(path, tol): i64 {
     var n_verbs = load64(path + SD_PATH_NVERBS_OFFSET);
-    if (n_verbs == 0) { return 0; }      # empty path — caller checks EMPTY_PATH
+    if (n_verbs == 0) { return 0; }
 
     var verbs = load64(path + SD_PATH_VERBS_OFFSET);
     var points = load64(path + SD_PATH_POINTS_OFFSET);
-    var n_points = load64(path + SD_PATH_NPOINTS_OFFSET);
 
-    # Output can never exceed the input point count in this stub (no new
-    # interior points are generated yet), so size the buffer to n_points.
-    var out = alloc(n_points * 8);
-    var out_n = 0;
+    var out = alloc(SD_FLATTEN_CAP * 8);
+    var ctx = alloc(24);
+    store64(ctx + 0, out);
+    store64(ctx + 8, 0);
+    store64(ctx + 16, SD_FLATTEN_CAP);
 
-    # Walk verbs, consuming points per verb arity, emitting the anchors.
+    # A non-positive tol would never satisfy the flatness test — recurse to
+    # the depth cap every time; clamp to >= 1 (1/65536 px).
+    var t = tol;
+    if (t < 1) { t = 1; }
+
+    var cur = 0;
     var vi = 0;
     var pi = 0;
     while (vi < n_verbs) {
         var verb = load64(verbs + vi * 8);
         if (verb == SD_VERB_MOVETO) {
-            store64(out + out_n * 8, load64(points + pi * 8));
-            out_n = out_n + 1;
+            cur = load64(points + pi * 8);
+            sd_flat_emit(ctx, cur);
             pi = pi + 1;
         }
         if (verb == SD_VERB_LINETO) {
-            store64(out + out_n * 8, load64(points + pi * 8));
-            out_n = out_n + 1;
+            cur = load64(points + pi * 8);
+            sd_flat_emit(ctx, cur);
             pi = pi + 1;
         }
         if (verb == SD_VERB_QUADTO) {
-            # STUB: skip the control point, keep the end anchor.
-            store64(out + out_n * 8, load64(points + (pi + 1) * 8));
-            out_n = out_n + 1;
+            var qc = load64(points + pi * 8);
+            var qe = load64(points + (pi + 1) * 8);
+            sd_flatten_quad(ctx, cur, qc, qe, t, SD_FLATTEN_MAX_DEPTH);
+            cur = qe;
             pi = pi + 2;
         }
         if (verb == SD_VERB_CUBICTO) {
-            # STUB: skip both control points, keep the end anchor.
-            store64(out + out_n * 8, load64(points + (pi + 2) * 8));
-            out_n = out_n + 1;
+            var k1 = load64(points + pi * 8);
+            var k2 = load64(points + (pi + 1) * 8);
+            var ke = load64(points + (pi + 2) * 8);
+            sd_flatten_cubic(ctx, cur, k1, k2, ke, t, SD_FLATTEN_MAX_DEPTH);
+            cur = ke;
             pi = pi + 3;
         }
-        # SD_VERB_CLOSE consumes no point (the subpath's moveto anchor
-        # closes it in the rasterizer); nothing to emit here.
+        # SD_VERB_CLOSE consumes no point; the rasterizer closes the subpath
+        # back to its moveto anchor.
         vi = vi + 1;
     }
 
+    var count = load64(ctx + 8);
     var pl = alloc(SD_POLYLINE_SIZE);
     store64(pl + SD_POLYLINE_POINTS_OFFSET, out);
-    store64(pl + SD_POLYLINE_COUNT_OFFSET, out_n);
+    store64(pl + SD_POLYLINE_COUNT_OFFSET, count);
     return pl;
 }
