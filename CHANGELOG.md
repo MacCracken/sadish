@@ -5,6 +5,21 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - unreleased
+
+### Added
+- **Matrix skew** (`sd_matrix_skew`, `sd_fixed_div`) — completes the affine
+  transform set (identity / translate / scale / rotate / skew); shear angles
+  via CORDIC `tan = sin/cos`. Verified in `programs/rotate_test.cyr`.
+- **Linear gradient paint** (`sd_canvas_blit_gradient`) — composites coverage
+  with the source color lerped along a linear axis from `c0` to `c1`
+  (projection clamped to the endpoints), src-over onto an `SdSurface`.
+  Verified in `programs/gradient_test.cyr`.
+- **Growable path backing** (`sd_path_grow`) — `SdPath` is now unbounded: the
+  verb + point arrays double on overflow instead of capping at
+  `SD_PATH_CAP` (256). Verified in `programs/grow_test.cyr` (1000 verbs across
+  several grows, data preserved).
+
 ## [0.3.0] - 2026-07-05
 
 The rasterizer — the vector core comes alive. Paths now flatten, fill to

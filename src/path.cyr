@@ -9,8 +9,9 @@
 # Storage model: two bump-allocated arrays sized at construction. Verbs
 # are one i64 each; points are SdPoint pointers (one i64 each). A quadto
 # consumes 2 points (control, end); a cubicto 3 (c1, c2, end); moveto and
-# lineto 1 (the target); close 0. TODO(v0.3): growable/re-alloc backing so
-# capacity isn't fixed — for now a path caps at SD_PATH_CAP verbs.
+# lineto 1 (the target); close 0. Storage is unbounded as of v0.4.0 —
+# sd_path_grow doubles both arrays on overflow; SD_PATH_CAP is only the
+# initial allocation.
 
 # ---- verb tags --------------------------------------------------
 var SD_VERB_MOVETO = 0;
@@ -19,8 +20,8 @@ var SD_VERB_QUADTO = 2;
 var SD_VERB_CUBICTO = 3;
 var SD_VERB_CLOSE  = 4;
 
-# Fixed capacity (verbs and, generously, points) for the v0.1 skeleton.
-# TODO(v0.3): replace with a growable vec-backed store.
+# Initial capacity for both the verb and point arrays; sd_path_grow doubles
+# them on overflow (v0.4.0), so this is just the first allocation size.
 var SD_PATH_CAP = 256;
 
 # ================================================================
@@ -61,24 +62,46 @@ fn sd_path_verb_count(path): i64  { return load64(path + SD_PATH_NVERBS_OFFSET);
 # @public
 fn sd_path_point_count(path): i64 { return load64(path + SD_PATH_NPOINTS_OFFSET); }
 
-# Append one verb tag; returns SADISH_OK or SADISH_ERR_OOM at capacity.
+# Double both the verb and point arrays (copying live entries). Returns
+# SADISH_OK, or SADISH_ERR_OOM if the larger allocation fails.
+fn sd_path_grow(path): i64 {
+    var cap = load64(path + SD_PATH_CAP_OFFSET);
+    var newcap = cap * 2;
+    var nv = alloc(newcap * 8);
+    if (nv == 0) { return SADISH_ERR_OOM; }
+    var np = alloc(newcap * 8);
+    if (np == 0) { return SADISH_ERR_OOM; }
+    var nverbs = load64(path + SD_PATH_NVERBS_OFFSET);
+    var npoints = load64(path + SD_PATH_NPOINTS_OFFSET);
+    memcpy(nv, load64(path + SD_PATH_VERBS_OFFSET), nverbs * 8);
+    memcpy(np, load64(path + SD_PATH_POINTS_OFFSET), npoints * 8);
+    store64(path + SD_PATH_VERBS_OFFSET, nv);
+    store64(path + SD_PATH_POINTS_OFFSET, np);
+    store64(path + SD_PATH_CAP_OFFSET, newcap);
+    return SADISH_OK;
+}
+
+# Append one verb tag, growing the backing store if full. Returns SADISH_OK
+# (or SADISH_ERR_OOM only if a grow allocation fails).
 fn sd_path_push_verb(path, verb): i64 {
     var n = load64(path + SD_PATH_NVERBS_OFFSET);
-    var cap = load64(path + SD_PATH_CAP_OFFSET);
-    if (n >= cap) { return SADISH_ERR_OOM; }
-    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
-    store64(verbs + n * 8, verb);
+    if (n >= load64(path + SD_PATH_CAP_OFFSET)) {
+        var g = sd_path_grow(path);
+        if (g != SADISH_OK) { return g; }
+    }
+    store64(load64(path + SD_PATH_VERBS_OFFSET) + n * 8, verb);
     store64(path + SD_PATH_NVERBS_OFFSET, n + 1);
     return SADISH_OK;
 }
 
-# Append one SdPoint ptr; returns SADISH_OK or SADISH_ERR_OOM at capacity.
+# Append one SdPoint ptr, growing the backing store if full.
 fn sd_path_push_point(path, pt): i64 {
     var n = load64(path + SD_PATH_NPOINTS_OFFSET);
-    var cap = load64(path + SD_PATH_CAP_OFFSET);
-    if (n >= cap) { return SADISH_ERR_OOM; }
-    var points = load64(path + SD_PATH_POINTS_OFFSET);
-    store64(points + n * 8, pt);
+    if (n >= load64(path + SD_PATH_CAP_OFFSET)) {
+        var g = sd_path_grow(path);
+        if (g != SADISH_OK) { return g; }
+    }
+    store64(load64(path + SD_PATH_POINTS_OFFSET) + n * 8, pt);
     store64(path + SD_PATH_NPOINTS_OFFSET, n + 1);
     return SADISH_OK;
 }

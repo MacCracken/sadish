@@ -49,6 +49,15 @@ fn main(): i64 {
     near(sd_point_x(q3), 0 - SD_ONE, tol);
     near(sd_point_y(q3), 0, tol);
 
+    # skew(pi/4, 0): tan(45) = 1, so (1,1) -> (1 + 1*1, 1) = (2, 1)
+    var sk = sd_matrix_apply(sd_matrix_skew(QUARTER_PI, 0), sd_point_new(SD_ONE, SD_ONE));
+    near(sd_point_x(sk), 2 * SD_ONE, tol);
+    near(sd_point_y(sk), SD_ONE, tol);
+    # skew(0, 0) is the identity
+    var sk0 = sd_matrix_apply(sd_matrix_skew(0, 0), sd_point_new(3 * SD_ONE, 5 * SD_ONE));
+    near(sd_point_x(sk0), 3 * SD_ONE, tol);
+    near(sd_point_y(sk0), 5 * SD_ONE, tol);
+
     if (g_fails == 0) {
         var ok = "rotate_test: PASS (CORDIC sin/cos + rotate)\n";
         syscall(1, 1, ok, strlen(ok));

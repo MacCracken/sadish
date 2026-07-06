@@ -1,0 +1,64 @@
+# programs/gradient_test.cyr — RUN test for linear gradient paint.
+#
+# Fills the whole canvas, blits a red->blue horizontal gradient over black,
+# and asserts: left edge = pure c0 (red), right edge = mostly c1 (blue),
+# middle = a blend of both. Exit code = failed checks.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var RED  = sd_rgb(255, 0, 0);
+    var BLUE = sd_rgb(0, 0, 255);
+
+    # full 8x8 coverage
+    var cnv = sd_canvas_new(8, 8);
+    var rp = sd_path_new();
+    sd_path_moveto(rp, 0, 0);
+    sd_path_lineto(rp, 8 * SD_ONE, 0);
+    sd_path_lineto(rp, 8 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(rp, 0, 8 * SD_ONE);
+    sd_path_close(rp);
+    sd_canvas_fill_path(cnv, rp, SD_FILL_NONZERO);
+
+    # gradient RED at x=0 -> BLUE at x=8, over a black surface
+    var surf = sd_surface_new(8, 8);
+    check(sd_canvas_blit_gradient(cnv, surf, 0, 0, RED, 8, 0, BLUE), SADISH_OK);
+
+    # left column -> pure red
+    check(sd_surface_pixel_at(surf, 0, 0), 16711680);   # 0xFF0000
+
+    # right column -> mostly blue (R low, B high)
+    var pr = sd_surface_pixel_at(surf, 7, 0);
+    if (((pr >> 16) & 255) >= 128) { g_fails = g_fails + 1; }
+    if ((pr & 255) <= 128) { g_fails = g_fails + 1; }
+
+    # middle -> a blend (both channels present, neither saturated)
+    var pm = sd_surface_pixel_at(surf, 4, 0);
+    var mr = (pm >> 16) & 255;
+    var mb = pm & 255;
+    if (mr <= 0) { g_fails = g_fails + 1; }
+    if (mr >= 255) { g_fails = g_fails + 1; }
+    if (mb <= 0) { g_fails = g_fails + 1; }
+    if (mb >= 255) { g_fails = g_fails + 1; }
+
+    if (g_fails == 0) {
+        var ok = "gradient_test: PASS (linear gradient paint)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "gradient_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

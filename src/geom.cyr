@@ -218,5 +218,18 @@ fn sd_matrix_rotate(theta): i64 {
     return sd_matrix_new(c, s, 0 - s, c, 0, 0);
 }
 
-# TODO(v0.4): sd_matrix_skew(sx, sy) — a straight shear (a=d=1, off-diagonals
-# = tan), composed via sd_matrix_mul.
+# Divide two 16.16 fixed-point values -> 16.16 (signed). The a<<SD_SHIFT
+# pre-scale is exact for on-canvas / trig magnitudes; very large operands can
+# overflow the 64-bit intermediate (same caveat as sd_fixed_mul). b==0 -> 0.
+fn sd_fixed_div(a, b): i64 {
+    if (b == 0) { return 0; }
+    return (a << SD_SHIFT) / b;
+}
+
+# @public — skew by angles (ax, ay) in 16.16 radians. x' = x + y*tan(ax),
+# y' = y + x*tan(ay): a=1, c=tan(ax), b=tan(ay), d=1. tan = sin/cos.
+fn sd_matrix_skew(ax, ay): i64 {
+    var tx = sd_fixed_div(sd_sin(ax), sd_cos(ax));
+    var ty = sd_fixed_div(sd_sin(ay), sd_cos(ay));
+    return sd_matrix_new(SD_ONE, ty, tx, SD_ONE, 0, 0);
+}

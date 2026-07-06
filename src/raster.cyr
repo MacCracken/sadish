@@ -352,6 +352,82 @@ fn sd_canvas_blit(cv, surface, color): i64 {
 }
 
 # ================================================================
+# sd_canvas_blit_gradient — like sd_canvas_blit, but the source color is a
+# LINEAR GRADIENT from `c0` (at pixel (x0,y0)) to `c1` (at (x1,y1)): each
+# pixel's color is c0..c1 lerped by its projection onto the axis (clamped to
+# the endpoints), then src-over with coverage. Colors 0x00RRGGBB; endpoints in
+# whole pixels. A degenerate axis (x0,y0 == x1,y1) paints solid c0.
+# TODO(v0.4+): radial gradient + multi-stop.
+# ================================================================
+# @public
+fn sd_canvas_blit_gradient(cv, surface, x0, y0, c0, x1, y1, c1): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (surface == 0) { return SADISH_ERR_BOUNDS; }
+    var cw = sd_canvas_width(cv);
+    var ch = sd_canvas_height(cv);
+    var covbuf = sd_canvas_coverage(cv);
+    var covstride = sd_canvas_stride(cv);
+    var sw = sd_surface_width(surface);
+    var sh = sd_surface_height(surface);
+    var spx = sd_surface_pixels(surface);
+
+    var dx = x1 - x0;
+    var dy = y1 - y0;
+    var td = dx * dx + dy * dy;   # squared axis length
+    var r0 = (c0 >> 16) & 255;
+    var g0 = (c0 >> 8) & 255;
+    var b0 = c0 & 255;
+    var r1 = (c1 >> 16) & 255;
+    var g1 = (c1 >> 8) & 255;
+    var b1 = c1 & 255;
+
+    var w = cw;
+    if (sw < w) { w = sw; }
+    var h = ch;
+    if (sh < h) { h = sh; }
+
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var a = load8(covbuf + y * covstride + x);
+            if (a != 0) {
+                var sr = r0;
+                var sg = g0;
+                var sb = b0;
+                if (td > 0) {
+                    var tn = (x - x0) * dx + (y - y0) * dy;
+                    if (tn < 0) { tn = 0; }
+                    if (tn > td) { tn = td; }
+                    sr = r0 + ((r1 - r0) * tn) / td;
+                    sg = g0 + ((g1 - g0) * tn) / td;
+                    sb = b0 + ((b1 - b0) * tn) / td;
+                }
+                var off = (y * sw + x) * 4;
+                if (a == 255) {
+                    store8(spx + off, sb);
+                    store8(spx + off + 1, sg);
+                    store8(spx + off + 2, sr);
+                    store8(spx + off + 3, 255);
+                } else {
+                    var ia = 255 - a;
+                    var nb = (sb * a + load8(spx + off) * ia) / 255;
+                    var ng = (sg * a + load8(spx + off + 1) * ia) / 255;
+                    var nr = (sr * a + load8(spx + off + 2) * ia) / 255;
+                    store8(spx + off, nb);
+                    store8(spx + off + 1, ng);
+                    store8(spx + off + 2, nr);
+                    store8(spx + off + 3, 255);
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return SADISH_OK;
+}
+
+# ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
 # 0.3.0 -> 300.
 # ================================================================

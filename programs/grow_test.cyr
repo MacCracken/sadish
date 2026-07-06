@@ -1,0 +1,52 @@
+# programs/grow_test.cyr — RUN test for the growable path backing.
+#
+# Pushes far past SD_PATH_CAP (256) to force multiple doublings, then verifies
+# the counts and that the first/last points survived the reallocation copies.
+# Exit code = failed checks.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var n = 1000;   # >> SD_PATH_CAP -> several grows
+
+    var p = sd_path_new();
+    check(sd_path_moveto(p, 0, 0), SADISH_OK);
+    var i = 0;
+    while (i < n) {
+        check(sd_path_lineto(p, (i + 1) * SD_ONE, 0), SADISH_OK);
+        i = i + 1;
+    }
+
+    check(sd_path_verb_count(p), n + 1);    # 1 moveto + n linetos
+    check(sd_path_point_count(p), n + 1);
+
+    var pts = load64(p + SD_PATH_POINTS_OFFSET);
+    # first point survived every copy
+    check(sd_point_x(load64(pts + 0)), 0);
+    check(sd_point_y(load64(pts + 0)), 0);
+    # last point (index n) has the expected value
+    var last = load64(pts + n * 8);
+    check(sd_point_x(last), n * SD_ONE);
+    check(sd_point_y(last), 0);
+
+    if (g_fails == 0) {
+        var ok = "grow_test: PASS (growable path backing)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "grow_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -741,8 +741,21 @@ fn sd_matrix_rotate(theta): i64 {
     return sd_matrix_new(c, s, 0 - s, c, 0, 0);
 }
 
-# TODO(v0.4): sd_matrix_skew(sx, sy) — a straight shear (a=d=1, off-diagonals
-# = tan), composed via sd_matrix_mul.
+# Divide two 16.16 fixed-point values -> 16.16 (signed). The a<<SD_SHIFT
+# pre-scale is exact for on-canvas / trig magnitudes; very large operands can
+# overflow the 64-bit intermediate (same caveat as sd_fixed_mul). b==0 -> 0.
+fn sd_fixed_div(a, b): i64 {
+    if (b == 0) { return 0; }
+    return (a << SD_SHIFT) / b;
+}
+
+# @public — skew by angles (ax, ay) in 16.16 radians. x' = x + y*tan(ax),
+# y' = y + x*tan(ay): a=1, c=tan(ax), b=tan(ay), d=1. tan = sin/cos.
+fn sd_matrix_skew(ax, ay): i64 {
+    var tx = sd_fixed_div(sd_sin(ax), sd_cos(ax));
+    var ty = sd_fixed_div(sd_sin(ay), sd_cos(ay));
+    return sd_matrix_new(SD_ONE, ty, tx, SD_ONE, 0, 0);
+}
 
 # --- path.cyr ---
 
@@ -757,8 +770,9 @@ fn sd_matrix_rotate(theta): i64 {
 # Storage model: two bump-allocated arrays sized at construction. Verbs
 # are one i64 each; points are SdPoint pointers (one i64 each). A quadto
 # consumes 2 points (control, end); a cubicto 3 (c1, c2, end); moveto and
-# lineto 1 (the target); close 0. TODO(v0.3): growable/re-alloc backing so
-# capacity isn't fixed — for now a path caps at SD_PATH_CAP verbs.
+# lineto 1 (the target); close 0. Storage is unbounded as of v0.4.0 —
+# sd_path_grow doubles both arrays on overflow; SD_PATH_CAP is only the
+# initial allocation.
 
 # ---- verb tags --------------------------------------------------
 var SD_VERB_MOVETO = 0;
@@ -767,8 +781,8 @@ var SD_VERB_QUADTO = 2;
 var SD_VERB_CUBICTO = 3;
 var SD_VERB_CLOSE  = 4;
 
-# Fixed capacity (verbs and, generously, points) for the v0.1 skeleton.
-# TODO(v0.3): replace with a growable vec-backed store.
+# Initial capacity for both the verb and point arrays; sd_path_grow doubles
+# them on overflow (v0.4.0), so this is just the first allocation size.
 var SD_PATH_CAP = 256;
 
 # ================================================================
@@ -809,24 +823,46 @@ fn sd_path_verb_count(path): i64  { return load64(path + SD_PATH_NVERBS_OFFSET);
 # @public
 fn sd_path_point_count(path): i64 { return load64(path + SD_PATH_NPOINTS_OFFSET); }
 
-# Append one verb tag; returns SADISH_OK or SADISH_ERR_OOM at capacity.
+# Double both the verb and point arrays (copying live entries). Returns
+# SADISH_OK, or SADISH_ERR_OOM if the larger allocation fails.
+fn sd_path_grow(path): i64 {
+    var cap = load64(path + SD_PATH_CAP_OFFSET);
+    var newcap = cap * 2;
+    var nv = alloc(newcap * 8);
+    if (nv == 0) { return SADISH_ERR_OOM; }
+    var np = alloc(newcap * 8);
+    if (np == 0) { return SADISH_ERR_OOM; }
+    var nverbs = load64(path + SD_PATH_NVERBS_OFFSET);
+    var npoints = load64(path + SD_PATH_NPOINTS_OFFSET);
+    memcpy(nv, load64(path + SD_PATH_VERBS_OFFSET), nverbs * 8);
+    memcpy(np, load64(path + SD_PATH_POINTS_OFFSET), npoints * 8);
+    store64(path + SD_PATH_VERBS_OFFSET, nv);
+    store64(path + SD_PATH_POINTS_OFFSET, np);
+    store64(path + SD_PATH_CAP_OFFSET, newcap);
+    return SADISH_OK;
+}
+
+# Append one verb tag, growing the backing store if full. Returns SADISH_OK
+# (or SADISH_ERR_OOM only if a grow allocation fails).
 fn sd_path_push_verb(path, verb): i64 {
     var n = load64(path + SD_PATH_NVERBS_OFFSET);
-    var cap = load64(path + SD_PATH_CAP_OFFSET);
-    if (n >= cap) { return SADISH_ERR_OOM; }
-    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
-    store64(verbs + n * 8, verb);
+    if (n >= load64(path + SD_PATH_CAP_OFFSET)) {
+        var g = sd_path_grow(path);
+        if (g != SADISH_OK) { return g; }
+    }
+    store64(load64(path + SD_PATH_VERBS_OFFSET) + n * 8, verb);
     store64(path + SD_PATH_NVERBS_OFFSET, n + 1);
     return SADISH_OK;
 }
 
-# Append one SdPoint ptr; returns SADISH_OK or SADISH_ERR_OOM at capacity.
+# Append one SdPoint ptr, growing the backing store if full.
 fn sd_path_push_point(path, pt): i64 {
     var n = load64(path + SD_PATH_NPOINTS_OFFSET);
-    var cap = load64(path + SD_PATH_CAP_OFFSET);
-    if (n >= cap) { return SADISH_ERR_OOM; }
-    var points = load64(path + SD_PATH_POINTS_OFFSET);
-    store64(points + n * 8, pt);
+    if (n >= load64(path + SD_PATH_CAP_OFFSET)) {
+        var g = sd_path_grow(path);
+        if (g != SADISH_OK) { return g; }
+    }
+    store64(load64(path + SD_PATH_POINTS_OFFSET) + n * 8, pt);
     store64(path + SD_PATH_NPOINTS_OFFSET, n + 1);
     return SADISH_OK;
 }
@@ -1364,6 +1400,82 @@ fn sd_canvas_blit(cv, surface, color): i64 {
         while (x < w) {
             var a = load8(covbuf + y * covstride + x);
             if (a != 0) {
+                var off = (y * sw + x) * 4;
+                if (a == 255) {
+                    store8(spx + off, sb);
+                    store8(spx + off + 1, sg);
+                    store8(spx + off + 2, sr);
+                    store8(spx + off + 3, 255);
+                } else {
+                    var ia = 255 - a;
+                    var nb = (sb * a + load8(spx + off) * ia) / 255;
+                    var ng = (sg * a + load8(spx + off + 1) * ia) / 255;
+                    var nr = (sr * a + load8(spx + off + 2) * ia) / 255;
+                    store8(spx + off, nb);
+                    store8(spx + off + 1, ng);
+                    store8(spx + off + 2, nr);
+                    store8(spx + off + 3, 255);
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return SADISH_OK;
+}
+
+# ================================================================
+# sd_canvas_blit_gradient — like sd_canvas_blit, but the source color is a
+# LINEAR GRADIENT from `c0` (at pixel (x0,y0)) to `c1` (at (x1,y1)): each
+# pixel's color is c0..c1 lerped by its projection onto the axis (clamped to
+# the endpoints), then src-over with coverage. Colors 0x00RRGGBB; endpoints in
+# whole pixels. A degenerate axis (x0,y0 == x1,y1) paints solid c0.
+# TODO(v0.4+): radial gradient + multi-stop.
+# ================================================================
+# @public
+fn sd_canvas_blit_gradient(cv, surface, x0, y0, c0, x1, y1, c1): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (surface == 0) { return SADISH_ERR_BOUNDS; }
+    var cw = sd_canvas_width(cv);
+    var ch = sd_canvas_height(cv);
+    var covbuf = sd_canvas_coverage(cv);
+    var covstride = sd_canvas_stride(cv);
+    var sw = sd_surface_width(surface);
+    var sh = sd_surface_height(surface);
+    var spx = sd_surface_pixels(surface);
+
+    var dx = x1 - x0;
+    var dy = y1 - y0;
+    var td = dx * dx + dy * dy;   # squared axis length
+    var r0 = (c0 >> 16) & 255;
+    var g0 = (c0 >> 8) & 255;
+    var b0 = c0 & 255;
+    var r1 = (c1 >> 16) & 255;
+    var g1 = (c1 >> 8) & 255;
+    var b1 = c1 & 255;
+
+    var w = cw;
+    if (sw < w) { w = sw; }
+    var h = ch;
+    if (sh < h) { h = sh; }
+
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var a = load8(covbuf + y * covstride + x);
+            if (a != 0) {
+                var sr = r0;
+                var sg = g0;
+                var sb = b0;
+                if (td > 0) {
+                    var tn = (x - x0) * dx + (y - y0) * dy;
+                    if (tn < 0) { tn = 0; }
+                    if (tn > td) { tn = td; }
+                    sr = r0 + ((r1 - r0) * tn) / td;
+                    sg = g0 + ((g1 - g0) * tn) / td;
+                    sb = b0 + ((b1 - b0) * tn) / td;
+                }
                 var off = (y * sw + x) * 4;
                 if (a == 255) {
                     store8(spx + off, sb);
