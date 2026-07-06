@@ -41,6 +41,10 @@ include "src/error.cyr"
 # (docs/development/prior-art.md); they depend only on error + stdlib.
 include "src/surface.cyr"
 include "src/draw.cyr"
+# present.cyr — surface -> screen: a platform-neutral P6 PPM writer plus the
+# Linux /dev/fb0 SdPresenter (probe/scale/letterbox blit), adapted from
+# encom-hits' engine.cyr. Depends on surface + error only.
+include "src/present.cyr"
 include "src/geom.cyr"
 include "src/path.cyr"
 include "src/raster.cyr"

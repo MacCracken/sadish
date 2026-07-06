@@ -305,6 +305,220 @@ fn sd_clear(s, color): i64 {
     return sd_fill_rect(s, 0, 0, w, h, color);
 }
 
+# --- present.cyr ---
+
+# @public — sadish present backend: get a surface onto a screen.
+#
+# present.cyr — takes an SdSurface and displays it. Two sinks:
+#
+#   1. sd_surface_write_ppm(s, path) — write the surface as a binary P6 PPM.
+#      Platform-neutral (file syscalls only); the headless / CI / debug path.
+#   2. SdPresenter (sd_present_open/blit/close) — the LINUX host framebuffer
+#      sink: open /dev/fb0, probe real geometry (VSCREENINFO/FSCREENINFO),
+#      integer-scale + center-letterbox the surface honoring the physical
+#      pitch, and write the active band. Adapted from encom-hits/src/engine.cyr
+#      (probe/blit) — which fixed the "tiles across the top band" pitch bug
+#      shared by cyrius-doom/-polyomino. See docs/development/prior-art.md.
+#
+# The encom original was module-global + fixed 320x240; sadish's is
+# struct-based (reentrant) and takes the surface's own dimensions. Timing /
+# frame-pacing (game-specific) is intentionally left out.
+#
+# ⚠ sd_present_blit writes to the LIVE framebuffer — never call it from a test.
+# The fb0 path is Linux-specific (raw open/ioctl/lseek/write); the AGNOS sink
+# (kernel blit#39) is a future backend beside this one.
+
+# ---- PPM sink (platform-neutral) --------------------------------
+# Write the decimal ASCII of a non-negative n into buf at off; return new off.
+fn sd_ppm_put_dec(buf, off, n): i64 {
+    if (n == 0) {
+        store8(buf + off, 48);
+        return off + 1;
+    }
+    var digits = 0;
+    var t = n;
+    while (t > 0) { digits = digits + 1; t = t / 10; }
+    var i = digits - 1;
+    while (i >= 0) {
+        store8(buf + off + i, 48 + (n % 10));
+        n = n / 10;
+        i = i - 1;
+    }
+    return off + digits;
+}
+
+# Build "P6\n<w> <h>\n255\n" into buf; return its byte length.
+fn sd_ppm_header(buf, w, h): i64 {
+    var o = 0;
+    store8(buf + o, 80); o = o + 1;   # 'P'
+    store8(buf + o, 54); o = o + 1;   # '6'
+    store8(buf + o, 10); o = o + 1;   # newline
+    o = sd_ppm_put_dec(buf, o, w);
+    store8(buf + o, 32); o = o + 1;   # space
+    o = sd_ppm_put_dec(buf, o, h);
+    store8(buf + o, 10); o = o + 1;   # newline
+    store8(buf + o, 50); o = o + 1;   # '2'
+    store8(buf + o, 53); o = o + 1;   # '5'
+    store8(buf + o, 53); o = o + 1;   # '5'
+    store8(buf + o, 10); o = o + 1;   # newline
+    return o;
+}
+
+# @public — write the surface as a binary P6 PPM to `path`. BGRA -> RGB at
+# write time. Returns SADISH_OK, or SADISH_ERR_OTHER if the file won't open.
+fn sd_surface_write_ppm(s, path): i64 {
+    if (s == 0) { return SADISH_ERR_BOUNDS; }
+    var w = sd_surface_width(s);
+    var h = sd_surface_height(s);
+    var px = sd_surface_pixels(s);
+    # open(path, O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, mode 0644 = 420)
+    var fd = syscall(2, path, 577, 420);
+    if (fd < 0) { return SADISH_ERR_OTHER; }
+    var hdr = alloc(32);
+    var hlen = sd_ppm_header(hdr, w, h);
+    syscall(1, fd, hdr, hlen);
+    var n = w * h;
+    var rgb = alloc(n * 3);
+    var i = 0;
+    var j = 0;
+    while (i < n) {
+        var off = i * 4;
+        store8(rgb + j, load8(px + off + 2));      # R (BGRA byte 2)
+        store8(rgb + j + 1, load8(px + off + 1));  # G
+        store8(rgb + j + 2, load8(px + off));      # B (byte 0)
+        i = i + 1;
+        j = j + 3;
+    }
+    syscall(1, fd, rgb, n * 3);
+    syscall(3, fd);
+    return SADISH_OK;
+}
+
+# ================================================================
+# SdPresenter (72 bytes) — a Linux /dev/fb0 display sink.
+#   +0  fd     +8  xres   +16 yres   +24 bpp   +32 pitch   +64 blit-scratch(ptr)
+# ================================================================
+var SD_PRES_FD_OFFSET    = 0;
+var SD_PRES_XRES_OFFSET  = 8;
+var SD_PRES_YRES_OFFSET  = 16;
+var SD_PRES_BPP_OFFSET   = 24;
+var SD_PRES_PITCH_OFFSET = 32;
+var SD_PRES_BLIT_OFFSET  = 64;
+var SD_PRESENTER_SIZE    = 72;
+
+# @public — open /dev/fb0 and probe geometry. Returns an SdPresenter, or 0 if
+# the framebuffer is unavailable (no device / no permission) — callers fall
+# back to sd_surface_write_ppm.
+fn sd_present_open(): i64 {
+    var fd = syscall(2, "/dev/fb0", 2, 0);   # open O_RDWR
+    if (fd < 0) { return 0; }
+    var vinfo = alloc(256);
+    var finfo = alloc(256);
+    memset(vinfo, 0, 256);
+    memset(finfo, 0, 256);
+    syscall(16, fd, 0x4600, vinfo);   # ioctl FBIOGET_VSCREENINFO
+    syscall(16, fd, 0x4602, finfo);   # ioctl FBIOGET_FSCREENINFO
+    var xres = load32(vinfo + 0);     # fb_var_screeninfo.xres
+    var yres = load32(vinfo + 4);     # .yres
+    var bpp  = load32(vinfo + 24);    # .bits_per_pixel
+    var pitch = load32(finfo + 48);   # fb_fix_screeninfo.line_length
+    if (xres <= 0) { xres = 640; }
+    if (yres <= 0) { yres = 480; }
+    if (bpp  <= 0) { bpp  = 32; }
+    var minpitch = xres * (bpp / 8);
+    if (pitch < minpitch) { pitch = minpitch; }
+    var p = alloc(SD_PRESENTER_SIZE);
+    store64(p + SD_PRES_FD_OFFSET, fd);
+    store64(p + SD_PRES_XRES_OFFSET, xres);
+    store64(p + SD_PRES_YRES_OFFSET, yres);
+    store64(p + SD_PRES_BPP_OFFSET, bpp);
+    store64(p + SD_PRES_PITCH_OFFSET, pitch);
+    var blit = alloc(pitch * yres);
+    memset(blit, 0, pitch * yres);
+    store64(p + SD_PRES_BLIT_OFFSET, blit);
+    return p;
+}
+
+# @public — scale + center-letterbox `s` into the framebuffer and write it.
+# ⚠ writes to the live display. Integer scale = largest that fits both axes.
+fn sd_present_blit(p, s): i64 {
+    if (p == 0) { return SADISH_ERR_BOUNDS; }
+    if (s == 0) { return SADISH_ERR_BOUNDS; }
+    var fd = load64(p + SD_PRES_FD_OFFSET);
+    var xres = load64(p + SD_PRES_XRES_OFFSET);
+    var yres = load64(p + SD_PRES_YRES_OFFSET);
+    var bpp = load64(p + SD_PRES_BPP_OFFSET);
+    var pitch = load64(p + SD_PRES_PITCH_OFFSET);
+    var blit = load64(p + SD_PRES_BLIT_OFFSET);
+    var sw = sd_surface_width(s);
+    var sh = sd_surface_height(s);
+    var srcpx = sd_surface_pixels(s);
+
+    var scale = xres / sw;
+    var scy = yres / sh;
+    if (scy < scale) { scale = scy; }
+    if (scale < 1) { scale = 1; }
+    var xoff = (xres - sw * scale) / 2;
+    var yoff = (yres - sh * scale) / 2;
+    if (xoff < 0) { xoff = 0; }
+    if (yoff < 0) { yoff = 0; }
+    var bpp_bytes = bpp / 8;
+    var row_bytes = sw * (scale * bpp_bytes);
+
+    var sy = 0;
+    while (sy < sh) {
+        var src_row = srcpx + sy * (sw * 4);
+        var dy0 = yoff + sy * scale;
+        var first = blit + dy0 * pitch + xoff * bpp_bytes;
+        var dx = first;
+        var sx = 0;
+        while (sx < sw) {
+            var so = sx * 4;
+            if (bpp == 16) {
+                var b = load8(src_row + so);
+                var g = load8(src_row + so + 1);
+                var r = load8(src_row + so + 2);
+                var p16 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                var rx = 0;
+                while (rx < scale) {
+                    store8(dx, p16 & 0xFF);
+                    store8(dx + 1, (p16 >> 8) & 0xFF);
+                    dx = dx + 2;
+                    rx = rx + 1;
+                }
+            } else {
+                var p32 = load32(src_row + so) | 0xFF000000;
+                var rx = 0;
+                while (rx < scale) {
+                    store32(dx, p32);
+                    dx = dx + bpp_bytes;
+                    rx = rx + 1;
+                }
+            }
+            sx = sx + 1;
+        }
+        var ry = 1;
+        while (ry < scale) {
+            memcpy(blit + (dy0 + ry) * pitch + xoff * bpp_bytes, first, row_bytes);
+            ry = ry + 1;
+        }
+        sy = sy + 1;
+    }
+
+    var rows = sh * scale;
+    if (yoff + rows > yres) { rows = yres - yoff; }
+    syscall(8, fd, yoff * pitch, 0);                    # lseek SEEK_SET
+    syscall(1, fd, blit + yoff * pitch, rows * pitch);  # write active band
+    return SADISH_OK;
+}
+
+# @public — close the framebuffer fd.
+fn sd_present_close(p): i64 {
+    if (p == 0) { return SADISH_OK; }
+    syscall(3, load64(p + SD_PRES_FD_OFFSET));
+    return SADISH_OK;
+}
+
 # --- geom.cyr ---
 
 # @public — sadish geometry primitives: points + affine matrices.

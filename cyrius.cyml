@@ -32,6 +32,7 @@ modules = [
     "src/error.cyr",
     "src/surface.cyr",
     "src/draw.cyr",
+    "src/present.cyr",
     "src/geom.cyr",
     "src/path.cyr",
     "src/raster.cyr",

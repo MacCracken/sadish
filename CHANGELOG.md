@@ -28,3 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   filled vs hollow rect, silent out-of-bounds clip). The anti-aliased coverage
   path (`SdCanvas`) stays separate; `sd_canvas_blit` will composite coverage
   onto an `SdSurface` in v0.2.0.
+- **Present backend** (`src/present.cyr`) — `sd_surface_write_ppm` (binary P6
+  PPM dump, platform-neutral file syscalls) + the Linux `/dev/fb0` `SdPresenter`
+  (`sd_present_open`/`_blit`/`_close`: geometry probe, largest-integer-scale
+  center-letterbox blit honoring the physical pitch, 32bpp + RGB565 paths),
+  adapted from encom-hits' `engine.cyr`. Struct-based/reentrant (the encom
+  original was module-global + fixed 320×240). Verified by
+  `programs/present_test.cyr` (PPM write + readback); the fb0 path is never
+  exercised in tests — it writes the live display. The AGNOS `blit`#39 sink is
+  a future backend beside fb0.
+- **CI + release** (`.github/workflows/{ci,release}.yml`) — build / lint / fmt /
+  vet / dist-sync + RUN-test suites, a security scan (raw execve/fork/sys_system),
+  and docs + version-consistency gates; semver-tag release that archives the src
+  tarball + `dist/sadish.cyr` + `SHA256SUMS`. Toolchain pinned via
+  `cyrius.cyml` (no version hardcoded in YAML).

@@ -1,0 +1,67 @@
+# programs/present_test.cyr — RUN test for the PPM sink.
+#
+# SAFE: never touches /dev/fb0 (that would scribble on the live display).
+# Draws a 4x2 surface, writes a P6 PPM, reads it back, and asserts the header
+# + the first two pixels. Exit code = number of failed checks (0 = PASS).
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    var s = sd_surface_new(4, 2);
+    sd_plot(s, 0, 0, sd_rgb(255, 0, 0));   # red
+    sd_plot(s, 1, 0, sd_rgb(0, 255, 0));   # green
+
+    var path = "build/present_test.ppm";
+    check(sd_surface_write_ppm(s, path), SADISH_OK);
+
+    # read it back
+    var fd = syscall(2, path, 0, 0);       # open O_RDONLY
+    if (fd < 0) { g_fails = g_fails + 1; }
+    var buf = alloc(256);
+    syscall(0, fd, buf, 256);              # read
+    syscall(3, fd);
+
+    # header "P6\n4 2\n255\n" = 11 bytes
+    check(load8(buf + 0), 80);    # P
+    check(load8(buf + 1), 54);    # 6
+    check(load8(buf + 2), 10);
+    check(load8(buf + 3), 52);    # 4
+    check(load8(buf + 4), 32);    # space
+    check(load8(buf + 5), 50);    # 2
+    check(load8(buf + 6), 10);
+    check(load8(buf + 7), 50);    # 2
+    check(load8(buf + 8), 53);    # 5
+    check(load8(buf + 9), 53);    # 5
+    check(load8(buf + 10), 10);
+
+    # pixel (0,0) red -> R,G,B = 255,0,0 at data offset 11
+    check(load8(buf + 11), 255);
+    check(load8(buf + 12), 0);
+    check(load8(buf + 13), 0);
+    # pixel (1,0) green -> 0,255,0 at offset 14
+    check(load8(buf + 14), 0);
+    check(load8(buf + 15), 255);
+    check(load8(buf + 16), 0);
+
+    if (g_fails == 0) {
+        var ok = "present_test: PASS (PPM write+readback)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "present_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
