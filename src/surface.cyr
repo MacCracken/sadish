@@ -1,0 +1,98 @@
+# @public — sadish pixel surface: the direct primitives' destination buffer.
+#
+# surface.cyr — an SdSurface owns a width*height 32bpp pixel buffer in the
+# ecosystem-convergent BGRA byte order (memory: B,G,R,A), so a packed sadish
+# color 0x00RRGGBB lands verbatim in a little-endian 32bpp framebuffer. This is
+# the DESTINATION buffer: the direct hairline/fill primitives in draw.cyr write
+# here, and (v0.2+) the coverage blit in raster.cyr will composite onto it.
+#
+# Lifted, not reinvented: the pixel-write convention, the {w,h,px} layout, and
+# the coordinate system (origin top-left, y-down, off = (y*w + x)*4) are the
+# shared idiom proven across the ecosystem's framebuffer apps (encom-hits,
+# cyrius-bb/-polyomino, cyrius-doom). See docs/development/prior-art.md.
+
+# ================================================================
+# Color — a packed 0x00RRGGBB integer. Stored to the surface as BGRA with the
+# alpha byte forced opaque (0xFF); read back RGB-packed (alpha dropped).
+# ================================================================
+# @public — pack (r,g,b) 0..255 into a sadish color 0x00RRGGBB.
+fn sd_rgb(r, g, b): i64 {
+    return ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
+}
+# @public — channel extractors.
+fn sd_color_r(c): i64 { return (c >> 16) & 255; }
+fn sd_color_g(c): i64 { return (c >> 8) & 255; }
+fn sd_color_b(c): i64 { return c & 255; }
+
+# ================================================================
+# SdSurface (32 bytes):
+#   +0:  width   (i64 — pixels)
+#   +8:  height  (i64 — pixels)
+#   +16: pixels  (ptr — owned width*height*4 bytes, BGRA, packed)
+#   +24: stride  (i64 — bytes per row; width*4 for the packed buffer)
+# ================================================================
+var SD_SURFACE_WIDTH_OFFSET  = 0;
+var SD_SURFACE_HEIGHT_OFFSET = 8;
+var SD_SURFACE_PIXELS_OFFSET = 16;
+var SD_SURFACE_STRIDE_OFFSET = 24;
+var SD_SURFACE_SIZE          = 32;
+
+# @public — allocate a w*h BGRA surface, cleared to transparent black (0).
+# Returns the SdSurface ptr, or 0 on OOM / bad dimensions.
+fn sd_surface_new(w, h): i64 {
+    if (w <= 0) { return 0; }
+    if (h <= 0) { return 0; }
+    var s = alloc(SD_SURFACE_SIZE);
+    if (s == 0) { return 0; }
+    var nbytes = (w * h) * 4;
+    var px = alloc(nbytes);
+    if (px == 0) { return 0; }
+    memset(px, 0, nbytes);
+    store64(s + SD_SURFACE_WIDTH_OFFSET, w);
+    store64(s + SD_SURFACE_HEIGHT_OFFSET, h);
+    store64(s + SD_SURFACE_PIXELS_OFFSET, px);
+    store64(s + SD_SURFACE_STRIDE_OFFSET, (w * 4));
+    return s;
+}
+
+# ---- accessors --------------------------------------------------
+# @public
+fn sd_surface_width(s): i64  { return load64(s + SD_SURFACE_WIDTH_OFFSET); }
+# @public
+fn sd_surface_height(s): i64 { return load64(s + SD_SURFACE_HEIGHT_OFFSET); }
+# @public
+fn sd_surface_pixels(s): i64 { return load64(s + SD_SURFACE_PIXELS_OFFSET); }
+# @public
+fn sd_surface_stride(s): i64 { return load64(s + SD_SURFACE_STRIDE_OFFSET); }
+
+# Bounds-checked BGRA store into a raw pixel buffer (w,h in pixels). Private
+# helper shared by every primitive so the write convention lives in one place.
+fn sd_put(px, w, h, x, y, color): i64 {
+    if (x < 0) { return 0; }
+    if (x >= w) { return 0; }
+    if (y < 0) { return 0; }
+    if (y >= h) { return 0; }
+    var off = ((y * w) + x) * 4;
+    store8(px + off, color & 255);
+    store8(px + off + 1, (color >> 8) & 255);
+    store8(px + off + 2, (color >> 16) & 255);
+    store8(px + off + 3, 255);
+    return 0;
+}
+
+# @public — read a pixel back as a packed 0x00RRGGBB color (alpha dropped).
+# Out-of-bounds reads return 0. The readback path for tests + coverage compositing.
+fn sd_surface_pixel_at(s, x, y): i64 {
+    var w = load64(s + SD_SURFACE_WIDTH_OFFSET);
+    var h = load64(s + SD_SURFACE_HEIGHT_OFFSET);
+    if (x < 0) { return 0; }
+    if (y < 0) { return 0; }
+    if (x >= w) { return 0; }
+    if (y >= h) { return 0; }
+    var px = load64(s + SD_SURFACE_PIXELS_OFFSET);
+    var off = ((y * w) + x) * 4;
+    var b = load8(px + off);
+    var g = load8(px + off + 1);
+    var r = load8(px + off + 2);
+    return (r << 16) | (g << 8) | b;
+}

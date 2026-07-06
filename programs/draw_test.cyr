@@ -1,0 +1,98 @@
+# programs/draw_test.cyr — RUN test for the sadish direct primitives.
+#
+# Draws known shapes into an SdSurface and asserts pixel readback. Exit code =
+# number of failed checks (0 = PASS). Pure in-memory (no file I/O), so it runs
+# headless in CI. Compiling is not passing — this exercises the actual writes.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    var RED    = sd_rgb(255, 0, 0);      # 0xFF0000 = 16711680
+    var GREEN  = sd_rgb(0, 255, 0);      # 0x00FF00 = 65280
+    var BLUE   = sd_rgb(0, 0, 255);      # 0x0000FF = 255
+    var WHITE  = sd_rgb(255, 255, 255);  # 0xFFFFFF = 16777215
+    var YELLOW = sd_rgb(255, 255, 0);    # 0xFFFF00 = 16776960
+    var CYAN   = sd_rgb(0, 255, 255);    # 0x00FFFF = 65535
+
+    # color-pack sanity
+    check(RED, 16711680);
+    check(GREEN, 65280);
+    check(BLUE, 255);
+    check(CYAN, 65535);
+
+    var s = sd_surface_new(16, 16);
+    if (s == 0) { g_fails = g_fails + 1; }
+    check(sd_surface_width(s), 16);
+    check(sd_surface_height(s), 16);
+
+    # freshly cleared to 0
+    check(sd_surface_pixel_at(s, 0, 0), 0);
+    check(sd_surface_pixel_at(s, 8, 8), 0);
+
+    # plot one pixel + a bystander stays clear
+    sd_plot(s, 3, 4, RED);
+    check(sd_surface_pixel_at(s, 3, 4), 16711680);
+    check(sd_surface_pixel_at(s, 3, 5), 0);
+
+    # hline row 10, x 2..6 green; endpoints in, neighbors out
+    sd_hline(s, 2, 6, 10, GREEN);
+    check(sd_surface_pixel_at(s, 2, 10), 65280);
+    check(sd_surface_pixel_at(s, 6, 10), 65280);
+    check(sd_surface_pixel_at(s, 1, 10), 0);
+    check(sd_surface_pixel_at(s, 7, 10), 0);
+
+    # vline col 5, y 1..3 blue
+    sd_vline(s, 5, 1, 3, BLUE);
+    check(sd_surface_pixel_at(s, 5, 1), 255);
+    check(sd_surface_pixel_at(s, 5, 3), 255);
+    check(sd_surface_pixel_at(s, 5, 4), 0);
+
+    # pure diagonal (0,0)->(3,3) white — Bresenham must step exactly diagonally
+    sd_line(s, 0, 0, 3, 3, WHITE);
+    check(sd_surface_pixel_at(s, 0, 0), 16777215);
+    check(sd_surface_pixel_at(s, 1, 1), 16777215);
+    check(sd_surface_pixel_at(s, 2, 2), 16777215);
+    check(sd_surface_pixel_at(s, 3, 3), 16777215);
+
+    # filled rect 8,8 size 2x2 yellow; outside stays clear
+    sd_fill_rect(s, 8, 8, 2, 2, YELLOW);
+    check(sd_surface_pixel_at(s, 8, 8), 16776960);
+    check(sd_surface_pixel_at(s, 9, 9), 16776960);
+    check(sd_surface_pixel_at(s, 10, 10), 0);
+
+    # rect OUTLINE 12,12 size 3x3 cyan; corners set, center hollow
+    sd_rect(s, 12, 12, 3, 3, CYAN);
+    check(sd_surface_pixel_at(s, 12, 12), 65535);
+    check(sd_surface_pixel_at(s, 14, 14), 65535);
+    check(sd_surface_pixel_at(s, 13, 13), 0);
+
+    # out-of-bounds writes must clip silently, not corrupt / crash
+    sd_plot(s, -1, -1, RED);
+    sd_plot(s, 100, 100, RED);
+    sd_hline(s, -5, 100, 100, RED);
+    sd_vline(s, 100, -5, 100, RED);
+    sd_line(s, -3, -3, 40, 40, RED);
+    check(sd_surface_pixel_at(s, 0, 15), 0);   # untouched corner still clear
+
+    if (g_fails == 0) {
+        var ok = "draw_test: PASS (all pixel checks)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "draw_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

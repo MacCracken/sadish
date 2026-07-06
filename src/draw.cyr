@@ -1,0 +1,123 @@
+# @public — sadish direct 2D primitives (opaque, integer-pixel).
+#
+# draw.cyr — hairline + axis-aligned primitives adapted from the ecosystem's
+# framebuffer games (integer Bresenham line, hline/vline fast paths, rect
+# outline, filled rect, clear). This is the "easy 80%" LIFTED rather than
+# reinvented (see docs/development/prior-art.md): proven, dependency-free,
+# opaque 1px drawing onto an SdSurface. The anti-aliased / coverage / winding
+# path is the separate vector core (path.cyr -> raster.cyr).
+#
+# All coordinates are whole integer pixels; color is a packed 0x00RRGGBB.
+# The Bresenham body is encom-hits/src/draw.cyr:7-55 verbatim in structure,
+# retargeted from a fixed 320x240 to the SdSurface's own width/height.
+
+# @public — plot one pixel (bounds-checked; off-surface is a silent no-op).
+fn sd_plot(s, x, y, color): i64 {
+    var w = load64(s + SD_SURFACE_WIDTH_OFFSET);
+    var h = load64(s + SD_SURFACE_HEIGHT_OFFSET);
+    var px = load64(s + SD_SURFACE_PIXELS_OFFSET);
+    return sd_put(px, w, h, x, y, color);
+}
+
+# @public — Bresenham line from (x0,y0) to (x1,y1). Integer, per-pixel clipped.
+fn sd_line(s, x0, y0, x1, y1, color): i64 {
+    var w = load64(s + SD_SURFACE_WIDTH_OFFSET);
+    var h = load64(s + SD_SURFACE_HEIGHT_OFFSET);
+    var px = load64(s + SD_SURFACE_PIXELS_OFFSET);
+    var dx = x1 - x0;
+    var dy = y1 - y0;
+    if (dx < 0) { dx = 0 - dx; }
+    if (dy < 0) { dy = 0 - dy; }
+    var sx = 1;
+    if (x0 > x1) { sx = 0 - 1; }
+    var sy = 1;
+    if (y0 > y1) { sy = 0 - 1; }
+    var err = dx - dy;
+    var x = x0;
+    var y = y0;
+    while (1) {
+        sd_put(px, w, h, x, y, color);
+        if (x == x1) {
+            if (y == y1) { return 0; }
+        }
+        var e2 = err * 2;
+        if (e2 > (0 - dy)) { err = err - dy; x = x + sx; }
+        if (e2 < dx) { err = err + dx; y = y + sy; }
+    }
+    return 0;
+}
+
+# @public — horizontal span [x0,x1] at row y (endpoints clamped to the surface).
+fn sd_hline(s, x0, x1, y, color): i64 {
+    var w = load64(s + SD_SURFACE_WIDTH_OFFSET);
+    var h = load64(s + SD_SURFACE_HEIGHT_OFFSET);
+    if (y < 0) { return 0; }
+    if (y >= h) { return 0; }
+    var px = load64(s + SD_SURFACE_PIXELS_OFFSET);
+    var start = x0;
+    var end = x1;
+    if (start > end) { var tmp = start; start = end; end = tmp; }
+    if (start < 0) { start = 0; }
+    if (end >= w) { end = w - 1; }
+    var base = (y * w) * 4;
+    var x = start;
+    while (x <= end) {
+        var off = base + x * 4;
+        store8(px + off, color & 255);
+        store8(px + off + 1, (color >> 8) & 255);
+        store8(px + off + 2, (color >> 16) & 255);
+        store8(px + off + 3, 255);
+        x = x + 1;
+    }
+    return 0;
+}
+
+# @public — vertical span [y0,y1] at column x (endpoints clamped to the surface).
+fn sd_vline(s, x, y0, y1, color): i64 {
+    var w = load64(s + SD_SURFACE_WIDTH_OFFSET);
+    var h = load64(s + SD_SURFACE_HEIGHT_OFFSET);
+    if (x < 0) { return 0; }
+    if (x >= w) { return 0; }
+    var px = load64(s + SD_SURFACE_PIXELS_OFFSET);
+    var start = y0;
+    var end = y1;
+    if (start > end) { var tmp = start; start = end; end = tmp; }
+    if (start < 0) { start = 0; }
+    if (end >= h) { end = h - 1; }
+    var y = start;
+    while (y <= end) {
+        var off = ((y * w) + x) * 4;
+        store8(px + off, color & 255);
+        store8(px + off + 1, (color >> 8) & 255);
+        store8(px + off + 2, (color >> 16) & 255);
+        store8(px + off + 3, 255);
+        y = y + 1;
+    }
+    return 0;
+}
+
+# @public — rectangle OUTLINE (4 edges); top-left (x,y), size rw*rh.
+fn sd_rect(s, x, y, rw, rh, color): i64 {
+    sd_hline(s, x, x + rw - 1, y, color);
+    sd_hline(s, x, x + rw - 1, y + rh - 1, color);
+    sd_vline(s, x, y, y + rh - 1, color);
+    sd_vline(s, x + rw - 1, y, y + rh - 1, color);
+    return 0;
+}
+
+# @public — FILLED rectangle; top-left (x,y), size rw*rh.
+fn sd_fill_rect(s, x, y, rw, rh, color): i64 {
+    var row = 0;
+    while (row < rh) {
+        sd_hline(s, x, x + rw - 1, y + row, color);
+        row = row + 1;
+    }
+    return 0;
+}
+
+# @public — clear the whole surface to `color`.
+fn sd_clear(s, color): i64 {
+    var w = load64(s + SD_SURFACE_WIDTH_OFFSET);
+    var h = load64(s + SD_SURFACE_HEIGHT_OFFSET);
+    return sd_fill_rect(s, 0, 0, w, h, color);
+}

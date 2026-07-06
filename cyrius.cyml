@@ -23,12 +23,15 @@ output = "build/sadish-smoke"
 
 # `[lib]` feeds `cyrius distlib` — module order matters: stdlib first
 # (declared in src/lib.cyr), then domain modules in dependency order.
-# error.cyr is dep-free; geom.cyr uses it; path.cyr builds on geom;
-# raster.cyr consumes path. Don't reorder without re-running
-# `cyrius distlib` and verifying the concatenated bundle still compiles.
+# error.cyr is dep-free; surface.cyr (SdSurface BGRA pixel buffer) + draw.cyr
+# (direct opaque primitives) build on error only; geom.cyr uses error;
+# path.cyr builds on geom; raster.cyr consumes path. Don't reorder without
+# re-running `cyrius distlib` and verifying the concatenated bundle compiles.
 [lib]
 modules = [
     "src/error.cyr",
+    "src/surface.cyr",
+    "src/draw.cyr",
     "src/geom.cyr",
     "src/path.cyr",
     "src/raster.cyr",

@@ -35,6 +35,12 @@ include "lib/bench.cyr"
 # + fill/blit) consumes path's flattened polyline and error.cyr's codes.
 # ================================================================
 include "src/error.cyr"
+# surface.cyr (SdSurface BGRA pixel buffer) + draw.cyr (direct opaque
+# primitives: Bresenham line, hline/vline, rect, fill_rect, clear) are the
+# pixel-target + "easy 80%" primitives lifted from the ecosystem games
+# (docs/development/prior-art.md); they depend only on error + stdlib.
+include "src/surface.cyr"
+include "src/draw.cyr"
 include "src/geom.cyr"
 include "src/path.cyr"
 include "src/raster.cyr"
