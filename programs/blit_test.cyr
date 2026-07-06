@@ -1,0 +1,72 @@
+# programs/blit_test.cyr — RUN test for the coverage -> surface composite.
+#
+# Fills a shape into a coverage canvas, blits a solid color over a colored
+# surface with src-over, and asserts: full-coverage pixel = pure source,
+# zero-coverage pixel = untouched dst, partial-coverage pixel = a blend of
+# both. Exit code = failed checks.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    var RED  = sd_rgb(255, 0, 0);   # 0xFF0000 = 16711680
+    var BLUE = sd_rgb(0, 0, 255);   # 0x0000FF = 255
+
+    # --- rectangle coverage, red over blue ---
+    var surf = sd_surface_new(8, 8);
+    sd_clear(surf, BLUE);
+    var cnv = sd_canvas_new(8, 8);
+    var rp = sd_path_new();
+    sd_path_moveto(rp, 2 * SD_ONE, 2 * SD_ONE);
+    sd_path_lineto(rp, 6 * SD_ONE, 2 * SD_ONE);
+    sd_path_lineto(rp, 6 * SD_ONE, 6 * SD_ONE);
+    sd_path_lineto(rp, 2 * SD_ONE, 6 * SD_ONE);
+    sd_path_close(rp);
+    sd_canvas_fill_path(cnv, rp, SD_FILL_NONZERO);
+    check(sd_canvas_blit(cnv, surf, RED), SADISH_OK);
+    check(sd_surface_pixel_at(surf, 4, 4), 16711680);  # full cov -> pure red
+    check(sd_surface_pixel_at(surf, 6, 6), 255);        # zero cov -> untouched blue
+
+    # --- triangle coverage over blue: partial pixel must blend ---
+    var surf2 = sd_surface_new(8, 8);
+    sd_clear(surf2, BLUE);
+    var tcnv = sd_canvas_new(8, 8);
+    var tp = sd_path_new();
+    sd_path_moveto(tp, 1 * SD_ONE, 1 * SD_ONE);
+    sd_path_lineto(tp, 6 * SD_ONE, 1 * SD_ONE);
+    sd_path_lineto(tp, 1 * SD_ONE, 6 * SD_ONE);
+    sd_path_close(tp);
+    sd_canvas_fill_path(tcnv, tp, SD_FILL_NONZERO);
+    sd_canvas_blit(tcnv, surf2, RED);
+    check(sd_surface_pixel_at(surf2, 2, 2), 16711680);  # full -> red
+    check(sd_surface_pixel_at(surf2, 6, 6), 255);        # empty -> blue
+    # (3,3) partial -> purple: 0 < R < 255 AND 0 < B < 255
+    var pv = sd_surface_pixel_at(surf2, 3, 3);
+    var pr = (pv >> 16) & 255;
+    var pb = pv & 255;
+    if (pr <= 0) { g_fails = g_fails + 1; }
+    if (pr >= 255) { g_fails = g_fails + 1; }
+    if (pb <= 0) { g_fails = g_fails + 1; }
+    if (pb >= 255) { g_fails = g_fails + 1; }
+
+    if (g_fails == 0) {
+        var ok = "blit_test: PASS (coverage src-over composite)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "blit_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

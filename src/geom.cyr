@@ -144,7 +144,79 @@ fn sd_matrix_apply(m, pt): i64 {
     return sd_point_new(nx, ny);
 }
 
-# TODO(v0.2): sd_matrix_rotate(theta) + sd_matrix_skew(sx, sy) — need a
-# fixed-point sin/cos (CORDIC or a 16.16 lookup table) before rotate is
-# exact; skew is a straight shear (a=d=1, off-diagonals = tan). Both slot
-# in as sd_matrix_* constructors composed via sd_matrix_mul.
+# ================================================================
+# Fixed-point trig via CORDIC — sovereign (no float, no libm), all shifts +
+# adds through the SIGNED sd_asr. 16 rotation iterations after range-reducing
+# to [-pi/2, pi/2]; accurate to a few 16.16 LSBs.
+# ================================================================
+# atan(2^-i) in 16.16 radians, i = 0..15.
+fn sd_cordic_atan(i): i64 {
+    if (i == 0)  { return 51472; }
+    if (i == 1)  { return 30386; }
+    if (i == 2)  { return 16055; }
+    if (i == 3)  { return 8150; }
+    if (i == 4)  { return 4091; }
+    if (i == 5)  { return 2047; }
+    if (i == 6)  { return 1024; }
+    if (i == 7)  { return 512; }
+    if (i == 8)  { return 256; }
+    if (i == 9)  { return 128; }
+    if (i == 10) { return 64; }
+    if (i == 11) { return 32; }
+    if (i == 12) { return 16; }
+    if (i == 13) { return 8; }
+    if (i == 14) { return 4; }
+    return 2;
+}
+
+# theta in 16.16 radians -> cos (want_sin=0) or sin (want_sin=1) in 16.16.
+fn sd_cordic(theta, want_sin): i64 {
+    var two_pi = 411775;
+    var pi = 205887;
+    var half_pi = 102944;
+    var t = theta;
+    while (t > pi) { t = t - two_pi; }
+    while (t < 0 - pi) { t = t + two_pi; }
+    # Fold [-pi,pi] into [-pi/2, pi/2]; a fold past +-pi/2 flips both signs.
+    var flip = 0;
+    if (t > half_pi) { t = t - pi; flip = 1; }
+    if (t < 0 - half_pi) { t = t + pi; flip = 1; }
+
+    var x = 39797;   # K gain (1 / A_16) in 16.16 — cancels the CORDIC gain
+    var y = 0;
+    var z = t;
+    var i = 0;
+    while (i < 16) {
+        var dx = sd_asr(x, i);
+        var dy = sd_asr(y, i);
+        if (z >= 0) {
+            x = x - dy;
+            y = y + dx;
+            z = z - sd_cordic_atan(i);
+        } else {
+            x = x + dy;
+            y = y - dx;
+            z = z + sd_cordic_atan(i);
+        }
+        i = i + 1;
+    }
+    if (flip != 0) { x = 0 - x; y = 0 - y; }
+    if (want_sin != 0) { return y; }
+    return x;
+}
+
+# @public — cos(theta), theta in 16.16 radians -> 16.16.
+fn sd_cos(theta): i64 { return sd_cordic(theta, 0); }
+# @public — sin(theta), theta in 16.16 radians -> 16.16.
+fn sd_sin(theta): i64 { return sd_cordic(theta, 1); }
+
+# @public — rotation by `theta` (16.16 radians). Maps (x,y) ->
+# (x*cos - y*sin, x*sin + y*cos): a=cos, b=sin, c=-sin, d=cos.
+fn sd_matrix_rotate(theta): i64 {
+    var c = sd_cos(theta);
+    var s = sd_sin(theta);
+    return sd_matrix_new(c, s, 0 - s, c, 0, 0);
+}
+
+# TODO(v0.4): sd_matrix_skew(sx, sy) — a straight shear (a=d=1, off-diagonals
+# = tan), composed via sd_matrix_mul.

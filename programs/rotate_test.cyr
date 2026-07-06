@@ -1,0 +1,63 @@
+# programs/rotate_test.cyr — RUN test for CORDIC fixed-point trig + rotate.
+#
+# Near-equality (tolerance) checks, since CORDIC is accurate to a few 16.16
+# LSBs, not exact. Covers known angles, the range fold (theta = pi), and
+# rotating the unit x-vector. Exit code = failed checks.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn near(got, want, tol): i64 {
+    var d = got - want;
+    if (d < 0) { d = 0 - d; }
+    if (d <= tol) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var HALF_PI    = 102944;   # pi/2 in 16.16
+    var QUARTER_PI = 51472;    # pi/4
+    var PI         = 205887;   # pi
+    var COS45      = 46341;    # sqrt(2)/2 in 16.16
+    var tol        = 300;      # ~0.0046 px — well above CORDIC error
+
+    # cos/sin at 0
+    near(sd_cos(0), SD_ONE, tol);
+    near(sd_sin(0), 0, tol);
+    # cos/sin at pi/2
+    near(sd_cos(HALF_PI), 0, tol);
+    near(sd_sin(HALF_PI), SD_ONE, tol);
+    # cos/sin at pi/4
+    near(sd_cos(QUARTER_PI), COS45, tol);
+    near(sd_sin(QUARTER_PI), COS45, tol);
+
+    # rotate the unit x-vector (1,0) by pi/2 -> (~0, ~1)
+    var q = sd_matrix_apply(sd_matrix_rotate(HALF_PI), sd_point_new(SD_ONE, 0));
+    near(sd_point_x(q), 0, tol);
+    near(sd_point_y(q), SD_ONE, tol);
+
+    # rotate (1,0) by pi/4 -> (~0.707, ~0.707)
+    var q2 = sd_matrix_apply(sd_matrix_rotate(QUARTER_PI), sd_point_new(SD_ONE, 0));
+    near(sd_point_x(q2), COS45, tol);
+    near(sd_point_y(q2), COS45, tol);
+
+    # rotate (1,0) by pi -> (~-1, ~0) (exercises the range fold + sign flip)
+    var q3 = sd_matrix_apply(sd_matrix_rotate(PI), sd_point_new(SD_ONE, 0));
+    near(sd_point_x(q3), 0 - SD_ONE, tol);
+    near(sd_point_y(q3), 0, tol);
+
+    if (g_fails == 0) {
+        var ok = "rotate_test: PASS (CORDIC sin/cos + rotate)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "rotate_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

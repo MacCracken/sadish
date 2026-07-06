@@ -5,6 +5,39 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - unreleased
+
+The rasterizer — the vector core comes alive. Paths now flatten, fill to
+anti-aliased coverage, and composite onto a surface; plus affine rotation.
+All five pieces are RUN-tested.
+
+### Added
+- **Signed fixed-point** (`sd_asr` + `sd_fixed_mul` routed through it, plus
+  `sd_abs`) — Cyrius `>>` is logical (zero-fill); the signed arithmetic-right
+  shift keeps negative products (mirrors, rotations, below-origin coords)
+  correct. Guarded by `programs/geom_test.cyr`.
+- **Adaptive Bézier flattening** (`sd_path_flatten`) — real de Casteljau
+  subdivision for quad + cubic verbs, second-difference flatness vs `tol`,
+  midpoints via `sd_asr`. Replaces the anchor-only stub.
+  (`programs/flatten_test.cyr`.)
+- **Scanline coverage fill** (`sd_canvas_fill_path`) — the headline: builds a
+  closed-edge list from the flattened path (each subpath closed back to its
+  moveto), then supersampled (4×4) anti-aliased coverage via a +x winding ray
+  per sub-sample, honoring both nonzero and even-odd rules.
+  (`programs/fill_test.cyr`.)
+- **Coverage composite** (`sd_canvas_blit`) — retyped from the raw-`fb` stub to
+  composite coverage × a solid color, src-over, onto an `SdSurface`.
+  (`programs/blit_test.cyr`.)
+- **Affine rotate** (`sd_matrix_rotate`, `sd_cos`/`sd_sin`) — sovereign
+  fixed-point trig via CORDIC (16 iterations, shifts + adds only, no float / no
+  libm), range-reduced to [-π/2, π/2]. (`programs/rotate_test.cyr`.)
+
+### Notes
+- Coverage is supersampled (4×4 → 17 levels); an analytic signed-area cell
+  accumulator (smoother AA, lower cost) is TODO(v0.4), along with gradient
+  paints, clip paths, stroking, matrix skew, and a growable path/flatten
+  backing.
+
 ## [0.2.0] - 2026-07-05
 
 The "easy 80%" lift — sadish stops being a scaffold. A real pixel surface,

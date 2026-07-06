@@ -667,10 +667,82 @@ fn sd_matrix_apply(m, pt): i64 {
     return sd_point_new(nx, ny);
 }
 
-# TODO(v0.2): sd_matrix_rotate(theta) + sd_matrix_skew(sx, sy) — need a
-# fixed-point sin/cos (CORDIC or a 16.16 lookup table) before rotate is
-# exact; skew is a straight shear (a=d=1, off-diagonals = tan). Both slot
-# in as sd_matrix_* constructors composed via sd_matrix_mul.
+# ================================================================
+# Fixed-point trig via CORDIC — sovereign (no float, no libm), all shifts +
+# adds through the SIGNED sd_asr. 16 rotation iterations after range-reducing
+# to [-pi/2, pi/2]; accurate to a few 16.16 LSBs.
+# ================================================================
+# atan(2^-i) in 16.16 radians, i = 0..15.
+fn sd_cordic_atan(i): i64 {
+    if (i == 0)  { return 51472; }
+    if (i == 1)  { return 30386; }
+    if (i == 2)  { return 16055; }
+    if (i == 3)  { return 8150; }
+    if (i == 4)  { return 4091; }
+    if (i == 5)  { return 2047; }
+    if (i == 6)  { return 1024; }
+    if (i == 7)  { return 512; }
+    if (i == 8)  { return 256; }
+    if (i == 9)  { return 128; }
+    if (i == 10) { return 64; }
+    if (i == 11) { return 32; }
+    if (i == 12) { return 16; }
+    if (i == 13) { return 8; }
+    if (i == 14) { return 4; }
+    return 2;
+}
+
+# theta in 16.16 radians -> cos (want_sin=0) or sin (want_sin=1) in 16.16.
+fn sd_cordic(theta, want_sin): i64 {
+    var two_pi = 411775;
+    var pi = 205887;
+    var half_pi = 102944;
+    var t = theta;
+    while (t > pi) { t = t - two_pi; }
+    while (t < 0 - pi) { t = t + two_pi; }
+    # Fold [-pi,pi] into [-pi/2, pi/2]; a fold past +-pi/2 flips both signs.
+    var flip = 0;
+    if (t > half_pi) { t = t - pi; flip = 1; }
+    if (t < 0 - half_pi) { t = t + pi; flip = 1; }
+
+    var x = 39797;   # K gain (1 / A_16) in 16.16 — cancels the CORDIC gain
+    var y = 0;
+    var z = t;
+    var i = 0;
+    while (i < 16) {
+        var dx = sd_asr(x, i);
+        var dy = sd_asr(y, i);
+        if (z >= 0) {
+            x = x - dy;
+            y = y + dx;
+            z = z - sd_cordic_atan(i);
+        } else {
+            x = x + dy;
+            y = y - dx;
+            z = z + sd_cordic_atan(i);
+        }
+        i = i + 1;
+    }
+    if (flip != 0) { x = 0 - x; y = 0 - y; }
+    if (want_sin != 0) { return y; }
+    return x;
+}
+
+# @public — cos(theta), theta in 16.16 radians -> 16.16.
+fn sd_cos(theta): i64 { return sd_cordic(theta, 0); }
+# @public — sin(theta), theta in 16.16 radians -> 16.16.
+fn sd_sin(theta): i64 { return sd_cordic(theta, 1); }
+
+# @public — rotation by `theta` (16.16 radians). Maps (x,y) ->
+# (x*cos - y*sin, x*sin + y*cos): a=cos, b=sin, c=-sin, d=cos.
+fn sd_matrix_rotate(theta): i64 {
+    var c = sd_cos(theta);
+    var s = sd_sin(theta);
+    return sd_matrix_new(c, s, 0 - s, c, 0, 0);
+}
+
+# TODO(v0.4): sd_matrix_skew(sx, sy) — a straight shear (a=d=1, off-diagonals
+# = tan), composed via sd_matrix_mul.
 
 # --- path.cyr ---
 
@@ -1053,20 +1125,86 @@ fn sd_canvas_clear(cv): i64 {
     return SADISH_OK;
 }
 
+# ---- fill internals --------------------------------------------
+# Supersampling factor per axis (SS*SS samples/pixel -> 0..255 coverage).
+# TODO(v0.4): replace supersampling with an analytic signed-area cell
+# accumulator (stb_truetype / FreeType-smooth) for smoother AA at lower cost.
+var SD_FILL_SS = 4;
+
+# Edge builder ctx: +0 edges(ptr, 4 i64/edge: ax,ay,bx,by)  +8 count  +16 cap.
+# Horizontal edges (ay == by) contribute no crossings and are dropped.
+fn sd_edge_add(ectx, ax, ay, bx, by): i64 {
+    if (ay == by) { return 0; }
+    var count = load64(ectx + 8);
+    var cap = load64(ectx + 16);
+    if (count >= cap) { return 0; }
+    var e = load64(ectx + 0) + count * 32;
+    store64(e + 0, ax);
+    store64(e + 8, ay);
+    store64(e + 16, bx);
+    store64(e + 24, by);
+    store64(ectx + 8, count + 1);
+    return 0;
+}
+
+# Connect `cur` through the points a flatten ctx just emitted, as edges;
+# returns the last point (the new current point).
+fn sd_fill_edges_from(ectx, fctx, cur): i64 {
+    var pts = load64(fctx + 0);
+    var n = load64(fctx + 8);
+    var prev = cur;
+    var i = 0;
+    while (i < n) {
+        var p = load64(pts + i * 8);
+        sd_edge_add(ectx, sd_point_x(prev), sd_point_y(prev), sd_point_x(p), sd_point_y(p));
+        prev = p;
+        i = i + 1;
+    }
+    return prev;
+}
+
+# Cast a +x ray from (sx, sy) and accumulate edge crossings to its right.
+# `signed` = 1 -> signed winding number (nonzero rule); 0 -> crossing count
+# (even-odd rule). Half-open [ylo, yhi) span test avoids double-counting a
+# vertex shared by two edges.
+fn sd_ray_cross(edges, n_edges, sx, sy, signed): i64 {
+    var acc = 0;
+    var ei = 0;
+    while (ei < n_edges) {
+        var e = edges + ei * 32;
+        var ax = load64(e + 0);
+        var ay = load64(e + 8);
+        var bx = load64(e + 16);
+        var by = load64(e + 24);
+        var ylo = ay;
+        var yhi = by;
+        if (ay > by) { ylo = by; yhi = ay; }
+        if (sy >= ylo) {
+            if (sy < yhi) {
+                var x = ax + ((bx - ax) * (sy - ay)) / (by - ay);
+                if (x > sx) {
+                    if (signed != 0) {
+                        if (by > ay) { acc = acc + 1; } else { acc = acc - 1; }
+                    } else {
+                        acc = acc + 1;
+                    }
+                }
+            }
+        }
+        ei = ei + 1;
+    }
+    return acc;
+}
+
 # ================================================================
 # sd_canvas_fill_path — rasterize `path` into the canvas coverage buffer
-# under winding rule `rule` (SD_FILL_EVEN_ODD | SD_FILL_NONZERO).
+# under winding rule `rule` (SD_FILL_EVEN_ODD | SD_FILL_NONZERO), writing
+# 0..255 anti-aliased coverage per pixel (overwrites the buffer).
 #
-# v0.1 STUB: flattens the path (proving the path->raster handoff links)
-# and returns SADISH_OK without writing coverage yet. An empty path is
-# reported as SADISH_ERR_EMPTY_PATH so the contract is real from day one.
-#
-# TODO(v0.2): the scanline coverage accumulator — build an active-edge
-# table from the flattened polyline, walk scanlines top-to-bottom,
-# compute per-pixel signed area coverage (a signed-area / cell approach in
-# the mould of stb_truetype's rasterizer and FreeType's smooth renderer),
-# apply the winding rule (even-odd = parity of crossings; nonzero = sum of
-# signed windings != 0), and store 0..255 anti-aliased coverage per pixel.
+# Pipeline: flatten curve verbs (de Casteljau) into a CLOSED edge list —
+# each subpath is closed back to its moveto — then, per pixel, sample an
+# SS*SS grid and cast a +x winding ray per sub-sample; coverage is the
+# fraction of sub-samples inside.
 # ================================================================
 # @public
 fn sd_canvas_fill_path(cv, path, rule): i64 {
@@ -1075,36 +1213,178 @@ fn sd_canvas_fill_path(cv, path, rule): i64 {
     var n_verbs = sd_path_verb_count(path);
     if (n_verbs == 0) { return SADISH_ERR_EMPTY_PATH; }
 
-    # Flatten to a polyline (curve verbs -> line segments). tol = 1/4 px.
+    var w = sd_canvas_width(cv);
+    var h = sd_canvas_height(cv);
+    var cov = sd_canvas_coverage(cv);
+    var stride = sd_canvas_stride(cv);
     var tol = SD_ONE >> 2;
-    var pl = sd_path_flatten(path, tol);
-    if (pl == 0) { return SADISH_ERR_EMPTY_PATH; }
 
-    # TODO(v0.2): consume `pl` + `rule` into the scanline coverage pass.
-    # For now the handoff is proven and coverage is left at its cleared
-    # state.
+    # ---- build the closed-edge list ----
+    var ecap = SD_FLATTEN_CAP;
+    var ectx = alloc(24);
+    store64(ectx + 0, alloc(ecap * 32));
+    store64(ectx + 8, 0);
+    store64(ectx + 16, ecap);
+    var fbuf = alloc(SD_FLATTEN_CAP * 8);
+    var fctx = alloc(24);
+
+    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
+    var points = load64(path + SD_PATH_POINTS_OFFSET);
+    var cur = 0;
+    var sub_start = 0;
+    var sub_open = 0;
+    var vi = 0;
+    var pi = 0;
+    while (vi < n_verbs) {
+        var verb = load64(verbs + vi * 8);
+        if (verb == SD_VERB_MOVETO) {
+            if (sub_open != 0) {
+                sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
+            }
+            cur = load64(points + pi * 8);
+            sub_start = cur;
+            sub_open = 0;
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_LINETO) {
+            var lp = load64(points + pi * 8);
+            sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(lp), sd_point_y(lp));
+            cur = lp;
+            sub_open = 1;
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_QUADTO) {
+            var qc = load64(points + pi * 8);
+            var qe = load64(points + (pi + 1) * 8);
+            store64(fctx + 0, fbuf);
+            store64(fctx + 8, 0);
+            store64(fctx + 16, SD_FLATTEN_CAP);
+            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
+            cur = sd_fill_edges_from(ectx, fctx, cur);
+            sub_open = 1;
+            pi = pi + 2;
+        }
+        if (verb == SD_VERB_CUBICTO) {
+            var k1 = load64(points + pi * 8);
+            var k2 = load64(points + (pi + 1) * 8);
+            var ke = load64(points + (pi + 2) * 8);
+            store64(fctx + 0, fbuf);
+            store64(fctx + 8, 0);
+            store64(fctx + 16, SD_FLATTEN_CAP);
+            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
+            cur = sd_fill_edges_from(ectx, fctx, cur);
+            sub_open = 1;
+            pi = pi + 3;
+        }
+        if (verb == SD_VERB_CLOSE) {
+            sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
+            cur = sub_start;
+            sub_open = 0;
+        }
+        vi = vi + 1;
+    }
+    if (sub_open != 0) {
+        sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
+    }
+
+    var n_edges = load64(ectx + 8);
+    var edges = load64(ectx + 0);
+    if (n_edges == 0) { return SADISH_OK; }
+
+    # ---- supersampled coverage ----
+    var want_signed = 0;
+    if (rule == SD_FILL_NONZERO) { want_signed = 1; }
+    var ss = SD_FILL_SS;
+    var samples = ss * ss;
+
+    var py = 0;
+    while (py < h) {
+        var px = 0;
+        while (px < w) {
+            var incount = 0;
+            var syi = 0;
+            while (syi < ss) {
+                var sy = (py << SD_SHIFT) + (syi * SD_ONE + (SD_ONE >> 1)) / ss;
+                var sxi = 0;
+                while (sxi < ss) {
+                    var sx = (px << SD_SHIFT) + (sxi * SD_ONE + (SD_ONE >> 1)) / ss;
+                    var acc = sd_ray_cross(edges, n_edges, sx, sy, want_signed);
+                    var inside = 0;
+                    if (want_signed != 0) {
+                        if (acc != 0) { inside = 1; }
+                    } else {
+                        if ((acc & 1) != 0) { inside = 1; }
+                    }
+                    incount = incount + inside;
+                    sxi = sxi + 1;
+                }
+                syi = syi + 1;
+            }
+            store8(cov + py * stride + px, (incount * 255) / samples);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
     return SADISH_OK;
 }
 
 # ================================================================
-# sd_canvas_blit — composite the canvas coverage onto a destination
-# framebuffer `fb` (width*height packed pixels) using solid color `rgba`
-# (0xRRGGBBAA), coverage-scaling the source alpha.
+# sd_canvas_blit — composite the canvas coverage onto an SdSurface `surface`
+# using the solid `color` (0x00RRGGBB), the per-pixel coverage acting as the
+# source alpha (src-over): out = src*cov/255 + dst*(255-cov)/255. The blit is
+# clipped to the min of the canvas and surface dimensions.
 #
-# v0.1 STUB: validates the arguments and returns SADISH_OK. On AGNOS this
-# will drive the kernel blit#39; on a host it writes into a linear
-# framebuffer.
-#
-# TODO(v0.2): src-over composite of (rgba scaled by per-pixel coverage/255)
-# onto `fb`; add a gradient-paint variant (linear/radial) alongside the
-# solid path, and route the whole-canvas fast path through blit#39 on
-# AGNOS.
+# TODO(v0.4): a gradient paint (linear / radial) variant alongside the solid
+# path, and a whole-canvas fast path routed through the AGNOS blit#39.
 # ================================================================
 # @public
-fn sd_canvas_blit(cv, fb, rgba): i64 {
+fn sd_canvas_blit(cv, surface, color): i64 {
     if (cv == 0) { return SADISH_ERR_BOUNDS; }
-    if (fb == 0) { return SADISH_ERR_BOUNDS; }
-    # TODO(v0.2): per-pixel src-over using coverage as alpha.
+    if (surface == 0) { return SADISH_ERR_BOUNDS; }
+    var cw = sd_canvas_width(cv);
+    var ch = sd_canvas_height(cv);
+    var covbuf = sd_canvas_coverage(cv);
+    var covstride = sd_canvas_stride(cv);
+    var sw = sd_surface_width(surface);
+    var sh = sd_surface_height(surface);
+    var spx = sd_surface_pixels(surface);
+
+    var sr = (color >> 16) & 255;
+    var sg = (color >> 8) & 255;
+    var sb = color & 255;
+
+    var w = cw;
+    if (sw < w) { w = sw; }
+    var h = ch;
+    if (sh < h) { h = sh; }
+
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var a = load8(covbuf + y * covstride + x);
+            if (a != 0) {
+                var off = (y * sw + x) * 4;
+                if (a == 255) {
+                    store8(spx + off, sb);
+                    store8(spx + off + 1, sg);
+                    store8(spx + off + 2, sr);
+                    store8(spx + off + 3, 255);
+                } else {
+                    var ia = 255 - a;
+                    var nb = (sb * a + load8(spx + off) * ia) / 255;
+                    var ng = (sg * a + load8(spx + off + 1) * ia) / 255;
+                    var nr = (sr * a + load8(spx + off + 2) * ia) / 255;
+                    store8(spx + off, nb);
+                    store8(spx + off + 1, ng);
+                    store8(spx + off + 2, nr);
+                    store8(spx + off + 3, 255);
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
     return SADISH_OK;
 }
 

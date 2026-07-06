@@ -1,0 +1,70 @@
+# programs/fill_test.cyr — RUN test for the scanline AA coverage rasterizer.
+#
+# Fills known shapes and asserts coverage: full interior = 255, exterior = 0,
+# and an edge pixel straddling a diagonal is partial (0 < c < 255). The
+# triangle exercises the signed-division edge interpolation. Exit = failures.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # --- axis-aligned rectangle [2,6] x [2,6], nonzero ---
+    var rc = sd_canvas_new(8, 8);
+    var rp = sd_path_new();
+    sd_path_moveto(rp, 2 * SD_ONE, 2 * SD_ONE);
+    sd_path_lineto(rp, 6 * SD_ONE, 2 * SD_ONE);
+    sd_path_lineto(rp, 6 * SD_ONE, 6 * SD_ONE);
+    sd_path_lineto(rp, 2 * SD_ONE, 6 * SD_ONE);
+    sd_path_close(rp);
+    check(sd_canvas_fill_path(rc, rp, SD_FILL_NONZERO), SADISH_OK);
+    check(sd_canvas_coverage_at(rc, 4, 4), 255);   # interior
+    check(sd_canvas_coverage_at(rc, 2, 2), 255);   # inclusive top-left cell
+    check(sd_canvas_coverage_at(rc, 5, 5), 255);   # inclusive bottom-right cell
+    check(sd_canvas_coverage_at(rc, 6, 6), 0);     # right/bottom edge is exclusive
+    check(sd_canvas_coverage_at(rc, 6, 4), 0);     # column 6 outside
+    check(sd_canvas_coverage_at(rc, 4, 6), 0);     # row 6 outside
+    check(sd_canvas_coverage_at(rc, 1, 4), 0);     # column 1 outside
+    check(sd_canvas_coverage_at(rc, 0, 0), 0);     # far exterior
+
+    # --- same rectangle, even-odd (single contour -> identical) ---
+    var rc2 = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(rc2, rp, SD_FILL_EVEN_ODD);
+    check(sd_canvas_coverage_at(rc2, 4, 4), 255);
+    check(sd_canvas_coverage_at(rc2, 6, 6), 0);
+
+    # --- right triangle (1,1)(6,1)(1,6), nonzero — diagonal hypotenuse ---
+    var tc = sd_canvas_new(8, 8);
+    var tp = sd_path_new();
+    sd_path_moveto(tp, 1 * SD_ONE, 1 * SD_ONE);
+    sd_path_lineto(tp, 6 * SD_ONE, 1 * SD_ONE);
+    sd_path_lineto(tp, 1 * SD_ONE, 6 * SD_ONE);
+    sd_path_close(tp);
+    sd_canvas_fill_path(tc, tp, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(tc, 2, 2), 255);   # clearly inside (x+y < 7)
+    check(sd_canvas_coverage_at(tc, 6, 6), 0);     # clearly outside
+    # (3,3) straddles the hypotenuse x+y=7 -> partial anti-aliased coverage
+    var cp = sd_canvas_coverage_at(tc, 3, 3);
+    if (cp <= 0) { g_fails = g_fails + 1; }
+    if (cp >= 255) { g_fails = g_fails + 1; }
+
+    if (g_fails == 0) {
+        var ok = "fill_test: PASS (scanline AA coverage)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "fill_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
