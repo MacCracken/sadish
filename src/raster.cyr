@@ -16,17 +16,19 @@ var SD_FILL_EVEN_ODD = 0;
 var SD_FILL_NONZERO  = 1;
 
 # ================================================================
-# SdCanvas (32 bytes):
+# SdCanvas (40 bytes):
 #   +0:  width      (i64 — pixels)
 #   +8:  height     (i64 — pixels)
 #   +16: coverage   (ptr — owned width*height bytes, one coverage per px)
 #   +24: stride     (i64 — bytes per row; == width for the packed buffer)
+#   +32: clip       (ptr — top SdClip node, or 0 = unclipped)
 # ================================================================
 var SD_CANVAS_WIDTH_OFFSET    = 0;
 var SD_CANVAS_HEIGHT_OFFSET   = 8;
 var SD_CANVAS_COVERAGE_OFFSET = 16;
 var SD_CANVAS_STRIDE_OFFSET   = 24;
-var SD_CANVAS_SIZE            = 32;
+var SD_CANVAS_CLIP_OFFSET     = 32;
+var SD_CANVAS_SIZE            = 40;
 
 # @public — allocate a w*h canvas with a zeroed coverage buffer.
 # Returns the SdCanvas ptr, or 0 on OOM / bad dimensions.
@@ -48,6 +50,7 @@ fn sd_canvas_new(w, h): i64 {
     store64(cv + SD_CANVAS_HEIGHT_OFFSET, h);
     store64(cv + SD_CANVAS_COVERAGE_OFFSET, cov);
     store64(cv + SD_CANVAS_STRIDE_OFFSET, w);
+    store64(cv + SD_CANVAS_CLIP_OFFSET, 0);
     return cv;
 }
 
@@ -296,6 +299,10 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
                 syi = syi + 1;
             }
             var c = (incount * 255) / samples;
+            var clipnode = load64(cv + SD_CANVAS_CLIP_OFFSET);
+            if (clipnode != 0) {
+                c = (c * load8(load64(clipnode + 0) + py * stride + px)) / 255;
+            }
             if (combine != 0) {
                 var oldc = load8(cov + py * stride + px);
                 if (c < oldc) { c = oldc; }
@@ -603,6 +610,83 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
         vi = vi + 1;
     }
     if (run_n > 0) { sd_stroke_run(cv, run, run_n, closed, hw); }
+    return SADISH_OK;
+}
+
+# ---- clipping (v0.4.0) -----------------------------------------
+# A clip is a coverage MASK (0..255 per pixel), the top of a stack held on the
+# canvas (SD_CANVAS_CLIP_OFFSET). fill_impl multiplies each pixel's coverage by
+# the active mask, so fills + strokes are bounded to the clip region; blit then
+# composites the already-clipped coverage. Push intersects (multiplies) a new
+# shape into the current clip; pop restores the previous region.
+# SdClip node (16 bytes): +0 mask(ptr, w*h)  +8 prev(SdClip | 0).
+
+# Intersect `shape` (a w*h mask) with the current clip IN PLACE, then push it.
+fn sd_clip_push_mask(cv, shape): i64 {
+    var w = sd_canvas_width(cv);
+    var h = sd_canvas_height(cv);
+    var cur = load64(cv + SD_CANVAS_CLIP_OFFSET);
+    if (cur != 0) {
+        var curmask = load64(cur + 0);
+        var n = w * h;
+        var i = 0;
+        while (i < n) {
+            store8(shape + i, (load8(shape + i) * load8(curmask + i)) / 255);
+            i = i + 1;
+        }
+    }
+    var node = alloc(16);
+    store64(node + 0, shape);
+    store64(node + 8, cur);
+    store64(cv + SD_CANVAS_CLIP_OFFSET, node);
+    return SADISH_OK;
+}
+
+# @public — intersect a rectangle [x0,x1) x [y0,y1) (whole pixels) into the
+# clip and push it.
+fn sd_canvas_clip_push_rect(cv, x0, y0, x1, y1): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    var w = sd_canvas_width(cv);
+    var h = sd_canvas_height(cv);
+    var shape = alloc(w * h);
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var v = 0;
+            if (x >= x0) {
+                if (x < x1) {
+                    if (y >= y0) {
+                        if (y < y1) { v = 255; }
+                    }
+                }
+            }
+            store8(shape + y * w + x, v);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return sd_clip_push_mask(cv, shape);
+}
+
+# @public — intersect a filled PATH (its coverage) into the clip and push it.
+fn sd_canvas_clip_push_path(cv, path, rule): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (path == 0) { return SADISH_ERR_EMPTY_PATH; }
+    var w = sd_canvas_width(cv);
+    var h = sd_canvas_height(cv);
+    var tmp = sd_canvas_new(w, h);        # fresh (unclipped) -> raw shape coverage
+    sd_canvas_fill_path(tmp, path, rule);
+    return sd_clip_push_mask(cv, sd_canvas_coverage(tmp));
+}
+
+# @public — pop the top clip, restoring the previous region (0 = unclipped).
+fn sd_canvas_clip_pop(cv): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    var cur = load64(cv + SD_CANVAS_CLIP_OFFSET);
+    if (cur != 0) {
+        store64(cv + SD_CANVAS_CLIP_OFFSET, load64(cur + 8));
+    }
     return SADISH_OK;
 }
 

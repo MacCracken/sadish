@@ -1,0 +1,78 @@
+# programs/clip_test.cyr — RUN test for the clip stack.
+#
+# Fills the whole canvas under a clip and asserts coverage only lands inside
+# the active region; exercises a nested (intersected) clip and pop-restore.
+# Exit code = failed checks.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+# a path covering the whole 8x8 canvas
+fn full_rect(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0, 0);
+    sd_path_lineto(p, 8 * SD_ONE, 0);
+    sd_path_lineto(p, 8 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(p, 0, 8 * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var p = full_rect();
+    var cv = sd_canvas_new(8, 8);
+
+    # clip to [2,6) x [2,6)
+    check(sd_canvas_clip_push_rect(cv, 2, 2, 6, 6), SADISH_OK);
+    sd_canvas_fill_path(cv, p, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(cv, 4, 4), 255);   # inside
+    check(sd_canvas_coverage_at(cv, 2, 2), 255);   # inclusive corner
+    check(sd_canvas_coverage_at(cv, 5, 5), 255);
+    check(sd_canvas_coverage_at(cv, 6, 6), 0);     # x=6 excluded
+    check(sd_canvas_coverage_at(cv, 0, 0), 0);     # far outside
+    check(sd_canvas_coverage_at(cv, 6, 4), 0);
+
+    # nested: intersect [4,8) -> effective [4,6)
+    check(sd_canvas_clip_push_rect(cv, 4, 4, 8, 8), SADISH_OK);
+    sd_canvas_clear(cv);
+    sd_canvas_fill_path(cv, p, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(cv, 5, 5), 255);   # inside [4,6)
+    check(sd_canvas_coverage_at(cv, 2, 2), 0);      # outside inner clip
+    check(sd_canvas_coverage_at(cv, 7, 7), 0);      # x>=6 excluded
+    check(sd_canvas_coverage_at(cv, 3, 5), 0);      # x<4 excluded
+
+    # pop back to [2,6)
+    sd_canvas_clip_pop(cv);
+    sd_canvas_clear(cv);
+    sd_canvas_fill_path(cv, p, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(cv, 2, 2), 255);
+    check(sd_canvas_coverage_at(cv, 5, 5), 255);
+    check(sd_canvas_coverage_at(cv, 6, 6), 0);
+
+    # pop to unclipped -> full coverage
+    sd_canvas_clip_pop(cv);
+    sd_canvas_clear(cv);
+    sd_canvas_fill_path(cv, p, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(cv, 0, 0), 255);
+    check(sd_canvas_coverage_at(cv, 7, 7), 255);
+
+    if (g_fails == 0) {
+        var ok = "clip_test: PASS (clip stack)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "clip_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

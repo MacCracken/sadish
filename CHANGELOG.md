@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Curves flatten first; subpaths + close are honored. Verified in
   `programs/stroke_test.cyr`. (Miter/bevel joins + butt/square caps + piece
   batching are TODO(v0.5).)
+- **Clip paths / clip stack** (`sd_canvas_clip_push_rect` /
+  `sd_canvas_clip_push_path` / `sd_canvas_clip_pop`) — a coverage-mask clip
+  region held as a stack on the `SdCanvas`; push intersects a rect or a filled
+  path into the active clip, fills + strokes are multiplied by the mask, pop
+  restores. Verified in `programs/clip_test.cyr` (nested intersect + pop).
 
 ## [0.3.0] - 2026-07-05
 
