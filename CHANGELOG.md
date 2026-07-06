@@ -5,7 +5,7 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.3.0] - unreleased
+## [0.3.0] - 2026-07-05
 
 The rasterizer — the vector core comes alive. Paths now flatten, fill to
 anti-aliased coverage, and composite onto a surface; plus affine rotation.

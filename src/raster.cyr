@@ -353,9 +353,9 @@ fn sd_canvas_blit(cv, surface, color): i64 {
 
 # ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
-# 0.2.0 -> 200.
+# 0.3.0 -> 300.
 # ================================================================
 # @public
 fn sadish_version(): i64 {
-    return 200;
+    return 300;
 }
