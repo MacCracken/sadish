@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.4.0
+Version: 0.4.1
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =

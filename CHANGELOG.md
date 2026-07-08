@@ -5,6 +5,19 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-07-08 — toolchain alignment
+
+Pin/hygiene release — no code change; the 2D vector core is byte-identical to
+0.4.0 (all RUN tests green).
+
+### Changed
+
+- **Cyrius pin `6.4.7` → `6.4.25`** — aligns sadish with the desktop stack
+  (setu + dhancha, its consumer, both pin `6.4.25`) instead of drifting behind.
+  Builds + all 13 RUN tests (aa / blit / clip / draw / fill / flatten / geom /
+  gradient / grow / present / rotate / stroke / smoke) pass.
+- `sadish_version()` → **401**.
+
 ## [0.4.0] - 2026-07-05
 
 The full 2D vector core: skew (affine set complete), gradient paint, unbounded
