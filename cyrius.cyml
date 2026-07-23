@@ -5,7 +5,7 @@ description = "sadish (सदिश — vector) — pure-Cyrius low-level 2D vec
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sadish"
 language = "cyrius"
-cyrius = "6.4.25"
+cyrius = "6.4.71"
 
 # sadish is a library — no CLI binary. `cyrius build` targets a smoke
 # program that links the full include chain to prove lib.cyr parses clean.

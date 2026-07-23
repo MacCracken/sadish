@@ -5,6 +5,13 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] - 2026-07-23
+
+### Changed — cyrius pin 6.4.25 → 6.4.71
+
+Toolchain refresh across the draw stack. Materialised `lib/` re-synced (`cyrius lib sync --full`).
+No source change; build + tests green at the new pin.
+
 ## [0.4.1] - 2026-07-08 — toolchain alignment
 
 Pin/hygiene release — no code change; the 2D vector core is byte-identical to
