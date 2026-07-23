@@ -5,6 +5,32 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-07-23
+
+### Added — a real ALPHA channel: `sd_rgba` · `sd_alpha_of` · `sd_color_a` · `sd_premul`
+
+Until now every primitive hardcoded the alpha byte to **255 in four separate places** and the colour type
+had no alpha at all. Invisible, because nothing downstream read byte 3 — but agnos's `gpu_shader_op` **#92**
+op 0x01 does: it performs **premultiplied src-over on the GPU shader cores**, the one thing a CPU blit
+cannot do cheaply. Without a real alpha channel that whole hardware-blend path had **no producer**.
+
+`sd_put`, `sd_hline` and `sd_vline` now write the colour's alpha instead of a hardcoded 255. (`sd_fill_rect`
+and `sd_clear` route through `sd_hline`, so fixing `sd_put` alone would not have covered fills — the three
+sites were independent.)
+
+⚠ **An alpha byte of 0 means OPAQUE, not invisible, and that is what makes this additive.** `sd_rgb(r,g,b)`
+returns `0x00RRGGBB` with byte 3 = 0, and every existing caller and test depends on that value; treating 0
+as transparent would make every pre-existing drawing vanish. `sd_alpha_of()` maps 0 → 255. The cost is that
+fully-transparent is not expressible as a colour — the right trade, since it is the one alpha value with no
+visible effect.
+
+⚠ `sd_premul()` is the **sanctioned producer** for surfaces flagged `SETU_SURF_PREMULTIPLIED`. Passing
+straight alpha to #92 does not error — it renders washed out, silently, with no diagnostic anywhere.
+
+**Not changed:** `sd_canvas_blit`'s coverage path still flattens anti-aliased coverage into opaque RGB. That
+is correct for an opaque destination and is not what blocked #92; a premultiplied coverage path would be a
+new function, not a change to this one.
+
 ## [0.4.2] - 2026-07-23
 
 ### Changed — cyrius pin 6.4.25 → 6.4.71

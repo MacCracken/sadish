@@ -25,6 +25,48 @@ fn sd_color_g(c): i64 { return (c >> 8) & 255; }
 fn sd_color_b(c): i64 { return c & 255; }
 
 # ================================================================
+# ALPHA (v0.5.0) — additive, and deliberately backward-compatible.
+#
+# Until now every sadish primitive hardcoded the alpha byte to 255 in four separate places, and the colour
+# type had no alpha at all. That was invisible because nothing downstream read byte 3 — but agnos's
+# gpu_shader_op#92 op 0x01 does: it performs PREMULTIPLIED src-over on the shader cores, which is the one
+# thing a CPU blit cannot do cheaply. Without a real alpha channel the whole hardware-blend path had no
+# producer.
+#
+# ⚠ THE LEGACY RULE, and it is what makes this additive: an alpha byte of 0 means OPAQUE, not invisible.
+# sd_rgb(r,g,b) returns 0x00RRGGBB with byte 3 = 0, and every existing caller and test depends on that
+# value. Treating 0 as transparent would make every pre-existing drawing vanish. So sd_alpha_of() maps
+# 0 -> 255, and a caller who genuinely wants "draw nothing" simply does not draw.
+# The cost: fully-transparent (a == 0) is not expressible as a colour. That is the right trade — it is the
+# one alpha value with no visible effect.
+# ================================================================
+# @public — pack (r,g,b,a) into a sadish colour 0xAARRGGBB. a is 1..255; 0 is reserved (reads back opaque).
+fn sd_rgba(r, g, b, a): i64 {
+    return ((a & 255) << 24) | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
+}
+# @public — the alpha a colour will actually be drawn with. 0 (a bare sd_rgb value) means OPAQUE.
+fn sd_alpha_of(c): i64 {
+    var a = (c >> 24) & 255;
+    if (a == 0) { return 255; }
+    return a;
+}
+# @public — raw alpha byte, WITHOUT the legacy 0-means-opaque mapping. For code that needs to know whether
+# a colour carried an explicit alpha at all.
+fn sd_color_a(c): i64 { return (c >> 24) & 255; }
+# @public — PREMULTIPLY a colour: scale each channel by its own alpha, as gpu_shader_op#92 op 0x01 requires
+# (c <= a). This is the sanctioned producer for surfaces flagged SETU_SURF_PREMULTIPLIED.
+#
+# ⚠ Passing STRAIGHT alpha to #92 does not error — it renders washed out, silently, with no diagnostic
+# anywhere in the stack. Always route through here rather than multiplying by hand.
+fn sd_premul(c): i64 {
+    var a = sd_alpha_of(c);
+    var r = (sd_color_r(c) * a) / 255;
+    var g = (sd_color_g(c) * a) / 255;
+    var b = (sd_color_b(c) * a) / 255;
+    return sd_rgba(r, g, b, a);
+}
+
+# ================================================================
 # SdSurface (32 bytes):
 #   +0:  width   (i64 — pixels)
 #   +8:  height  (i64 — pixels)
@@ -76,7 +118,7 @@ fn sd_put(px, w, h, x, y, color): i64 {
     store8(px + off, color & 255);
     store8(px + off + 1, (color >> 8) & 255);
     store8(px + off + 2, (color >> 16) & 255);
-    store8(px + off + 3, 255);
+    store8(px + off + 3, sd_alpha_of(color));   # v0.5.0: honour the colour's alpha (0 == opaque, legacy)
     return 0;
 }
 

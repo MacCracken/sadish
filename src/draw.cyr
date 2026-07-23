@@ -66,7 +66,7 @@ fn sd_hline(s, x0, x1, y, color): i64 {
         store8(px + off, color & 255);
         store8(px + off + 1, (color >> 8) & 255);
         store8(px + off + 2, (color >> 16) & 255);
-        store8(px + off + 3, 255);
+        store8(px + off + 3, sd_alpha_of(color));   # v0.5.0: honour alpha (0 == opaque)
         x = x + 1;
     }
     return 0;
@@ -90,7 +90,7 @@ fn sd_vline(s, x, y0, y1, color): i64 {
         store8(px + off, color & 255);
         store8(px + off + 1, (color >> 8) & 255);
         store8(px + off + 2, (color >> 16) & 255);
-        store8(px + off + 3, 255);
+        store8(px + off + 3, sd_alpha_of(color));   # v0.5.0: honour alpha (0 == opaque)
         y = y + 1;
     }
     return 0;
