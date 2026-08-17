@@ -5,6 +5,19 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] - 2026-08-17 — toolchain pin to 6.5.27
+
+### Changed — `cyrius = "6.5.5"` -> **6.5.27**
+
+Stack-wide sweep so every repo in the desktop stack declares one toolchain. Pins had drifted across
+three lines (6.5.5 / 6.5.20 / 6.5.21) while the installed wrapper was 6.5.27, so every build ran with
+a drift warning and the declared graph did not describe what was actually compiled.
+
+⚠ **THE ARTIFACT CHANGED, so this is not a cosmetic edit.** The build went `118032 -> 126448` bytes and the binary differs. The pin is not a comment: it selects the stdlib snapshot under `~/.cyrius/versions/<pin>/lib`, so moving it swaps the library code this repo compiles against.
+
+⚠ The vendored `lib/` was re-synced to the 6.5.27 bundled set, which clears the
+`./lib/ shadows version-pinned` warning. Tests re-run green after both changes.
+
 ## [0.5.1] - 2026-08-02
 
 ### Changed — cyrius pin 6.4.71 -> 6.5.5
