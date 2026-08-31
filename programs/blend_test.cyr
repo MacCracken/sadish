@@ -1,0 +1,92 @@
+# programs/blend_test.cyr — RUN test for the alpha-blended fill (0.5.3).
+# Exit code = failed checks.
+#
+# ⛔ THE WHOLE POINT IS THAT THIS FILL **READS ITS DESTINATION**. Every other span writer in sadish
+# stores four bytes and never loads, so the only way to prove this one is different is to put a
+# known colour underneath and check what survives.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+
+fn check(got, want): i64 {
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var s = sd_surface_new(8, 8);
+
+    # ---- a == 255 is exactly an opaque fill ------------------------------------------------------
+    sd_clear(s, sd_rgb(0, 0, 0));
+    sd_fill_rect_blend(s, 0, 0, 8, 8, sd_rgb(255, 255, 255), 255);
+    check(sd_surface_pixel_at(s, 4, 4), sd_rgb(255, 255, 255));
+
+    # ---- ⛔ a == 0 PAINTS NOTHING, which is the opposite of the legacy packed-alpha rule ----------
+    # `sd_alpha_of` maps a 0 byte to OPAQUE so a bare `sd_rgb` is not invisible. Carrying that into a
+    # blend would make "fully transparent" paint SOLID — the single most surprising outcome available,
+    # and exactly the trap that made `sd_rgba(0,0,0,128)` paint black. Alpha is a separate argument
+    # here and 0 is a no-op.
+    sd_clear(s, sd_rgb(10, 20, 30));
+    sd_fill_rect_blend(s, 0, 0, 8, 8, sd_rgb(255, 255, 255), 0);
+    check(sd_surface_pixel_at(s, 4, 4), sd_rgb(10, 20, 30));
+
+    # ---- the midpoint really blends --------------------------------------------------------------
+    # white over black at 128: (255*128 + 0*127)/255 = 128.
+    sd_clear(s, sd_rgb(0, 0, 0));
+    sd_fill_rect_blend(s, 0, 0, 8, 8, sd_rgb(255, 255, 255), 128);
+    check(sd_surface_pixel_at(s, 4, 4), sd_rgb(128, 128, 128));
+    # ...and black over white at 128 lands on the same value from the other side.
+    sd_clear(s, sd_rgb(255, 255, 255));
+    sd_fill_rect_blend(s, 0, 0, 8, 8, sd_rgb(0, 0, 0), 128);
+    check(sd_surface_pixel_at(s, 4, 4), sd_rgb(127, 127, 127));
+
+    # ---- ⛔ PER CHANNEL, NOT PER PIXEL — a bug here shows only on a non-grey blend ----------------
+    sd_clear(s, sd_rgb(0, 0, 200));
+    sd_fill_rect_blend(s, 0, 0, 8, 8, sd_rgb(200, 0, 0), 128);
+    # r: (200*128 + 0*127)/255 = 100.  g: 0.  b: (0*128 + 200*127)/255 = 99.
+    check(sd_color_r(sd_surface_pixel_at(s, 4, 4)), 100);
+    check(sd_color_g(sd_surface_pixel_at(s, 4, 4)), 0);
+    check(sd_color_b(sd_surface_pixel_at(s, 4, 4)), 99);
+
+    # ---- the rect is bounded, and clipping to the surface still holds -----------------------------
+    sd_clear(s, sd_rgb(0, 0, 0));
+    sd_fill_rect_blend(s, 2, 2, 4, 4, sd_rgb(255, 255, 255), 255);
+    check(sd_surface_pixel_at(s, 3, 3), sd_rgb(255, 255, 255));
+    check(sd_surface_pixel_at(s, 1, 1), sd_rgb(0, 0, 0));      # outside, untouched
+    check(sd_surface_pixel_at(s, 6, 6), sd_rgb(0, 0, 0));
+    # ⚠ A rect running off the edge must clip rather than wrap into the next row — the classic
+    # scanline bug, and the reason `sd_hline` clamps rather than trusting its caller.
+    sd_clear(s, sd_rgb(0, 0, 0));
+    sd_fill_rect_blend(s, 6, 0, 8, 1, sd_rgb(255, 255, 255), 255);
+    check(sd_surface_pixel_at(s, 7, 0), sd_rgb(255, 255, 255));
+    check(sd_surface_pixel_at(s, 0, 1), sd_rgb(0, 0, 0));      # did NOT wrap onto row 1
+
+    # ---- the destination alpha byte stays opaque --------------------------------------------------
+    # ⚠ sadish surfaces are opaque render targets. A blend that also composited alpha would make the
+    # result translucent to whatever draws it next, and every consumer here presents to a screen.
+    sd_clear(s, sd_rgb(0, 0, 0));
+    sd_fill_rect_blend(s, 0, 0, 8, 8, sd_rgb(90, 90, 90), 64);
+    check(sd_alpha_of(sd_surface_pixel_at(s, 4, 4)), 255);
+
+    # ---- stacking: two 50% veils are darker than one, and neither reaches full -------------------
+    sd_clear(s, sd_rgb(255, 255, 255));
+    sd_fill_rect_blend(s, 0, 0, 8, 8, sd_rgb(0, 0, 0), 128);
+    var once = sd_color_r(sd_surface_pixel_at(s, 4, 4));
+    sd_fill_rect_blend(s, 0, 0, 8, 8, sd_rgb(0, 0, 0), 128);
+    var twice = sd_color_r(sd_surface_pixel_at(s, 4, 4));
+    check(twice < once, 1);
+    check(twice > 0, 1);                                        # ...and still not solid
+
+    if (g_fails == 0) {
+        println("blend_test: PASS (opaque, transparent, midpoint, per-channel, clip, stacking)");
+        return 0;
+    }
+    println("blend_test: FAIL");
+    return g_fails;
+}
+
+var rc = main();
+syscall(60, rc);

@@ -5,6 +5,47 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.3] - 2026-08-31 — a fill that reads its destination
+
+### Added — `sd_fill_rect_blend` / `sd_blend_hline`
+
+⭐⭐ **The first fill in sadish that READS its destination.** Every other span writer stores four
+bytes per pixel and never loads — correct and fast for opaque paint, and exactly why a translucent
+veil was impossible. dhancha wanted a modal backdrop for its 0.9.23 sheet and had to ship a
+**scanline dither** instead; this is what that was waiting on.
+
+```
+sd_fill_rect_blend(s, x, y, w, h, color, a)     # a = 0..255 coverage
+sd_blend_hline(s, x0, x1, y, color, a)          # the span workhorse
+```
+
+⛔⛔ **`a` IS AN EXPLICIT ARGUMENT AND 0 MEANS FULLY TRANSPARENT — THE OPPOSITE OF `sd_alpha_of`.**
+The legacy packed-alpha rule maps a 0 byte to **opaque**, which exists so a bare `sd_rgb` value is
+not invisible. Carrying that convention into a blend would make `sd_fill_rect_blend(..., 0)` paint
+**solid** — the single most surprising outcome available, and the exact trap that made
+`sd_rgba(0, 0, 0, 128)` paint black rather than a half veil. ⇒ Alpha is passed separately, it is
+never read out of `color`, and 0 is a no-op. The test asserts that in both directions.
+
+⚠ **Source-over, integer, per channel**: `out = (src*a + dst*(255-a)) / 255`. Rounding truncates, so
+two 50 % veils are not identical to one at 75 % — true of any integer compositor and not worth a
+fractional pixel format to fix.
+⚠ **The destination alpha byte is left at 255.** sadish surfaces are opaque render targets; a blend
+that also composited alpha would make the result translucent to whatever draws it next, and every
+consumer here presents to a screen.
+
+### Changed — toolchain pin 6.5.27 → 6.5.36
+
+⚠ **Nine releases stale.** Per the standing rule a repaired repo does not stay on an old pin; `lib/`
+re-vendored with `cyrius lib sync`.
+
+### Verified
+
+All **14** `programs/*_test.cyr` pass (13 existing + the new `blend_test`). `fmt --check` clean,
+`lint` 0 warnings.
+⭐ **Three mutations, each of which fails the suite**: `a == 0` treated as opaque (the legacy trap);
+the blend ignoring its destination and storing the source directly; and the red channel reading the
+blue source, which only shows on a non-grey blend.
+
 ## [0.5.2] - 2026-08-17 — toolchain pin to 6.5.27
 
 ### Changed — `cyrius = "6.5.5"` -> **6.5.27**
