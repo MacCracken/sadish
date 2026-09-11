@@ -5,6 +5,13 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.4] - 2026-09-11
+
+### Changed
+
+- **Toolchain `6.5.36` → `6.6.2`.** No source change. Zero compiler rejections,
+  zero fail-open sites. All `programs/*_test.cyr` RUN suites pass.
+
 ## [0.5.3] - 2026-08-31 — a fill that reads its destination
 
 ### Added — `sd_fill_rect_blend` / `sd_blend_hline`
