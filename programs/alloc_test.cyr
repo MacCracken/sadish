@@ -1,0 +1,415 @@
+# programs/alloc_test.cyr — RUN test for the ALLOCATION SEAM (0.5.5): sd_alloc / sd_alloc_set /
+# sd_alloc_get, the process-lifetime fill/stroke scratch, and sd_canvas_blit_at.
+#
+# ⭐⭐ WHAT THIS EXISTS TO PROVE. lib/alloc.cyr is a bump allocator with NO free(). Before 0.5.5
+# every sd_canvas_fill_path call cost the global heap a FIXED 327,824 B and every stroke of a
+# closed 4-vertex rect 2,789,016 B (MEASURED, 8x8 canvas) — per call, forever — because the
+# rasterizer allocated its SD_FLATTEN_CAP-sized scratch fresh each time. dhancha filed it
+# (2026-09-13, scalable text allocates per call outside the frame arena); crab, whose per-frame
+# heap cost is asserted to be EXACTLY 0, cannot adopt a proportional face until sadish can be
+# pointed at a frame arena. This suite is that gate from sadish's side.
+#
+# ⚠ THE HEADLINE ASSERTIONS ARE EXACT ZEROS, NOT "LESS THAN BEFORE". Group B: twenty rounds of
+# canvas + path + fill + union + stroke + clip + blit under an arena hook cost the global heap
+# EXACTLY 0 bytes, and the arena converges on its high-water mark after a reset. Group C: with NO
+# hook, a straight-line fill after the one-time warm-up costs EXACTLY 0. A scratch that leaked
+# one byte per call would satisfy a "smaller" check and still be the same defect.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "alloc_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- the consumer's hook: everything sadish asks for goes onto g_arena -------------------
+var g_arena = 0;
+
+fn hook_alloc(n): i64 {
+    return arena_alloc(g_arena, n);
+}
+
+# A second hook for the nesting check in group D; never actually allocates through.
+var g_arena2 = 0;
+
+fn hook_alloc2(n): i64 {
+    return arena_alloc(g_arena2, n);
+}
+
+# ---- shapes ------------------------------------------------------------------------------
+# A closed rect [x0,x1] x [y0,y1] (whole pixels) — straight edges only, so a fill of it allocates
+# NOTHING beyond the path itself (no flatten mid-points).
+fn at_rect(x0, y0, x1, y1): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0 * SD_ONE, y0 * SD_ONE);
+    sd_path_lineto(p, x1 * SD_ONE, y0 * SD_ONE);
+    sd_path_lineto(p, x1 * SD_ONE, y1 * SD_ONE);
+    sd_path_lineto(p, x0 * SD_ONE, y1 * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+# A blob with two quads and two lines inside a 16x16 canvas — exercises the flatten path
+# (mid-points on the seam) and the edge list.
+fn at_blob(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 2 * SD_ONE, 2 * SD_ONE);
+    sd_path_quadto(p, 14 * SD_ONE, 2 * SD_ONE, 14 * SD_ONE, 14 * SD_ONE);
+    sd_path_lineto(p, 8 * SD_ONE, 14 * SD_ONE);
+    sd_path_quadto(p, 2 * SD_ONE, 14 * SD_ONE, 2 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(p, 2 * SD_ONE, 2 * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+# One "frame" of work through every seam-routed entry: canvas, path, fill, union, stroke,
+# clip, blit_at, pop. Returns the number of red pixels the blit produced (so the work is real).
+fn at_round(): i64 {
+    var cv = sd_canvas_new(16, 16);
+    var blob = at_blob();
+    sd_canvas_fill_path(cv, blob, SD_FILL_NONZERO);
+    var r = at_rect(1, 1, 4, 4);
+    sd_canvas_fill_union(cv, r, SD_FILL_NONZERO);
+    sd_canvas_stroke_path(cv, r, SD_ONE);
+    sd_canvas_clip_push_rect(cv, 0, 0, 12, 12);
+    var s = sd_surface_new(16, 16);
+    sd_clear(s, sd_rgb(0, 0, 255));
+    sd_canvas_blit_at(cv, s, sd_rgb(255, 0, 0), 0, 0);
+    sd_canvas_clip_pop(cv);
+    return sd_surface_pixel_at(s, 3, 3);
+}
+
+# The PRE-0.5.5 sd_canvas_blit, verbatim (width as pitch) — the reference group E compares
+# sd_canvas_blit_at(…, 0, 0) against, byte for byte, on a packed surface.
+fn ref_blit(cv, surface, color): i64 {
+    var cw = sd_canvas_width(cv);
+    var ch = sd_canvas_height(cv);
+    var covbuf = sd_canvas_coverage(cv);
+    var covstride = sd_canvas_stride(cv);
+    var sw = sd_surface_width(surface);
+    var sh = sd_surface_height(surface);
+    var spx = sd_surface_pixels(surface);
+    var sr = (color >> 16) & 255;
+    var sg = (color >> 8) & 255;
+    var sb = color & 255;
+    var w = cw;
+    if (sw < w) { w = sw; }
+    var h = ch;
+    if (sh < h) { h = sh; }
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var a = load8(covbuf + y * covstride + x);
+            if (a != 0) {
+                var off = (y * sw + x) * 4;
+                if (a == 255) {
+                    store8(spx + off, sb);
+                    store8(spx + off + 1, sg);
+                    store8(spx + off + 2, sr);
+                    store8(spx + off + 3, 255);
+                } else {
+                    var ia = 255 - a;
+                    var nb = (sb * a + load8(spx + off) * ia) / 255;
+                    var ng = (sg * a + load8(spx + off + 1) * ia) / 255;
+                    var nr = (sr * a + load8(spx + off + 2) * ia) / 255;
+                    store8(spx + off, nb);
+                    store8(spx + off + 1, ng);
+                    store8(spx + off + 2, nr);
+                    store8(spx + off + 3, 255);
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Count the pure-red pixels of a packed surface.
+fn at_count_red(s): i64 {
+    var w = sd_surface_width(s);
+    var h = sd_surface_height(s);
+    var n = 0;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            if (sd_surface_pixel_at(s, x, y) == 16711680) { n = n + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return n;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var RED  = sd_rgb(255, 0, 0);    # 0xFF0000 = 16711680
+    var BLUE = sd_rgb(0, 0, 255);    # 0x0000FF = 255
+
+    # ── A) THE DEFAULT IS THE GLOBAL ALLOCATOR, AND IT COSTS ───────────────
+    check(sd_alloc_get(), 0);                                          # 1
+    var g0 = alloc_used();
+    var p0 = sd_path_new();
+    check((alloc_used() - g0) > 0, 1);                                 # 2 — 4,144 B on 0.5.4/0.5.5
+    g0 = alloc_used();
+    var warm = sd_canvas_new(32, 32);
+    check((alloc_used() - g0) > 0, 1);                                 # 3
+    # ⛔ THE BASELINE, ASSERTED RATHER THAN ASSUMED. If path/canvas ever read 0 here the savings
+    # below are measured against nothing.
+    sd_path_moveto(p0, 1 * SD_ONE, 1 * SD_ONE);
+    sd_path_lineto(p0, 30 * SD_ONE, 3 * SD_ONE);
+    sd_path_lineto(p0, 5 * SD_ONE, 30 * SD_ONE);
+    sd_path_close(p0);
+    # ⛔⛔ THE PROCESS'S FIRST FILL RUNS UNDER AN ARENA HOOK. raster.cyr's rule is that the scratch
+    # comes from the GLOBAL alloc, never sd_alloc — a scratch drawn from a per-frame arena is
+    # dangling on the second frame (corruption, not a leak). With no hook installed sd_alloc IS
+    # alloc, so a warm-up outside a hook cannot tell the two apart: before this group, all nine
+    # scratch sites (raster.cyr _sd_scratch_init + _sd_fill_accrow_for) flipped alloc -> sd_alloc
+    # passed this suite 90/90. ⇒ The gate is the exact ZERO on the arena, paired with the exact
+    # one-time cost on the global heap: MEASURED 589,896 B scratch + 32*8 accrow = 590,152 B.
+    g_arena = arena_new_growable(4194304);
+    check(g_arena != 0, 1);                                            # 4
+    check(sd_alloc_set(&hook_alloc), 0);                               # 5 — previous hook was none
+    g0 = alloc_used();
+    var a0 = arena_used(g_arena);
+    check(sd_canvas_fill_path(warm, p0, SD_FILL_NONZERO), SADISH_OK);   # 6
+    var warm_cost = alloc_used() - g0;
+    check(warm_cost, 589896 + 32 * 8);                                 # 7 — the scratch, on the global heap
+    check(arena_used(g_arena) - a0, 0);                                # 8 — and not one byte of it on the hook
+    # A WIDER canvas under the same hook re-grows the per-row accumulator (_sd_fill_accrow_for):
+    # exactly w*8 on the global heap, still 0 on the arena — the fixed set is already warm, so
+    # this pair isolates the accrow site. MUTATION-PROVED: all nine sites alloc -> sd_alloc fails
+    # #7 #8 #10 #11 and the process then FAULTS in group B (SIGSEGV, rc 139: the scratch dangles
+    # after arena_reset — the corruption, not a leak, that the rule exists to prevent); the accrow
+    # site alone fails the same four (rc 4); the fixed set alone (raster.cyr:142-149) fails #7 #8
+    # and faults.
+    var wide = sd_canvas_new(64, 64);
+    g0 = alloc_used();
+    a0 = arena_used(g_arena);
+    check(sd_canvas_fill_path(wide, p0, SD_FILL_NONZERO), SADISH_OK);   # 9
+    check(alloc_used() - g0, 64 * 8);                                  # 10 — accrow re-grown on the global heap
+    check(arena_used(g_arena) - a0, 0);                                # 11 — never on the hook
+    check(sd_alloc_set(0), &hook_alloc);                               # 12 — restore returns the hook
+    # `wide` lived on the arena and is dead now; reset so group B measures from an empty arena.
+    arena_reset(g_arena);
+
+    # ── B) UNDER AN ARENA HOOK A FRAME COSTS THE GLOBAL HEAP EXACTLY 0 ───────────
+    check(sd_alloc_set(&hook_alloc), 0);                               # 13 — group A restored the global allocator
+    check(sd_alloc_get(), &hook_alloc);                                # 14
+    var gb = alloc_used();
+    var ab = arena_used(g_arena);
+    var i = 0;
+    while (i < 20) {
+        check(at_round(), RED);                                        # 15..34 — the work is real
+        i = i + 1;
+    }
+    var hw1 = arena_used(g_arena) - ab;
+    # ⭐ THE HEADLINE. Twenty frames of fill + union + stroke + clip + blit: not one byte on the
+    # global heap. MEASURED: the twenty rounds put 900,000 B on the arena (45,000 B per round; the
+    # same round cost the global heap 3,456,048 B on 0.5.4). The arena is 4 MiB so it never chains
+    # a chunk — a chunk would come from the global allocator and fail this, which is the correct
+    # answer for an arena sized too small.
+    check(alloc_used() - gb, 0);                                       # 35
+    check(hw1 > 0, 1);                                                 # 36 — and the arena paid for it
+    # Convergence: reset, repeat, same high-water mark — the arena is not growing frame over frame.
+    arena_reset(g_arena);
+    i = 0;
+    while (i < 20) {
+        at_round();
+        i = i + 1;
+    }
+    check(arena_used(g_arena) - ab, hw1);                              # 37
+    check(alloc_used() - gb, 0);                                       # 38
+    check(sd_alloc_set(0), &hook_alloc);                               # 39 — restore returns the hook
+    check(sd_alloc_get(), 0);                                          # 40
+
+    # ── C) NO HOOK: THE SCRATCH IS REUSED, SO A FILL COSTS WHAT ITS GEOMETRY COSTS ───────
+    var cv = sd_canvas_new(16, 16);
+    var rect = at_rect(2, 2, 10, 10);
+    var gc = alloc_used();
+    sd_canvas_fill_path(cv, rect, SD_FILL_NONZERO);
+    # ⭐ A straight-line fill after warm-up costs the global heap EXACTLY 0 (was 327,888 B, 16x16).
+    check(alloc_used() - gc, 0);                                       # 41
+    check(sd_canvas_coverage_at(cv, 5, 5), 255);                       # 42 — and it still fills
+    var blob = at_blob();
+    gc = alloc_used();
+    sd_canvas_fill_path(cv, blob, SD_FILL_NONZERO);
+    var quad_cost = alloc_used() - gc;
+    gc = alloc_used();
+    sd_canvas_fill_path(cv, blob, SD_FILL_NONZERO);
+    var quad_cost2 = alloc_used() - gc;
+    # The quads' flatten mid-points are proportional to the work and stay on the seam:
+    # MEASURED 480 B for this blob (30 mid-points x 16 B), identical on the second call, and far
+    # below the 328,544 B the same fill cost on 0.5.4 (16x16).
+    check(quad_cost > 0, 1);                                           # 43
+    check(quad_cost, quad_cost2);                                      # 44
+    check(quad_cost < 32768, 1);                                       # 45
+    gc = alloc_used();
+    sd_canvas_stroke_path(cv, rect, SD_ONE);
+    var stroke_cost = alloc_used() - gc;
+    gc = alloc_used();
+    sd_canvas_stroke_path(cv, rect, SD_ONE);
+    var stroke_cost2 = alloc_used() - gc;
+    # A stroke still builds a path per segment + per vertex disc (on the seam): MEASURED 34,432 B
+    # for a closed 4-vertex rect (was 2,789,528 B, 16x16), identical on the second call.
+    check(stroke_cost > 0, 1);                                         # 46
+    check(stroke_cost, stroke_cost2);                                  # 47
+    check(stroke_cost < 65536, 1);                                     # 48
+    check(warm_cost > stroke_cost, 1);                                 # 49 — the warm-up paid the scratch
+
+    # ── D) sd_alloc_set RETURNS THE PREVIOUS HOOK; NESTED SCOPES UNWIND IN ORDER ────────
+    g_arena2 = arena_new_growable(65536);
+    check(sd_alloc_set(&hook_alloc), 0);                               # 50
+    check(sd_alloc_set(&hook_alloc2), &hook_alloc);                    # 51 — inner scope sees outer
+    check(sd_alloc_get(), &hook_alloc2);                               # 52
+    var a2 = arena_used(g_arena2);
+    sd_point_new(1, 2);
+    check(arena_used(g_arena2) - a2, 16);                              # 53 — landed on the inner arena
+    check(sd_alloc_set(&hook_alloc), &hook_alloc2);                    # 54 — unwind inner
+    check(sd_alloc_get(), &hook_alloc);                                # 55
+    check(sd_alloc_set(0), &hook_alloc);                               # 56 — unwind outer
+    check(sd_alloc_get(), 0);                                          # 57
+    var gd = alloc_used();
+    sd_point_new(3, 4);
+    check(alloc_used() - gd, 16);                                      # 58 — back on the global heap
+
+    # ── E) sd_canvas_blit_at ─────────────────────────
+    # (0,0) is byte-identical to the pre-0.5.5 blit on a packed surface: a triangle (partial
+    # coverage at the hypotenuse) over blue, every one of 16*16*4 bytes compared.
+    var tri = sd_path_new();
+    sd_path_moveto(tri, 1 * SD_ONE, 1 * SD_ONE);
+    sd_path_lineto(tri, 14 * SD_ONE, 1 * SD_ONE);
+    sd_path_lineto(tri, 1 * SD_ONE, 14 * SD_ONE);
+    sd_path_close(tri);
+    var tcv = sd_canvas_new(16, 16);
+    sd_canvas_fill_path(tcv, tri, SD_FILL_NONZERO);
+    var sa = sd_surface_new(16, 16);
+    var sb = sd_surface_new(16, 16);
+    sd_clear(sa, BLUE);
+    sd_clear(sb, BLUE);
+    ref_blit(tcv, sa, RED);
+    check(sd_canvas_blit_at(tcv, sb, RED, 0, 0), SADISH_OK);          # 59
+    var pa = sd_surface_pixels(sa);
+    var pb = sd_surface_pixels(sb);
+    var diff = 0;
+    var k = 0;
+    while (k < 16 * 16 * 4) {
+        if (load8(pa + k) != load8(pb + k)) { diff = diff + 1; }
+        k = k + 1;
+    }
+    check(diff, 0);                                                    # 60
+    check(at_count_red(sb) > 0, 1);                                    # 61 — the comparison saw ink
+    # sd_canvas_blit is blit_at(0,0): same bytes again through the old entry point.
+    var sc = sd_surface_new(16, 16);
+    sd_clear(sc, BLUE);
+    sd_canvas_blit(tcv, sc, RED);
+    var pc = sd_surface_pixels(sc);
+    diff = 0;
+    k = 0;
+    while (k < 16 * 16 * 4) {
+        if (load8(pa + k) != load8(pc + k)) { diff = diff + 1; }
+        k = k + 1;
+    }
+    check(diff, 0);                                                    # 62
+
+    # Offset placement: a 3x3 fully-covered mark lands with its (0,0) at (dx,dy).
+    var mark = sd_canvas_new(3, 3);
+    sd_canvas_fill_path(mark, at_rect(0, 0, 3, 3), SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(mark, 2, 2), 255);                     # 63
+    var so = sd_surface_new(16, 16);
+    sd_clear(so, BLUE);
+    check(sd_canvas_blit_at(mark, so, RED, 5, 7), SADISH_OK);         # 64
+    check(at_count_red(so), 9);                                        # 65
+    check(sd_surface_pixel_at(so, 5, 7), RED);                         # 66 — top-left of the mark
+    check(sd_surface_pixel_at(so, 7, 9), RED);                         # 67 — bottom-right
+    check(sd_surface_pixel_at(so, 4, 7), BLUE);                        # 68 — one left: untouched
+    check(sd_surface_pixel_at(so, 8, 9), BLUE);                        # 69 — one right
+    check(sd_surface_pixel_at(so, 5, 6), BLUE);                        # 70 — one above
+    check(sd_surface_pixel_at(so, 7, 10), BLUE);                       # 71 — one below
+    # Edge-straddling placements on MID-SURFACE rows FIRST, so a mis-clipped column wraps into
+    # the neighbouring row where the count can see it. ⛔ Found by mutation: with dx clipped to 0
+    # instead of -dx, a (-2,-2) placement writes 8 bytes BEFORE the pixel buffer — into the
+    # surface's own stride field — and the next blit faults instead of failing a check; a (-2, 3)
+    # placement paints (14..15, 2..4) and the count reads 9, not 3, before that can happen.
+    var sn = sd_surface_new(16, 16);
+    sd_clear(sn, BLUE);
+    sd_canvas_blit_at(mark, sn, RED, 0 - 2, 3);                        # left edge, rows 3..5
+    check(at_count_red(sn), 3);                                        # 72 — column 0 only
+    check(sd_surface_pixel_at(sn, 0, 4), RED);                         # 73
+    check(sd_surface_pixel_at(sn, 15, 2), BLUE);                       # 74 — no wrap into row 2
+    sd_clear(sn, BLUE);
+    sd_canvas_blit_at(mark, sn, RED, 15, 3);                           # right edge, rows 3..5
+    check(at_count_red(sn), 3);                                        # 75 — column 15 only
+    check(sd_surface_pixel_at(sn, 15, 4), RED);                        # 76
+    check(sd_surface_pixel_at(sn, 0, 4), BLUE);                        # 77 — no wrap into row 4
+
+    # Negative offsets and offsets past the edge clip to the surface and do not fault.
+    sd_clear(sn, BLUE);
+    check(sd_canvas_blit_at(mark, sn, RED, 0 - 2, 0 - 2), SADISH_OK); # 78
+    check(at_count_red(sn), 1);                                        # 79 — only (0,0) survives
+    check(sd_surface_pixel_at(sn, 0, 0), RED);                         # 80
+    sd_clear(sn, BLUE);
+    sd_canvas_blit_at(mark, sn, RED, 15, 15);
+    check(at_count_red(sn), 1);                                        # 81 — only (15,15)
+    check(sd_surface_pixel_at(sn, 15, 15), RED);                       # 82
+    sd_clear(sn, BLUE);
+    sd_canvas_blit_at(mark, sn, RED, 16, 16);
+    sd_canvas_blit_at(mark, sn, RED, 0 - 3, 0 - 3);
+    sd_canvas_blit_at(mark, sn, RED, 100, 0 - 100);
+    sd_canvas_blit_at(mark, sn, RED, 0 - 100, 100);
+    check(at_count_red(sn), 0);                                        # 83 — entirely off-surface
+    sd_clear(sn, BLUE);
+    sd_canvas_blit_at(mark, sn, RED, 0 - 1, 14);                       # straddles two edges
+    check(at_count_red(sn), 4);                                        # 84 — (0..1, 14..15)
+    check(sd_surface_pixel_at(sn, 1, 15), RED);                        # 85
+    # ⚠ A WRAPPED surface: a 32-byte SdSurface header built by hand over a WIDER buffer — 32 px
+    # pitch, 8 px wide window starting at column 4 — as dhancha's dh_surface_wrap produces. Row 1
+    # must land at pitch (128 B), not at width*4 (32 B), which is the pre-0.5.5 sd_canvas_blit
+    # defect this entry point exists to not have.
+    var pitch_px = 32;
+    var buf = alloc(pitch_px * 4 * 8);
+    memset(buf, 0, pitch_px * 4 * 8);
+    var ws = alloc(32);
+    store64(ws + 0, 8);                       # width
+    store64(ws + 8, 8);                       # height
+    store64(ws + 16, buf + 4 * 4);            # pixels: window starts at column 4
+    store64(ws + 24, pitch_px * 4);           # stride = 128 B
+    check(sd_surface_stride(ws), 128);                                 # 86
+    check(sd_canvas_blit_at(mark, ws, RED, 1, 1), SADISH_OK);         # 87
+    # window pixel (1,1) -> buffer byte 16 + 1*128 + 1*4; red channel is byte +2
+    check(load8(buf + 16 + 128 + 4 + 2), 255);                         # 88 — row 1 at the pitch
+    check(load8(buf + 16 + 128 + 4 + 3), 255);                         # 89 — alpha forced opaque
+    check(load8(buf + 16 + 2 * 128 + 3 * 4 + 2), 255);                 # 90 — (3,3), last mark pixel
+    check(load8(buf + 16 + 32 + 4 + 2), 0);                            # 91 — NOT at width*4
+    check(load8(buf + 16 + 4 + 2), 0);                                 # 92 — row 0 untouched (dy=1)
+    check(load8(buf + 16 + 128 + 2), 0);                               # 93 — column 0 untouched (dx=1)
+    check(load8(buf + 16 + 4 * 128 + 4 + 2), 0);                       # 94 — row 4, past the mark
+    # and clipping honours the WINDOW's width/height, not the buffer's: past column 7 nothing.
+    sd_canvas_blit_at(mark, ws, RED, 7, 0);
+    check(load8(buf + 16 + 7 * 4 + 2), 255);                           # 95 — (7,0) in the window
+    check(load8(buf + 16 + 8 * 4 + 2), 0);                             # 96 — (8,0) is outside it
+
+    if (g_fails == 0) {
+        var ok = "alloc_test: PASS (seam -> hook; scratch reused; blit_at clips + strides)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "alloc_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

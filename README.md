@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.5.1
+Version: 0.5.5
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -44,9 +44,14 @@ toolkit are all **consumers**, not re-implementations.
   - **Clip stack** — `sd_canvas_clip_push_rect` / `_push_path` / `_pop`.
   - **Analytic coverage** — the fill core is now exact-in-x across vertical
     sub-scanlines (smoother + cheaper than the 4×4 supersampler).
-- **v0.5.0 — next:** miter/bevel joins + butt/square caps, radial + multi-stop
-  gradients, full 2-axis signed-area coverage, and the `rekha` / `dhancha`
-  consumers coming online.
+- **v0.5.5 — the allocation seam (shipped).** `sd_alloc` / `sd_alloc_set` /
+  `sd_alloc_get` route EVERYTHING sadish allocates through a consumer hook
+  (dhancha's per-frame arena), the fill/stroke fixed-capacity scratch becomes
+  process-lifetime (a straight-line fill costs the heap 0 B after the first
+  call; was 327,824 B per call), and `sd_canvas_blit_at(cv, s, color, dx, dy)`
+  places + clips a canvas on a surface, honouring `sd_surface_stride`.
+- **next:** miter/bevel joins + butt/square caps, radial + multi-stop
+  gradients, full 2-axis signed-area coverage.
 
 ## Place in the stack
 
@@ -73,8 +78,12 @@ none of them re-implement rasterization.
 - A canvas / drawing API, compositing, and SVG layers (planned) sit on the
   same core.
 
-No live consumer depends on sadish yet; downstream repos pull
-`dist/sadish.cyr` via a `[deps.sadish]` git-tag entry. The complete 2D vector
+Live consumers — rekha (≥ 0.3.10 routes its outline scratch and font
+records through `sd_alloc`), dhancha (≥ 0.10.0 installs its per-frame arena
+as the hook around a text draw and blits through `sd_canvas_blit_at`), crab
+(pins sadish directly, 0.5.4 as of crab 0.8.10) and agnos's refagree GPU test
+— pull `dist/sadish.cyr` via a `[deps.sadish]` git-tag entry (rekha and
+dhancha also carry a `path = "../sadish"` dev override). The complete 2D vector
 core — fill, stroke, gradient, affine transforms, clip, and analytic AA — is
 live as of **v0.4.0**.
 
@@ -85,7 +94,7 @@ live as of **v0.4.0**.
   leaf. Resolved by `cyrius deps` into `lib/`.
 
 All deps are pinned in `cyrius.cyml`; the toolchain pin is
-`cyrius = "6.4.7"`.
+`cyrius = "6.6.4"`.
 
 ## Quick Start
 
@@ -95,7 +104,7 @@ cyrius build programs/smoke.cyr build/sadish-smoke    # link-check
 ./build/sadish-smoke                                  # prints the banner
 
 # RUN tests (each self-checks and exits non-zero on failure)
-for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present; do
+for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present blend alloc; do
   cyrius build "programs/${t}_test.cyr" "build/${t}_test" && "./build/${t}_test"
 done
 ```

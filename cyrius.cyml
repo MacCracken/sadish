@@ -5,7 +5,7 @@ description = "sadish (सदिश — vector) — pure-Cyrius low-level 2D vec
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sadish"
 language = "cyrius"
-cyrius = "6.6.2"
+cyrius = "6.6.4"
 
 # sadish is a library — no CLI binary. `cyrius build` targets a smoke
 # program that links the full include chain to prove lib.cyr parses clean.
@@ -27,8 +27,10 @@ output = "build/sadish-smoke"
 # (direct opaque primitives) build on error only; geom.cyr uses error;
 # path.cyr builds on geom; raster.cyr consumes path. Don't reorder without
 # re-running `cyrius distlib` and verifying the concatenated bundle compiles.
+# alloc.cyr is FIRST: the allocation seam (sd_alloc) every other module draws from.
 [lib]
 modules = [
+    "src/alloc.cyr",
     "src/error.cyr",
     "src/surface.cyr",
     "src/draw.cyr",

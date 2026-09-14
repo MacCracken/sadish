@@ -29,7 +29,7 @@ enum SadishErrCode {
 
 # Create a SadishErr with code and an optional detail string (0 = none).
 fn sadish_err_new(code, detail): i64 {
-    var e = alloc(16);
+    var e = sd_alloc(16);
     store64(e, code);
     store64(e + 8, detail);
     return e;

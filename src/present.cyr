@@ -65,11 +65,11 @@ fn sd_surface_write_ppm(s, path): i64 {
     # open(path, O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, mode 0644 = 420)
     var fd = syscall(2, path, 577, 420);
     if (fd < 0) { return SADISH_ERR_OTHER; }
-    var hdr = alloc(32);
+    var hdr = sd_alloc(32);
     var hlen = sd_ppm_header(hdr, w, h);
     syscall(1, fd, hdr, hlen);
     var n = w * h;
-    var rgb = alloc(n * 3);
+    var rgb = sd_alloc(n * 3);
     var i = 0;
     var j = 0;
     while (i < n) {
@@ -103,8 +103,8 @@ var SD_PRESENTER_SIZE    = 72;
 fn sd_present_open(): i64 {
     var fd = syscall(2, "/dev/fb0", 2, 0);   # open O_RDWR
     if (fd < 0) { return 0; }
-    var vinfo = alloc(256);
-    var finfo = alloc(256);
+    var vinfo = sd_alloc(256);
+    var finfo = sd_alloc(256);
     memset(vinfo, 0, 256);
     memset(finfo, 0, 256);
     syscall(16, fd, 0x4600, vinfo);   # ioctl FBIOGET_VSCREENINFO
@@ -118,13 +118,13 @@ fn sd_present_open(): i64 {
     if (bpp  <= 0) { bpp  = 32; }
     var minpitch = xres * (bpp / 8);
     if (pitch < minpitch) { pitch = minpitch; }
-    var p = alloc(SD_PRESENTER_SIZE);
+    var p = sd_alloc(SD_PRESENTER_SIZE);
     store64(p + SD_PRES_FD_OFFSET, fd);
     store64(p + SD_PRES_XRES_OFFSET, xres);
     store64(p + SD_PRES_YRES_OFFSET, yres);
     store64(p + SD_PRES_BPP_OFFSET, bpp);
     store64(p + SD_PRES_PITCH_OFFSET, pitch);
-    var blit = alloc(pitch * yres);
+    var blit = sd_alloc(pitch * yres);
     memset(blit, 0, pitch * yres);
     store64(p + SD_PRES_BLIT_OFFSET, blit);
     return p;

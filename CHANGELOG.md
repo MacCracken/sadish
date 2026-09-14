@@ -5,6 +5,117 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.5] - 2026-09-14 — a rasterizer that can be told where its memory comes from
+
+### Added — `sd_alloc` / `sd_alloc_set` / `sd_alloc_get` (new first module `src/alloc.cyr`)
+
+⭐⭐ **The allocation seam.** 23 of the 32 `alloc(` sites sadish had (error 1, geom 2, path 8,
+present 6, surface 2, raster 4) now go through `sd_alloc(n)`; the other 9 — `sd_fill_impl`'s
+ectx/edges/fbuf/fctx/cross/accrow and the stroker's run/fbuf/fctx — became the process-lifetime
+scratch in `_sd_scratch_init` / `_sd_fill_accrow_for`, deliberately on the global `alloc` (⛔
+below). A consumer may install a hook:
+
+```
+var prev = sd_alloc_set(&my_arena_hook);   # fn(n): ptr, 0 on failure; returns the PREVIOUS hook
+... draw ...
+sd_alloc_set(prev);                        # 0 restores the global allocator; sd_alloc_get() reads it
+```
+
+`lib/alloc.cyr` is a bump allocator with **no `free()`**, so until now every canvas, path, point
+and clip mask sadish made was permanent. dhancha's frame arena (`dh_falloc`) is the only way a
+rendered frame can cost the heap nothing, and dhancha could not route sadish onto it — the defect
+it filed as `2026-09-13-scalable-text-allocates-per-call-outside-the-frame-arena.md`, and one of
+the two blockers on **crab** adopting a proportional face (crab's headline gate asserts a rendered
+frame costs the global heap **exactly 0 bytes**). This is the sadish half of closing it.
+
+⚠ **The hook applies to EVERYTHING sadish allocates while it is set** — surfaces, canvases,
+coverage buffers, clip masks, paths, verb/point arrays, points, matrices, flatten mid-points, the
+PPM/presenter buffers. sadish does not distinguish the result from the working set; the consumer
+scopes the hook around the work whose lifetime it is choosing. ⇒ Nothing returned under an arena
+hook may be kept across that arena's reset.
+⚠ A hook returning 0 is handled exactly as `alloc()` returning 0 already was. No new failure path.
+
+### Added — `sd_canvas_blit_at(cv, surface, color, dx, dy)`
+
+Composite the canvas with its (0,0) at surface pixel `(dx, dy)`; either may be negative or beyond
+the surface, and the blit clips to the surface on every side. Same src-over math as
+`sd_canvas_blit`, verbatim — which is now `sd_canvas_blit_at(cv, s, c, 0, 0)`.
+
+⚠ **Rows are addressed by `sd_surface_stride`, not `width*4`.** The pre-0.5.5 `sd_canvas_blit`
+used the surface WIDTH as its row pitch — right for every packed surface sadish makes itself, and
+one row of shear per row on a WRAPPED surface (dhancha's `dh_surface_wrap` over a framebuffer or a
+pane sub-rect, where `stride != width*4`). The suite builds such a header by hand and asserts row
+1 lands at the pitch (128 B), not at `width*4` (32 B).
+⚠ **This is now the ONE writer that honours the stride.** `sd_put`, `sd_surface_pixel_at`,
+`sd_hline`, `sd_vline`, `sd_blend_hline`, `sd_canvas_blit_gradient` and the presenter's row copy still
+address by `width * 4` — right for every packed surface sadish makes, one row of shear per row on a
+wrapped one, MEASURED as 4,000 padding pixels overwritten by a `WINDOW` background under text that
+landed straight. Filed as
+`docs/development/issues/2026-09-14-direct-primitives-address-rows-by-width-not-stride.md`.
+
+### Changed — the fill/stroke scratch is process-lifetime, allocated once
+
+⭐ `sd_fill_impl` allocated `ectx + edges + fbuf + fctx + accrow + cross` FRESH on every call, and
+`sd_canvas_stroke_path` its `run + fbuf + fctx` — all sized to the fixed `SD_FLATTEN_CAP`, none of
+it dependent on the path. **MEASURED on 0.5.4** (8x8 canvas, one call, `alloc_used()` delta):
+
+| call | 0.5.4, every call | 0.5.5, first call | 0.5.5, every call after |
+|---|---|---|---|
+| `sd_canvas_fill_path`, 4-line rect | 327,824 B | 589,960 B | **0 B** |
+| `sd_canvas_fill_path`, 1 quad + lines | 328,016 B | — | 144 B (9 flatten mid-points) |
+| `sd_canvas_fill_path`, 760x300 triangle | 333,856 B | 6,080 B (accrow) | **0 B** |
+| `sd_canvas_stroke_path`, closed 4-vertex rect | 2,789,016 B | — | 34,432 B (8 paths + points) |
+| one frame of fill+union+stroke+clip+blit (16x16) | 3,456,048 B | — | **0 B** under an arena hook (45,000 B on the arena) |
+
+The scratch is now one process-wide set — `_sd_fill_*` and `_sd_stroke_*` module globals in
+`raster.cyr`, allocated lazily ONCE by `_sd_scratch_init()` (MEASURED 589,896 B: fill 458,800 +
+stroke 131,096) plus a per-row accumulator that re-allocates only when a WIDER canvas than ever
+seen arrives (w*8: 64 B at 8 px, 6,080 B at 760). Every per-call reset (edge count, flatten ctx)
+is exactly as before, and the output is **byte-identical**: all 13 pre-existing suites pass
+unchanged, and a probe dumping coverage for a rect, a quad, a cubic and a stroke diffs empty
+against 0.5.4.
+
+⛔ **From the GLOBAL `alloc`, never the hook.** A consumer's hook is typically an arena that gets
+reset every frame; a scratch drawn from it would be dangling on the second frame. So the scratch
+is the one thing sadish allocates that the seam does not see — its one-time cost lands on the
+global heap at the first fill, and never again.
+⛔ **Two sets, not one.** `sd_canvas_stroke_path` holds `run` live across the `sd_canvas_fill_union`
+calls `sd_stroke_run` makes; the stroker's `run/fbuf/fctx` are its own globals so non-aliasing is
+visible in the names rather than reasoned about per call.
+⚠ **Single-threaded entry points, said out loud.** The rasterizer never had a lock anywhere and was
+never thread-safe; a shared scratch makes `sd_fill_impl` / `sd_canvas_stroke_path` explicitly so.
+Checked: every consumer (dhancha, rekha, agnos's refagree test) rasterizes from one thread.
+The flatten MID-POINTS stay on the seam: proportional to the curve work, not fixed-capacity, so the
+hook decides where they live.
+
+### Changed — toolchain `6.6.2` → `6.6.4`
+
+Bumped before any source change; all 13 suites passed on the new pin first. `sadish_version()`
+now answers **505** (it had read 401 since 0.4.1). `dist/sadish.cyr` 75,450 → 85,815 B; the DCE
+smoke binary 15,912 → 16,000 B.
+
+### Verified
+
+All **14** `programs/*_test.cyr` pass (13 existing + the new `alloc_test`, 96 numbered checks).
+`fmt --check` clean, `lint` 0 warnings, `vet` clean, `distlib` in sync.
+⛔ **The process's FIRST fill runs under an arena hook** (`alloc_test` group A). With no hook
+installed `sd_alloc` IS `alloc`, so a warm-up fill outside a hook lands the scratch on the global
+heap under either spelling and cannot see the ⛔ above: an earlier draft of the suite warmed up
+unhooked, and all nine scratch sites flipped `alloc` → `sd_alloc` passed it 90/90. The gate is now
+the pair of exact figures — 590,152 B (589,896 scratch + 32*8 accrow) on the global heap and
+EXACTLY 0 on the arena — followed by a wider (64 px) canvas under the same hook whose accrow
+re-grow is exactly 512 B on the heap and 0 on the arena.
+⭐ **Fifteen mutations, each of which fails the suite** (failed checks in brackets): a raster
+`sd_alloc(` back to `alloc(` for the coverage buffer [2] and for the clip node [2]; `sd_point_new`
+off the seam [3]; fill edges + cross back to per-call `alloc` [8]; the stroke run per-call [3];
+the accrow capacity never remembered [3]; `blit_at` ignoring `dy` [8]; `blit_at` using `width*4`
+as the pitch [4]; `blit_at` not clipping on the left [2, then the process faults — a mis-clipped
+column writes into the surface header's stride field]; not clipping on the right [3];
+`sd_alloc_set` returning the new hook instead of the previous [8]; `sd_alloc` ignoring the hook
+[4]; all nine scratch sites `alloc` → `sd_alloc` [4, then the process faults in group B — the
+scratch dangles after the first `arena_reset`, which is the corruption the ⛔ exists to prevent];
+the accrow site alone [4]; the eight fixed-scratch sites alone [2, then faults].
+
 ## [0.5.4] - 2026-09-11
 
 ### Changed

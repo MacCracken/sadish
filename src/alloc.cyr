@@ -1,0 +1,62 @@
+# @public — sadish allocation seam: the ONE place every other module draws memory from.
+#
+# alloc.cyr — `sd_alloc(n)` is what surface.cyr, geom.cyr, path.cyr, raster.cyr, present.cyr
+# and error.cyr call instead of the stdlib `alloc(n)`. By default it IS `alloc(n)`; a consumer
+# may install a hook with `sd_alloc_set(fp)` and every byte sadish asks for while the hook is
+# set comes from the hook instead.
+#
+# ⭐ WHY A SEAM EXISTS AT ALL. `lib/alloc.cyr` is a bump allocator with NO `free()`. Before 0.5.5
+# every fill cost the global heap a fixed 327,824 B and every stroke of a closed 4-vertex rect
+# 2,789,016 B (MEASURED, 8x8 canvas, one call each) — permanently, per call. A per-frame consumer
+# (dhancha's frame arena, and crab on top of it, whose headline gate asserts a rendered frame
+# costs the heap EXACTLY 0 bytes) had no way to draw scalable text through sadish without
+# leaking a canvas plus a path per glyph per frame — the defect dhancha filed as
+# `2026-09-13-scalable-text-allocates-per-call-outside-the-frame-arena.md`. Routing sadish's
+# allocations onto the consumer's arena is the ONLY way a frame can cost the heap nothing,
+# and the consumer is the only party that knows the frame boundary. Hence: a hook.
+#
+# THE CONTRACT.
+#   · The hook applies to EVERYTHING sadish allocates while it is set — surfaces, canvases,
+#     coverage buffers, clip masks, paths, verb/point arrays, points, matrices, error records,
+#     flatten mid-points, the PPM/presenter buffers. sadish does not distinguish "the result"
+#     from "the working set"; a consumer scopes the hook around the work whose lifetime it is
+#     choosing: `var prev = sd_alloc_set(&mine); ...draw...; sd_alloc_set(prev);`.
+#   ⛔ A pointer that outlives the hook's backing store is dangling. If the hook is an arena
+#     that gets reset every frame, NOTHING sadish returned under it may be kept across the reset
+#     — not a path, not a canvas, not a surface. That is the consumer's lifetime call, exactly as
+#     it already is for `dh_falloc`.
+#   · A hook returning 0 is handled precisely as `alloc()` returning 0 already is: the callers
+#     that check (sd_surface_new, sd_canvas_new, sd_path_new, sd_path_grow) return 0 /
+#     SADISH_ERR_OOM; the callers that do not check never did. No new failure path.
+#   · `sd_alloc_set` returns the PREVIOUS hook so a nested scope unwinds in order; 0 restores the
+#     global allocator. `sd_alloc_get` reads it back.
+#   ⚠ The fill/stroke fixed-capacity scratch in raster.cyr is deliberately NOT on this seam — it
+#     is allocated once for the life of the process from the global `alloc` (see
+#     `_sd_scratch_init`). A hook pointing at an arena that gets reset would otherwise leave the
+#     scratch dangling on the second frame.
+#   ⚠ The hook is a process-wide global, like the scratch: sadish has never had a lock anywhere
+#     and is not thread-safe. Set it from the thread that draws.
+
+# The installed hook: fn(n): ptr (0 on failure), or 0 = the global allocator.
+var _sd_alloc_fn = 0;
+
+# @public — allocate n bytes for sadish through the consumer's hook, or the global allocator when
+# none is set. Returns 0 on failure, as `alloc` does.
+fn sd_alloc(n): i64 {
+    if (_sd_alloc_fn == 0) { return alloc(n); }
+    return callptr(_sd_alloc_fn, n);
+}
+
+# @public — install `fp` (`fn(n): ptr`, 0 on failure) as the allocator for everything sadish
+# allocates from now on. Returns the PREVIOUS hook so a caller can scope it (set, draw, restore).
+# Passing 0 restores the global allocator.
+fn sd_alloc_set(fp): i64 {
+    var prev = _sd_alloc_fn;
+    _sd_alloc_fn = fp;
+    return prev;
+}
+
+# @public — the current hook; 0 = the global allocator.
+fn sd_alloc_get(): i64 {
+    return _sd_alloc_fn;
+}

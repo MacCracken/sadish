@@ -64,7 +64,7 @@ var SD_POINT_SIZE     = 16;
 
 # @public
 fn sd_point_new(x, y): i64 {
-    var p = alloc(SD_POINT_SIZE);
+    var p = sd_alloc(SD_POINT_SIZE);
     store64(p + SD_POINT_X_OFFSET, x);
     store64(p + SD_POINT_Y_OFFSET, y);
     return p;
@@ -93,7 +93,7 @@ var SD_MATRIX_SIZE  = 48;
 
 # Low-level constructor from all six 16.16 components.
 fn sd_matrix_new(a, b, c, d, e, f): i64 {
-    var m = alloc(SD_MATRIX_SIZE);
+    var m = sd_alloc(SD_MATRIX_SIZE);
     store64(m + SD_MAT_A_OFFSET, a);
     store64(m + SD_MAT_B_OFFSET, b);
     store64(m + SD_MAT_C_OFFSET, c);

@@ -84,10 +84,10 @@ var SD_SURFACE_SIZE          = 32;
 fn sd_surface_new(w, h): i64 {
     if (w <= 0) { return 0; }
     if (h <= 0) { return 0; }
-    var s = alloc(SD_SURFACE_SIZE);
+    var s = sd_alloc(SD_SURFACE_SIZE);
     if (s == 0) { return 0; }
     var nbytes = (w * h) * 4;
-    var px = alloc(nbytes);
+    var px = sd_alloc(nbytes);
     if (px == 0) { return 0; }
     memset(px, 0, nbytes);
     store64(s + SD_SURFACE_WIDTH_OFFSET, w);

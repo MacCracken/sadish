@@ -34,6 +34,9 @@ include "lib/bench.cyr"
 # + flatten) consumes geom's SdPoint; raster.cyr (SdCanvas coverage buffer
 # + fill/blit) consumes path's flattened polyline and error.cyr's codes.
 # ================================================================
+# alloc.cyr FIRST — the allocation seam (sd_alloc / sd_alloc_set) every
+# module below draws from; a consumer hooks it to route sadish onto its arena.
+include "src/alloc.cyr"
 include "src/error.cyr"
 # surface.cyr (SdSurface BGRA pixel buffer) + draw.cyr (direct opaque
 # primitives: Bresenham line, hline/vline, rect, fill_rect, clear) are the
