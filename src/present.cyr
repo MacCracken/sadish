@@ -62,6 +62,7 @@ fn sd_surface_write_ppm(s, path): i64 {
     var w = sd_surface_width(s);
     var h = sd_surface_height(s);
     var px = sd_surface_pixels(s);
+    var stride = sd_surface_stride(s);
     # open(path, O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, mode 0644 = 420)
     var fd = syscall(2, path, 577, 420);
     if (fd < 0) { return SADISH_ERR_OTHER; }
@@ -70,15 +71,22 @@ fn sd_surface_write_ppm(s, path): i64 {
     syscall(1, fd, hdr, hlen);
     var n = w * h;
     var rgb = sd_alloc(n * 3);
-    var i = 0;
+    # ⚠ Row by row at the surface's stride, not one run of w*h pixels: on a WRAPPED
+    # surface the bytes between one row's end and the next row's start are not its pixels.
     var j = 0;
-    while (i < n) {
-        var off = i * 4;
-        store8(rgb + j, load8(px + off + 2));      # R (BGRA byte 2)
-        store8(rgb + j + 1, load8(px + off + 1));  # G
-        store8(rgb + j + 2, load8(px + off));      # B (byte 0)
-        i = i + 1;
-        j = j + 3;
+    var y = 0;
+    while (y < h) {
+        var row = px + y * stride;
+        var x = 0;
+        while (x < w) {
+            var off = x * 4;
+            store8(rgb + j, load8(row + off + 2));      # R (BGRA byte 2)
+            store8(rgb + j + 1, load8(row + off + 1));  # G
+            store8(rgb + j + 2, load8(row + off));      # B (byte 0)
+            x = x + 1;
+            j = j + 3;
+        }
+        y = y + 1;
     }
     syscall(1, fd, rgb, n * 3);
     syscall(3, fd);
@@ -144,6 +152,7 @@ fn sd_present_blit(p, s): i64 {
     var sw = sd_surface_width(s);
     var sh = sd_surface_height(s);
     var srcpx = sd_surface_pixels(s);
+    var srcstride = sd_surface_stride(s);   # ⚠ source row pitch in bytes — not sw*4 on a wrapped surface
 
     var scale = xres / sw;
     var scy = yres / sh;
@@ -158,7 +167,7 @@ fn sd_present_blit(p, s): i64 {
 
     var sy = 0;
     while (sy < sh) {
-        var src_row = srcpx + sy * (sw * 4);
+        var src_row = srcpx + sy * srcstride;
         var dy0 = yoff + sy * scale;
         var first = blit + dy0 * pitch + xoff * bpp_bytes;
         var dx = first;

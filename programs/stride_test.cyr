@@ -1,0 +1,508 @@
+# programs/stride_test.cyr — RUN test: every reader and writer of an SdSurface addresses rows by
+# sd_surface_stride(s), not width*4.
+#
+# ⭐⭐ WHAT THIS EXISTS TO PROVE. Until this suite, sd_canvas_blit_at was the ONE writer that honoured
+# the stride; sd_put, sd_surface_pixel_at, sd_hline, sd_vline, sd_blend_hline, sd_canvas_blit_gradient,
+# the PPM writer and the presenter's row copy all used the surface WIDTH as the row pitch. Right for
+# every packed surface sadish makes itself, one row of shear per row on a WRAPPED one — MEASURED in
+# the 0.5.5 review as 4,000 padding pixels overwritten by a WINDOW background (sd_fill_rect) under
+# text that landed straight. Filed as
+# docs/development/issues/2026-09-14-direct-primitives-address-rows-by-width-not-stride.md.
+#
+# THE RIG. A 13x9 SdSurface header built by hand (the shape dhancha's dh_surface_wrap produces, and
+# alloc_test group E builds) over a 21-px-pitch buffer: the window starts 3 px into each row, with 2
+# guard rows above it and 2 below. Every byte outside the window is a SENTINEL; every byte inside
+# starts as a position-dependent pattern, and a packed 13x9 surface starts with the SAME pattern.
+# Each primitive is then driven identically on both and three things are asserted:
+#   (a) row N lands at N*stride — a byte read at the stride-computed address, by hand;
+#   (b) every guard byte (left/right padding of every row, the guard rows) still holds the sentinel;
+#   (c) the wrapped window is byte-identical to the packed surface, all four channels.
+# ⚠ (c) alone is not enough and neither is (b): a width*4 writer on the wrapped rig lands partly in
+# padding (b) and partly in another row's window (c); the explicit (a) checks pin where it went.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "stride_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- the rig -----------------------------------------------------------------------------------
+var ST_W = 13;          # window width  (px)
+var ST_H = 9;           # window height (px)
+var ST_PITCH = 21;      # buffer row pitch (px) — stride = 84 B, width*4 = 52 B
+var ST_LX = 3;          # window's first column inside each buffer row (px)
+var ST_GT = 2;          # guard rows above the window
+var ST_GB = 2;          # guard rows below it
+var ST_SENT = 90;       # 0x5A — no colour below stores this byte
+var ST_STRIDE = 84;     # ST_PITCH * 4, spelled out: the number every (a) check is about
+
+var g_buf = 0;          # the wide buffer (guards + window)
+var g_len = 0;
+var g_wpx = 0;          # the window's pixel pointer (what the header carries)
+var g_ws = 0;           # the WRAPPED header
+var g_ps = 0;           # the PACKED twin
+var g_ppx = 0;
+
+fn st_pat(x, y, c): i64 {
+    return (x * 29 + y * 53 + c * 71 + 7) & 255;
+}
+
+# Build the wrapped header + buffer and the packed twin (once).
+fn st_rig(): i64 {
+    g_len = (ST_GT + ST_H + ST_GB) * ST_STRIDE;
+    g_buf = alloc(g_len);
+    g_wpx = g_buf + ST_GT * ST_STRIDE + ST_LX * 4;
+    g_ws = alloc(SD_SURFACE_SIZE);
+    store64(g_ws + SD_SURFACE_WIDTH_OFFSET, ST_W);
+    store64(g_ws + SD_SURFACE_HEIGHT_OFFSET, ST_H);
+    store64(g_ws + SD_SURFACE_PIXELS_OFFSET, g_wpx);
+    store64(g_ws + SD_SURFACE_STRIDE_OFFSET, ST_STRIDE);
+    g_ps = sd_surface_new(ST_W, ST_H);
+    g_ppx = sd_surface_pixels(g_ps);
+    return 0;
+}
+
+# Sentinel everywhere, then the same pattern into both windows (by the test's OWN addressing).
+fn st_reset(): i64 {
+    memset(g_buf, ST_SENT, g_len);
+    var y = 0;
+    while (y < ST_H) {
+        var x = 0;
+        while (x < ST_W) {
+            var c = 0;
+            while (c < 4) {
+                store8(g_wpx + y * ST_STRIDE + x * 4 + c, st_pat(x, y, c));
+                store8(g_ppx + (y * ST_W + x) * 4 + c, st_pat(x, y, c));
+                c = c + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Wrapped window byte (x, y, channel) at the stride; the packed twin's at width*4.
+fn st_wb(x, y, c): i64 { return load8(g_wpx + y * ST_STRIDE + x * 4 + c); }
+fn st_pb(x, y, c): i64 { return load8(g_ppx + (y * ST_W + x) * 4 + c); }
+
+# (b) bytes outside the window that no longer hold the sentinel.
+fn st_guard_bad(): i64 {
+    var bad = 0;
+    var i = 0;
+    while (i < g_len) {
+        var row = i / ST_STRIDE;
+        var col = i % ST_STRIDE;
+        var inwin = 0;
+        if (row >= ST_GT) {
+            if (row < ST_GT + ST_H) {
+                if (col >= ST_LX * 4) {
+                    if (col < (ST_LX + ST_W) * 4) { inwin = 1; }
+                }
+            }
+        }
+        if (inwin == 0) {
+            if (load8(g_buf + i) != ST_SENT) { bad = bad + 1; }
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# (c) window bytes that differ from the packed twin.
+fn st_vis_diff(): i64 {
+    var d = 0;
+    var y = 0;
+    while (y < ST_H) {
+        var x = 0;
+        while (x < ST_W) {
+            var c = 0;
+            while (c < 4) {
+                if (st_wb(x, y, c) != st_pb(x, y, c)) { d = d + 1; }
+                c = c + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return d;
+}
+
+# Packed bytes no longer equal to the pattern — so (c) is never a comparison of two untouched rigs.
+fn st_changed(): i64 {
+    var d = 0;
+    var y = 0;
+    while (y < ST_H) {
+        var x = 0;
+        while (x < ST_W) {
+            var c = 0;
+            while (c < 4) {
+                if (st_pb(x, y, c) != st_pat(x, y, c)) { d = d + 1; }
+                c = c + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return d;
+}
+
+# (b) + (c) + non-vacuity, three numbered checks.
+fn st_verify(): i64 {
+    check(st_guard_bad(), 0);
+    check(st_vis_diff(), 0);
+    check(st_changed() > 0, 1);
+    return 0;
+}
+
+# Read a whole small file into buf; returns the byte count.
+fn st_slurp(path, buf, cap): i64 {
+    var fd = syscall(2, path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var n = syscall(0, fd, buf, cap);
+    syscall(3, fd);
+    return n;
+}
+
+# A hand-built SdPresenter over a REGULAR FILE (never /dev/fb0): sd_present_blit lseeks + writes the
+# active band to the fd, and the letterboxed frame stays readable in the blit scratch at +64.
+fn st_presenter(fd, xres, yres, bpp, pitch): i64 {
+    var p = alloc(72);
+    store64(p + 0, fd);
+    store64(p + 8, xres);
+    store64(p + 16, yres);
+    store64(p + 24, bpp);
+    store64(p + 32, pitch);
+    var blit = alloc(pitch * yres);
+    memset(blit, 0, pitch * yres);
+    store64(p + 64, blit);
+    return p;
+}
+
+fn st_mem_diff(a, b, n): i64 {
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+# A triangle with partial coverage along its hypotenuse, 16.16.
+fn st_tri(x0, y0, x1, y1, x2, y2): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0, y0);
+    sd_path_lineto(p, x1, y1);
+    sd_path_lineto(p, x2, y2);
+    sd_path_close(p);
+    return p;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var RED  = sd_rgb(200, 40, 16);
+    var TEAL = sd_rgb(16, 180, 160);
+    var INK  = sd_rgba(250, 120, 30, 77);    # explicit alpha byte 77 — stored verbatim by the opaque writers
+    st_rig();
+
+    # ── A) THE RIG, AND THE SHARED READ ─────────────────────────
+    check(sd_surface_stride(g_ws), 84);                                # 1
+    check(sd_surface_width(g_ws) * 4, 52);                             # 2 — the pitch a width*4 reader would use
+    st_reset();
+    check(st_guard_bad(), 0);                                          # 3
+    check(st_vis_diff(), 0);                                           # 4
+    # sd_surface_pixel_at reads every window pixel at the stride: all 117 agree with the packed twin.
+    var mism = 0;
+    var y = 0;
+    while (y < ST_H) {
+        var x = 0;
+        while (x < ST_W) {
+            if (sd_surface_pixel_at(g_ws, x, y) != sd_surface_pixel_at(g_ps, x, y)) { mism = mism + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    check(mism, 0);                                                    # 5
+    # (a) window pixel (4, 1) = buffer byte 2*84 + 3*4 + 1*84 + 4*4; red is byte +2.
+    var want41 = (st_pat(4, 1, 2) << 16) | (st_pat(4, 1, 1) << 8) | st_pat(4, 1, 0);
+    check(sd_surface_pixel_at(g_ws, 4, 1), want41);                    # 6
+    check(load8(g_buf + 2 * 84 + 12 + 84 + 16 + 2), st_pat(4, 1, 2)); # 7 — the same byte, by hand
+    check(sd_surface_pixel_at(g_ws, 12, 8), (st_pat(12, 8, 2) << 16) | (st_pat(12, 8, 1) << 8) | st_pat(12, 8, 0)); # 8
+    # out of the WINDOW reads 0, not the sentinel padding beside it (0x5A5A5A).
+    check(sd_surface_pixel_at(g_ws, 13, 1), 0);                        # 9
+    check(sd_surface_pixel_at(g_ws, 0 - 1, 1), 0);                     # 10
+    check(sd_surface_pixel_at(g_ws, 4, 9), 0);                         # 11
+
+    # ── B) sd_plot (the shared store) ─────────────────────────
+    st_reset();
+    var k = 0;
+    while (k < 2) {
+        var s = g_ws;
+        if (k == 1) { s = g_ps; }
+        sd_plot(s, 0, 0, RED);
+        sd_plot(s, 5, 1, INK);
+        sd_plot(s, 12, 8, TEAL);
+        sd_plot(s, 13, 1, RED);             # one past the window's right edge: a no-op, NOT the padding
+        sd_plot(s, 0 - 1, 2, RED);
+        sd_plot(s, 5, 9, RED);
+        sd_plot(s, 5, 0 - 1, RED);
+        k = k + 1;
+    }
+    check(st_wb(5, 1, 0), 30);                                         # 12 — (a) B at row 1
+    check(st_wb(5, 1, 2), 250);                                        # 13 — R
+    check(st_wb(5, 1, 3), 77);                                         # 14 — the colour's alpha
+    check(load8(g_wpx + 52 + 20 + 2), ST_SENT);                        # 15 — NOT at width*4 (left padding of row 1)
+    check(st_wb(12, 8, 1), 180);                                       # 16
+    st_verify();                                                       # 17 18 19
+
+    # ── C) sd_line (per-pixel through the shared store) ───────────────────
+    st_reset();
+    k = 0;
+    while (k < 2) {
+        var s = g_ws;
+        if (k == 1) { s = g_ps; }
+        sd_line(s, 0, 0, 8, 8, RED);                  # diagonal
+        sd_line(s, 0 - 6, 3, 30, 5, TEAL);            # shallow, both ends off-window
+        sd_line(s, 11, 0 - 4, 9, 20, INK);            # steep, both ends off-window
+        sd_line(s, 12, 8, 2, 1, sd_rgb(1, 2, 3));     # right-to-left, upward
+        k = k + 1;
+    }
+    check(st_wb(1, 1, 2), 200);                                        # 20 — (a) (1,1) on the diagonal
+    check(st_wb(1, 1, 3), 255);                                        # 21 — bare sd_rgb alpha reads opaque
+    check(st_wb(8, 8, 1), 40);                                         # 22
+    check(st_wb(12, 8, 0), 3);                                         # 23 — the last line's first pixel
+    st_verify();                                                       # 24 25 26
+
+    # ── D) sd_hline ───────────────────────────────
+    st_reset();
+    k = 0;
+    while (k < 2) {
+        var s = g_ws;
+        if (k == 1) { s = g_ps; }
+        sd_hline(s, 0 - 5, 40, 1, RED);               # clipped to the WINDOW on both sides
+        sd_hline(s, 10, 2, 4, INK);                   # reversed endpoints
+        sd_hline(s, 0, 12, 8, TEAL);                  # last row
+        sd_hline(s, 0, 12, 0 - 1, RED);               # off-window rows: no-ops
+        sd_hline(s, 0, 12, 9, RED);
+        k = k + 1;
+    }
+    check(load8(g_wpx + 1 * 84 + 0 * 4 + 2), 200);                     # 27 — (a) row 1 at 84 B
+    check(load8(g_wpx + 1 * 84 + 12 * 4 + 2), 200);                    # 28 — its last pixel
+    check(load8(g_wpx + 1 * 52 + 2), ST_SENT);                         # 29 — NOT at width*4 (row 0 right padding)
+    check(st_wb(2, 4, 3), 77);                                         # 30
+    check(st_wb(12, 8, 1), 180);                                       # 31
+    st_verify();                                                       # 32 33 34
+
+    # ── E) sd_vline ───────────────────────────────
+    st_reset();
+    k = 0;
+    while (k < 2) {
+        var s = g_ws;
+        if (k == 1) { s = g_ps; }
+        sd_vline(s, 0, 0 - 5, 40, RED);               # clipped to the WINDOW top and bottom
+        sd_vline(s, 12, 7, 2, TEAL);                  # reversed endpoints, last column
+        sd_vline(s, 13, 0, 8, RED);                   # off-window columns: no-ops
+        sd_vline(s, 0 - 1, 0, 8, RED);
+        k = k + 1;
+    }
+    check(st_wb(0, 1, 2), 200);                                        # 35 — (a)
+    check(st_wb(0, 8, 2), 200);                                        # 36 — the bottom row, 8 strides down
+    check(st_wb(12, 2, 1), 180);                                       # 37
+    check(st_wb(12, 7, 1), 180);                                       # 38
+    st_verify();                                                       # 39 40 41
+
+    # ── F) sd_rect / sd_fill_rect / sd_clear (through hline + vline) ───────────────
+    st_reset();
+    k = 0;
+    while (k < 2) {
+        var s = g_ws;
+        if (k == 1) { s = g_ps; }
+        sd_rect(s, 0 - 1, 1, 10, 20, RED);            # straddles left + bottom
+        sd_rect(s, 9, 5, 8, 3, TEAL);                 # straddles right
+        sd_fill_rect(s, 2, 3, 4, 3, INK);
+        sd_fill_rect(s, 10, 0 - 2, 10, 4, TEAL);      # straddles top + right
+        k = k + 1;
+    }
+    check(st_wb(0, 1, 2), 200);                                        # 42 — (a) the outline's top row
+    check(st_wb(8, 6, 2), 200);                                        # 43 — its right column
+    check(st_wb(5, 5, 3), 77);                                         # 44 — fill_rect's last row
+    check(st_wb(12, 1, 1), 180);                                       # 45
+    st_verify();                                                       # 46 47 48
+    st_reset();
+    sd_clear(g_ws, TEAL);
+    sd_clear(g_ps, TEAL);
+    check(st_wb(0, 1, 1), 180);                                        # 49
+    check(st_wb(12, 8, 1), 180);                                       # 50
+    st_verify();                                                       # 51 52 53
+
+    # ── G) sd_blend_hline / sd_fill_rect_blend (they READ the destination) ─────────────
+    st_reset();
+    k = 0;
+    while (k < 2) {
+        var s = g_ws;
+        if (k == 1) { s = g_ps; }
+        sd_blend_hline(s, 20, 0 - 3, 1, RED, 100);
+        sd_fill_rect_blend(s, 0 - 1, 3, 20, 20, TEAL, 180);
+        sd_fill_rect_blend(s, 0, 0, 13, 9, RED, 0);   # a == 0: a no-op on both
+        k = k + 1;
+    }
+    # (a) row 1 blended against ITS OWN pattern byte, not another row's: (src*a + dst*(255-a)) / 255.
+    check(st_wb(0, 1, 2), (200 * 100 + st_pat(0, 1, 2) * 155) / 255);  # 54
+    check(st_wb(12, 1, 0), (16 * 100 + st_pat(12, 1, 0) * 155) / 255); # 55
+    check(st_wb(12, 1, 3), 255);                                       # 56
+    check(st_wb(7, 8, 1), (180 * 180 + st_pat(7, 8, 1) * 75) / 255);   # 57
+    check(st_wb(7, 0, 1), st_pat(7, 0, 1));                            # 58 — row 0 untouched
+    st_verify();                                                       # 59 60 61
+
+    # ── H) sd_canvas_blit / sd_canvas_blit_at ───────────────────────
+    # A 16x12 canvas — larger than the 13x9 window, so the blit must clip to the window on the right
+    # and bottom — with partial coverage along a hypotenuse (so the src-over path reads too).
+    var cv = sd_canvas_new(16, 12);
+    var hyp = st_tri(SD_ONE / 3, SD_ONE / 2, 16 * SD_ONE, SD_ONE, 2 * SD_ONE, 12 * SD_ONE);
+    sd_canvas_fill_path(cv, hyp, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(cv, 3, 1), 255);                       # 62 — full coverage at (3,1)
+    var mark = sd_canvas_new(3, 3);
+    sd_canvas_fill_path(mark, st_tri(0, 0, 6 * SD_ONE, 0, 0, 6 * SD_ONE), SD_FILL_NONZERO);
+    st_reset();
+    k = 0;
+    while (k < 2) {
+        var s = g_ws;
+        if (k == 1) { s = g_ps; }
+        sd_canvas_blit(cv, s, RED);
+        sd_canvas_blit_at(mark, s, TEAL, 10, 6);      # straddles the right edge
+        sd_canvas_blit_at(mark, s, INK, 0 - 2, 7);    # straddles left + bottom
+        sd_canvas_blit_at(cv, s, TEAL, 4, 0 - 9);
+        k = k + 1;
+    }
+    check(st_wb(3, 1, 2), 200);                                        # 63 — (a)
+    check(st_wb(10, 6, 1), 180);                                       # 64
+    check(st_wb(12, 6, 1), 180);                                       # 65
+    st_verify();                                                       # 66 67 68
+
+    # ── I) sd_canvas_blit_gradient ──────────────────────────
+    st_reset();
+    k = 0;
+    while (k < 2) {
+        var s = g_ws;
+        if (k == 1) { s = g_ps; }
+        sd_canvas_blit_gradient(cv, s, 0, 0, RED, 12, 8, TEAL);
+        k = k + 1;
+    }
+    # (a) (3,1) is fully covered: exactly the gradient colour at tn = 3*12 + 1*8 = 44 of td = 208.
+    check(st_wb(3, 1, 2), 200 + ((16 - 200) * 44) / 208);              # 69
+    check(st_wb(3, 1, 1), 40 + ((180 - 40) * 44) / 208);               # 70
+    check(load8(g_wpx + 52 + 12 + 2), ST_SENT);                        # 71 — NOT at width*4 (row 0 right padding)
+    st_verify();                                                       # 72 73 74
+    st_reset();
+    sd_canvas_blit_gradient(mark, g_ws, 1, 1, INK, 1, 1, RED);         # degenerate axis: solid c0
+    sd_canvas_blit_gradient(mark, g_ps, 1, 1, INK, 1, 1, RED);
+    check(st_wb(1, 1, 2), 250);                                        # 75
+    st_verify();                                                       # 76 77 78
+
+    # ── J) the sinks: sd_surface_write_ppm and the presenter's row copy ──────────────
+    # One busy scene on both, then each sink reads the wrapped surface and the packed twin.
+    st_reset();
+    k = 0;
+    while (k < 2) {
+        var s = g_ws;
+        if (k == 1) { s = g_ps; }
+        sd_line(s, 0, 8, 12, 0, RED);
+        sd_fill_rect_blend(s, 2, 2, 7, 5, TEAL, 140);
+        sd_canvas_blit_at(mark, s, INK, 9, 1);
+        k = k + 1;
+    }
+    check(st_vis_diff(), 0);                                           # 79
+    var ga = alloc_used();
+    check(sd_surface_write_ppm(g_ws, "build/stride_test_w.ppm"), SADISH_OK); # 80
+    # MEASURED: the header block + w*h*3 RGB, both on the seam — the row-by-row rewrite allocates
+    # nothing more than the flat loop did (32 + 351 -> 32 + 352 aligned).
+    check(alloc_used() - ga, 384);                                     # 81
+    check(sd_surface_write_ppm(g_ps, "build/stride_test_p.ppm"), SADISH_OK); # 82
+    var fw = alloc(1024);
+    var fp = alloc(1024);
+    var nw = st_slurp("build/stride_test_w.ppm", fw, 1024);
+    var np = st_slurp("build/stride_test_p.ppm", fp, 1024);
+    check(nw, 12 + 13 * 9 * 3);                                        # 83 — "P6\n13 9\n255\n" + 351
+    check(np, nw);                                                     # 84
+    check(st_mem_diff(fw, fp, nw), 0);                                 # 85
+    # pixel (0,1) is data byte 13*3: R G B of window row 1, read at the stride.
+    check(load8(fw + 12 + 39), st_wb(0, 1, 2));                        # 86
+    check(load8(fw + 12 + 39 + 2), st_wb(0, 1, 0));                    # 87
+    check(st_guard_bad(), 0);                                          # 88 — a reader touches no padding
+
+    # Presenter, 32 bpp: 13x9 into 30x22 at a 32-px pitch -> scale 2, letterbox (2, 2).
+    # O_RDWR|O_CREAT|O_TRUNC on a regular file — never /dev/fb0.
+    var fd = syscall(2, "build/stride_test.fb", 578, 420);
+    check(fd >= 0, 1);                                                 # 89
+    var pw = st_presenter(fd, 30, 22, 32, 128);
+    var pp = st_presenter(fd, 30, 22, 32, 128);
+    check(sd_present_blit(pw, g_ws), SADISH_OK);                       # 90
+    check(sd_present_blit(pp, g_ps), SADISH_OK);                       # 91
+    check(st_mem_diff(load64(pw + 64), load64(pp + 64), 128 * 22), 0); # 92
+    # (a) window (5,1) -> fb row 2 + 1*2, column 2 + 5*2: the wrapped row-1 pixel, alpha forced.
+    var fbp = load64(pw + 64) + (2 + 2) * 128 + (2 + 10) * 4;
+    check(load32(fbp), sd_surface_pixel_at(g_ws, 5, 1) | 0xFF000000);  # 93
+    check(load32(fbp + 128 + 4), load32(fbp));                         # 94 — scaled 2x2
+    check(sd_surface_pixel_at(g_ws, 5, 1) != sd_surface_pixel_at(g_ws, 5, 0), 1); # 95 — rows 0/1 distinguishable
+    # Presenter, 16 bpp (RGB565) — the other source-row read.
+    var qw = st_presenter(fd, 30, 22, 16, 64);
+    var qp = st_presenter(fd, 30, 22, 16, 64);
+    sd_present_blit(qw, g_ws);
+    sd_present_blit(qp, g_ps);
+    check(st_mem_diff(load64(qw + 64), load64(qp + 64), 64 * 22), 0);  # 96
+    var c51 = sd_surface_pixel_at(g_ws, 5, 1);
+    var p565 = ((((c51 >> 16) & 255) >> 3) << 11) | ((((c51 >> 8) & 255) >> 2) << 5) | ((c51 & 255) >> 3);
+    check(load16(load64(qw + 64) + (2 + 2) * 64 + (2 + 10) * 2), p565); # 97
+    syscall(3, fd);
+    check(st_guard_bad(), 0);                                          # 98
+
+    # ── K) sd_put — the packed form, kept working ─────────────────────
+    # A raw pointer carries no stride, so sd_put addresses w*4 rows; sadish's own primitives no
+    # longer call it, so this is the only thing holding its arithmetic.
+    st_reset();
+    sd_put(g_ppx, ST_W, ST_H, 5, 1, RED);
+    sd_put(g_ppx, ST_W, ST_H, 13, 1, TEAL);           # out of bounds: a no-op, not (0,2)
+    check(sd_surface_pixel_at(g_ps, 5, 1), RED);                       # 99
+    check(load8(g_ppx + (1 * 13 + 5) * 4 + 3), 255);                   # 100
+    check(st_pb(0, 2, 1), st_pat(0, 2, 1));                            # 101
+
+    # ── L) THE WRAPPED PRIMITIVES COST THE HEAP NOTHING ───────────────────
+    # Every writer above loads the stride once per call; none of them allocates. MEASURED 0 B.
+    st_reset();
+    var gh = alloc_used();
+    sd_clear(g_ws, RED);
+    sd_plot(g_ws, 1, 1, TEAL);
+    sd_line(g_ws, 0, 0, 12, 8, TEAL);
+    sd_rect(g_ws, 1, 1, 5, 5, INK);
+    sd_fill_rect_blend(g_ws, 0, 0, 13, 9, TEAL, 64);
+    sd_canvas_blit(cv, g_ws, INK);
+    sd_canvas_blit_at(mark, g_ws, RED, 3, 3);
+    sd_canvas_blit_gradient(cv, g_ws, 0, 0, RED, 12, 0, TEAL);
+    sd_surface_pixel_at(g_ws, 3, 3);
+    check(alloc_used() - gh, 0);                                       # 102
+    check(st_guard_bad(), 0);                                          # 103
+
+    if (g_fails == 0) {
+        var ok = "stride_test: PASS (every surface reader/writer addresses rows by the stride)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "stride_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

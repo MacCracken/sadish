@@ -1,0 +1,1452 @@
+# programs/stroke_style_test.cyr — RUN test for sd_canvas_stroke_path_ex: butt / round / square caps,
+# miter / round / bevel joins, the SVG miter limit, and the round stroker's byte-identity.
+#
+# ⭐ WHAT THIS EXISTS TO PROVE. Styled strokes put the corners where the geometry says (a miter
+# fills the outer corner pixel, a bevel cuts it to exactly half, a butt end stops at the endpoint),
+# the limit falls back to a bevel on the exact integer boundary, degenerate input (lone moveto,
+# repeated points, 180° reversals) makes no spikes, and a curve's stroke has neither spikes outside
+# its band nor gaps inside it — nor, at a cusp, a spike from a join style that does not apply
+# inside a curve — and a stroke split across edge batches keeps its seams. ⛔ And
+# sd_canvas_stroke_path — now in stroke.cyr, and what `_ex(ROUND, ROUND)` returns — writes the
+# same bytes as the 0.5.5 stroker, kept verbatim below.
+#
+# Every styled coordinate below is whole or half pixels, so the expected coverage is worked out
+# from the geometry in the comments; the fill samples 4 sub-scanlines per row with exact x overlap.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "stroke_style_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    var m2 = " got ";
+    syscall(1, 2, m2, strlen(m2));
+    fmt_int_fd(2, got);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# lo <= got <= hi, counted as one check.
+fn check_in(got, lo, hi): i64 {
+    var ok = 0;
+    if (got >= lo) {
+        if (got <= hi) { ok = 1; }
+    }
+    if (ok == 0) {
+        check(got, lo - 1000000);
+        return 1;
+    }
+    return check(1, 1);
+}
+
+var g_arena = 0;
+
+fn hook_alloc(n): i64 {
+    return arena_alloc(g_arena, n);
+}
+
+# ---- shapes (whole-pixel arguments unless noted; H = half a pixel) ------------------------
+var H = 32768;
+
+fn seg(x0, y0, x1, y1): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0, y0);
+    sd_path_lineto(p, x1, y1);
+    return p;
+}
+
+fn poly3(x0, y0, x1, y1, x2, y2): i64 {
+    var p = seg(x0, y0, x1, y1);
+    sd_path_lineto(p, x2, y2);
+    return p;
+}
+
+# The closed square (4,4) (12,4) (12,12) (4,12).
+fn square(explicit_close_point): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(p, 12 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(p, 12 * SD_ONE, 12 * SD_ONE);
+    sd_path_lineto(p, 4 * SD_ONE, 12 * SD_ONE);
+    if (explicit_close_point != 0) { sd_path_lineto(p, 4 * SD_ONE, 4 * SD_ONE); }
+    sd_path_close(p);
+    return p;
+}
+
+fn stroked(w, h, path, width, cap, join, ml): i64 {
+    var cv = sd_canvas_new(w, h);
+    sd_canvas_stroke_path_ex(cv, path, width, cap, join, ml);
+    return cv;
+}
+
+fn cov_sum(cv): i64 {
+    var n = sd_canvas_width(cv) * sd_canvas_height(cv);
+    var c = sd_canvas_coverage(cv);
+    var s = 0;
+    var i = 0;
+    while (i < n) {
+        s = s + load8(c + i);
+        i = i + 1;
+    }
+    return s;
+}
+
+# Number of coverage bytes that differ between two same-size canvases.
+fn cov_diff(a, b): i64 {
+    var n = sd_canvas_width(a) * sd_canvas_height(a);
+    var ca = sd_canvas_coverage(a);
+    var cb = sd_canvas_coverage(b);
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(ca + i) != load8(cb + i)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+# Largest per-pixel |a - b|.
+fn cov_maxdiff(a, b): i64 {
+    var n = sd_canvas_width(a) * sd_canvas_height(a);
+    var ca = sd_canvas_coverage(a);
+    var cb = sd_canvas_coverage(b);
+    var m = 0;
+    var i = 0;
+    while (i < n) {
+        var d = sd_abs(load8(ca + i) - load8(cb + i));
+        if (d > m) { m = d; }
+        i = i + 1;
+    }
+    return m;
+}
+
+# Distance (16.16) from (px, py) to the polyline `pl` (an SdPolyline) — skipping the segment INTO
+# point `break1`, where sd_path_flatten's output jumps to the second subpath's moveto.
+fn poly_dist(pl, break1, px, py): i64 {
+    var pts = sd_polyline_points(pl);
+    var n = sd_polyline_count(pl);
+    var best = 0x7FFFFFFFFFFF;
+    var i = 0;
+    while (i < n - 1) {
+        if (i + 1 != break1) {
+            var a = load64(pts + i * 8);
+            var b = load64(pts + (i + 1) * 8);
+            var ax = sd_point_x(a);
+            var ay = sd_point_y(a);
+            var vx = sd_point_x(b) - ax;
+            var vy = sd_point_y(b) - ay;
+            var wx = px - ax;
+            var wy = py - ay;
+            var len2 = vx * vx + vy * vy;
+            var t = wx * vx + wy * vy;
+            var d = 0;
+            if (len2 == 0) {
+                d = sd_isqrt(wx * wx + wy * wy);
+            } else {
+                if (t <= 0) {
+                    d = sd_isqrt(wx * wx + wy * wy);
+                } else {
+                    if (t >= len2) {
+                        var ex = px - sd_point_x(b);
+                        var ey = py - sd_point_y(b);
+                        d = sd_isqrt(ex * ex + ey * ey);
+                    } else {
+                        d = sd_abs(wx * vy - wy * vx) / sd_isqrt(len2);
+                    }
+                }
+            }
+            if (d < best) { best = d; }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+# The largest miter ratio 1/cos(turn/2) = sqrt(2 / (1 + cos(turn))) over the interior vertices of
+# `pl` (16.16, rounded up); `break1` is the point index that starts its second subpath.
+fn poly_rmax(pl, break1): i64 {
+    var pts = sd_polyline_points(pl);
+    var n = sd_polyline_count(pl);
+    var rmax = SD_ONE;
+    var i = 1;
+    while (i < n - 1) {
+        var ok = 1;
+        if (i == break1) { ok = 0; }
+        if (i + 1 == break1) { ok = 0; }
+        if (ok != 0) {
+            var p0 = load64(pts + (i - 1) * 8);
+            var p1 = load64(pts + i * 8);
+            var p2 = load64(pts + (i + 1) * 8);
+            var ax = sd_point_x(p1) - sd_point_x(p0);
+            var ay = sd_point_y(p1) - sd_point_y(p0);
+            var bx = sd_point_x(p2) - sd_point_x(p1);
+            var by = sd_point_y(p2) - sd_point_y(p1);
+            var la = sd_isqrt(ax * ax + ay * ay);
+            var lb = sd_isqrt(bx * bx + by * by);
+            if (la > 0) {
+                if (lb > 0) {
+                    var c = ((ax * bx + ay * by) << 16) / (la * lb);
+                    var r = sd_isqrt(((2 << 32) / (SD_ONE + c)) << 16) + 1;
+                    if (r > rmax) { rmax = r; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return rmax;
+}
+
+# Band check for a stroke of half-width hw along polyline pl (second subpath at point break1) whose
+# worst join ratio is rmax: returns the pixels with ANY coverage whose centre is farther than
+# hw * rmax + 0.72 px from the polyline (spikes), plus the pixels whose whole square lies within
+# the join chord hw / rmax and the 16-gon's inscribed radius 0.981 hw, less 0.1 px, yet read below
+# 255 (gaps — or a split span). Pixel centre (x + 0.5, y + 0.5); 0.7072 px (46,347) is half a pixel
+# diagonal.
+fn band_faults(cv, pl, break1, hw, rmax): i64 {
+    var out_bound = sd_fixed_mul(hw, rmax) + 47186;
+    var in_bound = (hw << 16) / rmax;
+    var rim = sd_fixed_mul(hw, 64285);
+    if (rim < in_bound) { in_bound = rim; }
+    in_bound = in_bound - 6554;
+    var w = sd_canvas_width(cv);
+    var h = sd_canvas_height(cv);
+    var faults = 0;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var d = poly_dist(pl, break1, x * SD_ONE + H, y * SD_ONE + H);
+            var c = sd_canvas_coverage_at(cv, x, y);
+            if (c > 0) {
+                if (d > out_bound) { faults = faults + 1; }
+            }
+            if (d + 46347 <= in_bound) {
+                if (c < 255) { faults = faults + 1; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return faults;
+}
+
+# ---- the 0.5.5 stroker, VERBATIM (raster.cyr 0.5.5, names prefixed ref_) ---------------------
+fn ref_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
+    var dx = bx - ax;
+    var dy = by - ay;
+    var len2 = dx * dx + dy * dy;
+    if (len2 == 0) { return 0; }     # zero-length -> the vertex disc covers it
+    var l = sd_isqrt(len2);          # length in 16.16
+    if (l == 0) { return 0; }
+    var ox = ((0 - dy) * hw) / l;    # perpendicular offset, magnitude hw
+    var oy = (dx * hw) / l;
+    var rp = sd_path_new();
+    sd_path_moveto(rp, ax + ox, ay + oy);
+    sd_path_lineto(rp, bx + ox, by + oy);
+    sd_path_lineto(rp, bx - ox, by - oy);
+    sd_path_lineto(rp, ax - ox, ay - oy);
+    sd_path_close(rp);
+    sd_canvas_fill_union(cv, rp, SD_FILL_NONZERO);
+    return 0;
+}
+
+fn ref_stroke_disc(cv, cx, cy, hw): i64 {
+    var dp = sd_path_new();
+    var step = 411775 / 16;          # 2*pi / 16 in 16.16
+    var k = 0;
+    while (k < 16) {
+        var ang = k * step;
+        var px = cx + sd_fixed_mul(hw, sd_cos(ang));
+        var py = cy + sd_fixed_mul(hw, sd_sin(ang));
+        if (k == 0) { sd_path_moveto(dp, px, py); } else { sd_path_lineto(dp, px, py); }
+        k = k + 1;
+    }
+    sd_path_close(dp);
+    sd_canvas_fill_union(cv, dp, SD_FILL_NONZERO);
+    return 0;
+}
+
+fn ref_stroke_append(run, run_n, fctx): i64 {
+    var pts = load64(fctx + 0);
+    var n = load64(fctx + 8);
+    var i = 0;
+    while (i < n) {
+        if (run_n < SD_FLATTEN_CAP) {
+            store64(run + run_n * 8, load64(pts + i * 8));
+            run_n = run_n + 1;
+        }
+        i = i + 1;
+    }
+    return run_n;
+}
+
+fn ref_stroke_run(cv, run, n, closed, hw): i64 {
+    var i = 0;
+    while (i < n - 1) {
+        var a = load64(run + i * 8);
+        var b = load64(run + (i + 1) * 8);
+        ref_stroke_seg(cv, sd_point_x(a), sd_point_y(a), sd_point_x(b), sd_point_y(b), hw);
+        i = i + 1;
+    }
+    if (closed != 0) {
+        if (n > 1) {
+            var a2 = load64(run + (n - 1) * 8);
+            var b2 = load64(run + 0);
+            ref_stroke_seg(cv, sd_point_x(a2), sd_point_y(a2), sd_point_x(b2), sd_point_y(b2), hw);
+        }
+    }
+    var k = 0;
+    while (k < n) {
+        var v = load64(run + k * 8);
+        ref_stroke_disc(cv, sd_point_x(v), sd_point_y(v), hw);
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn ref_canvas_stroke_path(cv, path, width): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (path == 0) { return SADISH_ERR_EMPTY_PATH; }
+    var n_verbs = sd_path_verb_count(path);
+    if (n_verbs == 0) { return SADISH_ERR_EMPTY_PATH; }
+    var hw = sd_asr(width, 1);
+    if (hw <= 0) { return SADISH_OK; }
+    var tol = SD_ONE >> 2;
+
+    _sd_scratch_init();
+    var run = _sd_stroke_run;
+    var run_n = 0;
+    var fbuf = _sd_stroke_fbuf;
+    var fctx = _sd_stroke_fctx;
+
+    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
+    var points = load64(path + SD_PATH_POINTS_OFFSET);
+    var cur = 0;
+    var closed = 0;
+    var vi = 0;
+    var pi = 0;
+    while (vi < n_verbs) {
+        var verb = load64(verbs + vi * 8);
+        if (verb == SD_VERB_MOVETO) {
+            if (run_n > 0) { ref_stroke_run(cv, run, run_n, closed, hw); }
+            run_n = 0;
+            closed = 0;
+            cur = load64(points + pi * 8);
+            store64(run + run_n * 8, cur);
+            run_n = run_n + 1;
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_LINETO) {
+            cur = load64(points + pi * 8);
+            if (run_n < SD_FLATTEN_CAP) {
+                store64(run + run_n * 8, cur);
+                run_n = run_n + 1;
+            }
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_QUADTO) {
+            var qc = load64(points + pi * 8);
+            var qe = load64(points + (pi + 1) * 8);
+            store64(fctx + 0, fbuf);
+            store64(fctx + 8, 0);
+            store64(fctx + 16, SD_FLATTEN_CAP);
+            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
+            run_n = ref_stroke_append(run, run_n, fctx);
+            cur = qe;
+            pi = pi + 2;
+        }
+        if (verb == SD_VERB_CUBICTO) {
+            var k1 = load64(points + pi * 8);
+            var k2 = load64(points + (pi + 1) * 8);
+            var ke = load64(points + (pi + 2) * 8);
+            store64(fctx + 0, fbuf);
+            store64(fctx + 8, 0);
+            store64(fctx + 16, SD_FLATTEN_CAP);
+            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
+            run_n = ref_stroke_append(run, run_n, fctx);
+            cur = ke;
+            pi = pi + 3;
+        }
+        if (verb == SD_VERB_CLOSE) {
+            closed = 1;
+        }
+        vi = vi + 1;
+    }
+    if (run_n > 0) { ref_stroke_run(cv, run, run_n, closed, hw); }
+    return SADISH_OK;
+}
+
+# The byte-identity corpus: open polylines with fractional + collinear vertices, a closed rect,
+# quad + cubic, two subpaths, a lone moveto, repeated points, and drawing after a CLOSE.
+fn corpus(i): i64 {
+    var p = sd_path_new();
+    if (i == 0) {
+        sd_path_moveto(p, 2 * SD_ONE + H, 3 * SD_ONE);
+        sd_path_lineto(p, 9 * SD_ONE, 3 * SD_ONE);
+        sd_path_lineto(p, 15 * SD_ONE + 12345, 3 * SD_ONE);
+        sd_path_lineto(p, 20 * SD_ONE, 17 * SD_ONE + H);
+    }
+    if (i == 1) {
+        sd_path_moveto(p, 3 * SD_ONE, 3 * SD_ONE);
+        sd_path_lineto(p, 20 * SD_ONE, 3 * SD_ONE);
+        sd_path_lineto(p, 20 * SD_ONE, 18 * SD_ONE);
+        sd_path_lineto(p, 3 * SD_ONE, 18 * SD_ONE);
+        sd_path_close(p);
+    }
+    if (i == 2) {
+        sd_path_moveto(p, 2 * SD_ONE, 20 * SD_ONE);
+        sd_path_quadto(p, 12 * SD_ONE, 0, 22 * SD_ONE, 20 * SD_ONE);
+        sd_path_cubicto(p, 18 * SD_ONE, 8 * SD_ONE, 6 * SD_ONE, 8 * SD_ONE, 4 * SD_ONE + H, 14 * SD_ONE);
+    }
+    if (i == 3) {
+        sd_path_moveto(p, 4 * SD_ONE, 4 * SD_ONE);
+        sd_path_lineto(p, 10 * SD_ONE, 9 * SD_ONE + H);
+        sd_path_lineto(p, 4 * SD_ONE, 12 * SD_ONE);
+        sd_path_close(p);
+        sd_path_moveto(p, 14 * SD_ONE, 18 * SD_ONE);
+        sd_path_cubicto(p, 22 * SD_ONE, 2 * SD_ONE, 14 * SD_ONE, 2 * SD_ONE, 21 * SD_ONE, 12 * SD_ONE);
+    }
+    if (i == 4) {
+        sd_path_moveto(p, 11 * SD_ONE + H, 11 * SD_ONE + H);
+        sd_path_moveto(p, 5 * SD_ONE, 5 * SD_ONE);
+        sd_path_lineto(p, 5 * SD_ONE, 5 * SD_ONE);
+        sd_path_lineto(p, 17 * SD_ONE, 8 * SD_ONE);
+        sd_path_lineto(p, 17 * SD_ONE, 8 * SD_ONE);
+        sd_path_close(p);
+        sd_path_lineto(p, 9 * SD_ONE, 19 * SD_ONE);
+    }
+    return p;
+}
+
+# The first `count` vertices of a regular n-gon of radius r (16.16) about (cx, cy), from
+# sd_cos/sd_sin — fractional vertices.
+fn ngon(cx, cy, r, n, count, closed): i64 {
+    var p = sd_path_new();
+    var k = 0;
+    while (k < count) {
+        var ang = (411775 * k) / n;
+        var x = cx + sd_fixed_mul(r, sd_cos(ang));
+        var y = cy + sd_fixed_mul(r, sd_sin(ang));
+        if (k == 0) { sd_path_moveto(p, x, y); } else { sd_path_lineto(p, x, y); }
+        k = k + 1;
+    }
+    if (closed != 0) { sd_path_close(p); }
+    return p;
+}
+
+# ---- deterministic irregular paths for the batch sweeps (group K) ----------------------------
+var g_seed = 0;
+
+fn rnd(n): i64 {
+    g_seed = g_seed * 6364136223846793005 + 1442695040888963407;
+    return (g_seed >> 33) % n;
+}
+
+# An open wiggle: steps of 0.05..0.66 px with one in six of 0.6..1.6 px, heading swinging within
+# +-0.76 rad — irregular segment lengths, never crossing itself.
+fn wiggle(nseg): i64 {
+    var p = sd_path_new();
+    var x = 4 * SD_ONE + rnd(SD_ONE);
+    var y = 30 * SD_ONE + rnd(SD_ONE);
+    var hd = 0;
+    var dir = 1;
+    sd_path_moveto(p, x, y);
+    var k = 0;
+    while (k < nseg) {
+        var st = 3000 + rnd(40000);
+        if (rnd(6) == 0) { st = 40000 + rnd(SD_ONE); }
+        hd = hd + dir * (2000 + rnd(9000));
+        if (hd > 50000) { dir = 0 - 1; }
+        if (hd < 0 - 50000) { dir = 1; }
+        x = x + sd_fixed_mul(st, sd_cos(hd));
+        y = y + sd_fixed_mul(st, sd_sin(hd));
+        sd_path_lineto(p, x, y);
+        k = k + 1;
+    }
+    return p;
+}
+
+# A closed blob: radius 20..20.5 px, angular steps from a third to five thirds of the mean — so
+# neighbouring segment lengths differ by up to 5x.
+fn blob(nseg): i64 {
+    var p = sd_path_new();
+    var cx = 32 * SD_ONE + rnd(SD_ONE);
+    var cy = 32 * SD_ONE + rnd(SD_ONE);
+    var ang = 0;
+    var k = 0;
+    while (k < nseg) {
+        var r = 20 * SD_ONE + rnd(SD_ONE / 2);
+        var x = cx + sd_fixed_mul(r, sd_cos(ang));
+        var y = cy + sd_fixed_mul(r, sd_sin(ang));
+        if (k == 0) { sd_path_moveto(p, x, y); } else { sd_path_lineto(p, x, y); }
+        ang = ang + (411775 / nseg) / 3 + rnd((411775 * 4) / (nseg * 3));
+        if (ang >= 411775) { k = nseg; }
+        k = k + 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+# A closed gear: radius 18 px, every other vertex `tooth` further out, angular steps from a half to
+# one and a half of the mean — sharp, irregular teeth that never cross.
+fn gear(nseg, tooth): i64 {
+    var p = sd_path_new();
+    var cx = 32 * SD_ONE + rnd(SD_ONE);
+    var cy = 32 * SD_ONE + rnd(SD_ONE);
+    var ang = 0;
+    var k = 0;
+    while (k < nseg) {
+        var r = 18 * SD_ONE;
+        if ((k & 1) != 0) { r = r + tooth; }
+        var x = cx + sd_fixed_mul(r, sd_cos(ang));
+        var y = cy + sd_fixed_mul(r, sd_sin(ang));
+        if (k == 0) { sd_path_moveto(p, x, y); } else { sd_path_lineto(p, x, y); }
+        ang = ang + (411775 / nseg) / 2 + rnd(411775 / nseg);
+        if (ang >= 411775) { k = nseg; }
+        k = k + 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+# n samples of the 3:4 Lissajous figure (radius 90 px about (100, 100)), rounded to whole pixels,
+# walked forwards or backwards — a path that crosses itself dozens of times.
+fn liss(n, rev): i64 {
+    var p = sd_path_new();
+    var k = 0;
+    while (k < n) {
+        var j = k;
+        if (rev != 0) { j = n - 1 - k; }
+        var t = (411775 * j) / n;
+        var x = (100 + sd_asr(90 * sd_sin(3 * t) + 32768, 16)) * SD_ONE;
+        var y = (100 + sd_asr(90 * sd_sin(4 * t) + 32768, 16)) * SD_ONE;
+        if (k == 0) { sd_path_moveto(p, x, y); } else { sd_path_lineto(p, x, y); }
+        k = k + 1;
+    }
+    return p;
+}
+
+# A Lissajous knot (n samples, radius 40 px about (50, 50)) and then a tail of m whole-pixel zigzag
+# steps off to the right — forwards, or the same vertices backwards.
+fn knot_tail(n, m, rev): i64 {
+    var total = n + m;
+    var xs = sd_alloc(total * 8);
+    var ys = sd_alloc(total * 8);
+    var k = 0;
+    while (k < n) {
+        var t = (411775 * k) / n;
+        store64(xs + k * 8, (50 + sd_asr(40 * sd_sin(3 * t) + 32768, 16)) * SD_ONE);
+        store64(ys + k * 8, (50 + sd_asr(40 * sd_sin(4 * t) + 32768, 16)) * SD_ONE);
+        k = k + 1;
+    }
+    k = 0;
+    while (k < m) {
+        store64(xs + (n + k) * 8, (100 + k / 2) * SD_ONE);
+        store64(ys + (n + k) * 8, (20 + (k % 2) * 3 + (k / 7) % 60) * SD_ONE);
+        k = k + 1;
+    }
+    var p = sd_path_new();
+    k = 0;
+    while (k < total) {
+        var j = k;
+        if (rev != 0) { j = total - 1 - k; }
+        if (k == 0) {
+            sd_path_moveto(p, load64(xs + j * 8), load64(ys + j * 8));
+        } else {
+            sd_path_lineto(p, load64(xs + j * 8), load64(ys + j * 8));
+        }
+        k = k + 1;
+    }
+    return p;
+}
+
+# Sum of coverage over rows [y0, y1).
+fn rows_sum(cv, y0, y1): i64 {
+    var s = 0;
+    var y = y0;
+    while (y < y1) {
+        var x = 0;
+        while (x < sd_canvas_width(cv)) {
+            s = s + sd_canvas_coverage_at(cv, x, y);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return s;
+}
+
+# The polyline `pl` (second subpath starting at point `break1`, 0 for none) as explicit LINETOs.
+fn poly_path(pl, break1): i64 {
+    var p = sd_path_new();
+    var pts = sd_polyline_points(pl);
+    var i = 0;
+    while (i < sd_polyline_count(pl)) {
+        var q = load64(pts + i * 8);
+        var mv = 0;
+        if (i == 0) { mv = 1; }
+        if (i == break1) { mv = 1; }
+        if (mv != 0) {
+            sd_path_moveto(p, sd_point_x(q), sd_point_y(q));
+        } else {
+            sd_path_lineto(p, sd_point_x(q), sd_point_y(q));
+        }
+        i = i + 1;
+    }
+    return p;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var W2 = 2 * SD_ONE;    # stroke width 2 -> hw = 1 px
+    var W4 = 4 * SD_ONE;    # stroke width 4 -> hw = 2 px
+    var W6 = 6 * SD_ONE;    # stroke width 6 -> hw = 3 px
+    var ML4 = 4 * SD_ONE;   # SVG's default miter limit
+
+    # ── A) ALLOCATION — FIRST, so the styled scratch is cold ────
+    # Warm raster.cyr's fixed scratch with a plain fill (alloc_test owns those figures), then take
+    # the process's FIRST styled stroke under an arena hook. ⛔ The batch scratch must land on the
+    # GLOBAL heap — a batch path drawn from an arena that gets reset would dangle on the next frame.
+    var acv = sd_canvas_new(16, 16);
+    var arect = square(0);
+    var acurve = sd_path_new();
+    sd_path_moveto(acurve, 2 * SD_ONE, 14 * SD_ONE);
+    sd_path_cubicto(acurve, 2 * SD_ONE, 2 * SD_ONE, 14 * SD_ONE, 2 * SD_ONE, 14 * SD_ONE, 14 * SD_ONE);
+    sd_canvas_fill_path(acv, arect, SD_FILL_NONZERO);
+    g_arena = arena_new_growable(4194304);
+    check(sd_alloc_set(&hook_alloc), 0);                               # 1
+    var g0 = alloc_used();
+    var a0 = arena_used(g_arena);
+    check(sd_canvas_stroke_path_ex(acv, arect, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4), SADISH_OK);  # 2
+    # MEASURED 270,592 B: 8192*32 edges + 16*16 trig + 8192 curve flags (crossings: the fill's own).
+    check(alloc_used() - g0, 270592);                                  # 3 — one-time, on the global heap
+    check(arena_used(g_arena) - a0, 0);                                # 4 — and not one byte on the hook
+    # The edge array was the batch scratch's last allocation, so the next global block sits right
+    # behind it: a sentinel group U reads back, to catch a write past the array (a raised limit).
+    var sentinel = alloc(262144);
+    var sn = 0;
+    while (sn < 262144) {
+        store8(sentinel + sn, 165);
+        sn = sn + 1;
+    }
+    g0 = alloc_used();
+    a0 = arena_used(g_arena);
+    sd_canvas_stroke_path_ex(acv, arect, W2, SD_CAP_SQUARE, SD_JOIN_BEVEL, ML4);
+    check(alloc_used() - g0, 0);                                       # 5 — warm: 0 B on the heap
+    check(arena_used(g_arena) - a0, 0);                                # 6 — straight lines: 0 B anywhere
+    g0 = alloc_used();
+    a0 = arena_used(g_arena);
+    sd_canvas_stroke_path_ex(acv, acurve, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    var curve_cost = arena_used(g_arena) - a0;
+    check(alloc_used() - g0, 0);                                       # 7 — a curve: still 0 on the heap
+    # MEASURED 672 B: the cubic's 42 flatten mid-points x 16 B (7 subdivisions), on the seam, per call.
+    check(curve_cost, 672);                                            # 8
+    a0 = arena_used(g_arena);
+    sd_canvas_stroke_path_ex(acv, acurve, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    check(arena_used(g_arena) - a0, curve_cost);                       # 9 — identical on the next call
+    check(sd_alloc_set(0), &hook_alloc);                               # 10
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(acv, arect, W4, SD_CAP_ROUND, SD_JOIN_BEVEL, ML4);
+    check(alloc_used() - g0, 0);                                       # 11 — no hook: still 0 B
+    # ROUND/ROUND through _ex is the round stroker, allocations included (34,432 B, its paths).
+    g0 = alloc_used();
+    sd_canvas_stroke_path(acv, arect, W2);
+    var round_cost = alloc_used() - g0;
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(acv, arect, W2, SD_CAP_ROUND, SD_JOIN_ROUND, ML4);
+    check(alloc_used() - g0, round_cost);                              # 12
+    check(round_cost, 34432);                                          # 13
+
+    # ── B) ARGUMENT CONTRACT ────
+    var line = seg(2 * SD_ONE, 4 * SD_ONE, 6 * SD_ONE, 4 * SD_ONE);
+    var bcv = sd_canvas_new(9, 8);
+    sd_canvas_fill_path(bcv, square(0), SD_FILL_NONZERO);             # pre-existing coverage
+    var before = cov_sum(bcv);
+    check(before > 0, 1);                                              # 14
+    check(sd_canvas_stroke_path_ex(0, line, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4), SADISH_ERR_BOUNDS);        # 15
+    check(sd_canvas_stroke_path_ex(bcv, 0, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4), SADISH_ERR_EMPTY_PATH);     # 16
+    var empty = sd_path_new();
+    check(sd_canvas_stroke_path_ex(bcv, empty, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4), SADISH_ERR_EMPTY_PATH);  # 17
+    check(sd_canvas_stroke_path_ex(bcv, line, W2, 3, SD_JOIN_MITER, ML4), SADISH_ERR_BOUNDS);                # 18
+    check(sd_canvas_stroke_path_ex(bcv, line, W2, 0 - 1, SD_JOIN_MITER, ML4), SADISH_ERR_BOUNDS);            # 19
+    check(sd_canvas_stroke_path_ex(bcv, line, W2, SD_CAP_BUTT, 3, ML4), SADISH_ERR_BOUNDS);                  # 20
+    check(sd_canvas_stroke_path_ex(bcv, line, W2, SD_CAP_ROUND, 0 - 1, ML4), SADISH_ERR_BOUNDS);             # 21
+    # 22 — cap/join are validated before the width
+    check(sd_canvas_stroke_path_ex(bcv, line, 0, SD_CAP_SQUARE, 7, ML4), SADISH_ERR_BOUNDS);                 # 22
+    check(cov_sum(bcv), before);                                       # 23 — nothing drawn by any of them
+    check(sd_canvas_stroke_path_ex(bcv, line, 0, SD_CAP_SQUARE, SD_JOIN_MITER, ML4), SADISH_OK);            # 24
+    check(sd_canvas_stroke_path_ex(bcv, line, 0 - W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4), SADISH_OK);         # 25
+    check(sd_canvas_stroke_path_ex(bcv, line, 1, SD_CAP_SQUARE, SD_JOIN_BEVEL, ML4), SADISH_OK); # 26 hw = 0
+    check(cov_sum(bcv), before);                                       # 27
+
+    # ── C) CAPS on (2,4) -> (6,4), width 2: the band is rows 3..4 ────
+    # BUTT: exactly the rect [2,6] x [3,5] = 8 whole pixels. The end is AT x = 6: pixel 5 full, 6 empty.
+    var cb = stroked(9, 8, line, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    check(sd_canvas_coverage_at(cb, 5, 3), 255);                       # 28
+    check(sd_canvas_coverage_at(cb, 6, 3), 0);                         # 29
+    check(sd_canvas_coverage_at(cb, 2, 4), 255);                       # 30
+    check(sd_canvas_coverage_at(cb, 1, 4), 0);                         # 31
+    check(cov_sum(cb), 8 * 255);                                       # 32
+    # SQUARE: the rect extended by hw = 1 px at both ends -> [1,7] x [3,5] = 12 pixels.
+    var cs = stroked(9, 8, line, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(sd_canvas_coverage_at(cs, 6, 3), 255);                       # 33
+    check(sd_canvas_coverage_at(cs, 1, 4), 255);                       # 34
+    check(sd_canvas_coverage_at(cs, 7, 3), 0);                         # 35
+    check(sd_canvas_coverage_at(cs, 0, 4), 0);                         # 36
+    check(cov_sum(cs), 12 * 255);                                      # 37
+    # ROUND: a quarter of the radius-1 16-gon in pixel (6,3) — 0.765 px^2 of polygon (the 16-gon is
+    # 97.5 % of the disc), MEASURED 198 through 4 sub-scanlines. Partial on both ends, both rows.
+    var cr = stroked(9, 8, line, W2, SD_CAP_ROUND, SD_JOIN_BEVEL, ML4);
+    check_in(sd_canvas_coverage_at(cr, 6, 3), 185, 210);               # 38
+    check(sd_canvas_coverage_at(cr, 6, 3), sd_canvas_coverage_at(cr, 1, 4));   # 39 — symmetric
+    check(sd_canvas_coverage_at(cr, 7, 3), 0);                         # 40
+    # (5,3) is inside the rect, and the disc's edges cross it: the batch walk keeps the overlapping
+    # pieces one span, so it reads solid (sd_canvas_fill_union's walk floors each split: 254).
+    check(sd_canvas_coverage_at(cr, 5, 3), 255);                       # 41
+    # Direction does not matter: the reversed segment strokes the same bytes, for every cap.
+    var rline = seg(6 * SD_ONE, 4 * SD_ONE, 2 * SD_ONE, 4 * SD_ONE);
+    check(cov_diff(cs, stroked(9, 8, rline, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4)), 0);   # 42
+    check(cov_diff(cb, stroked(9, 8, rline, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4)), 0);     # 43
+    # A VERTICAL square-capped segment (4,2) -> (4,6): extends in y, never sideways.
+    var vcs = stroked(9, 9, seg(4 * SD_ONE, 2 * SD_ONE, 4 * SD_ONE, 6 * SD_ONE), W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(sd_canvas_coverage_at(vcs, 3, 1), 255);                      # 44 — start cap
+    check(sd_canvas_coverage_at(vcs, 4, 6), 255);                      # 45 — end cap
+    check(sd_canvas_coverage_at(vcs, 4, 7), 0);                        # 46
+    check(sd_canvas_coverage_at(vcs, 5, 3), 0);                        # 47
+    check(cov_sum(vcs), 12 * 255);                                     # 48
+
+    # ── D) A 90° CORNER: (2,2) -> (10,2) -> (10,10), width 2, butt ends ────
+    # The outer corner is pixel (10,1). MITER: tip (11,1) fills it. BEVEL: the chord (10,1)-(11,2)
+    # halves it — the four sub-scanline spans are 1/8, 3/8, 5/8, 7/8 px = exactly 1/2 -> 127.
+    var lp = poly3(2 * SD_ONE, 2 * SD_ONE, 10 * SD_ONE, 2 * SD_ONE, 10 * SD_ONE, 10 * SD_ONE);
+    var lm = stroked(13, 12, lp, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    var lb = stroked(13, 12, lp, W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    var lr = stroked(13, 12, lp, W2, SD_CAP_BUTT, SD_JOIN_ROUND, ML4);
+    check(sd_canvas_coverage_at(lm, 10, 1), 255);                      # 49
+    check(sd_canvas_coverage_at(lb, 10, 1), 127);                      # 50
+    check_in(sd_canvas_coverage_at(lr, 10, 1), 185, 210);              # 51 — the quarter 16-gon again
+    check(sd_canvas_coverage_at(lm, 9, 2), 255);                       # 52 — inner corner, all three
+    check(sd_canvas_coverage_at(lb, 9, 2), 255);                       # 53
+    check(sd_canvas_coverage_at(lr, 9, 2), 255);                       # 54 — the disc's edges cross it
+    check(sd_canvas_coverage_at(lm, 11, 1), 0);                        # 55 — the miter stops at its tip
+    check(sd_canvas_coverage_at(lm, 10, 0), 0);                        # 56
+    check(cov_sum(lm) - cov_sum(lb), 255 - 127);                       # 57 — the corner pixel is the only difference
+    # The same corner turning the OTHER way — (10,2) -> (2,2) -> (2,10): the outer corner is (1,1).
+    var lp2 = poly3(10 * SD_ONE, 2 * SD_ONE, 2 * SD_ONE, 2 * SD_ONE, 2 * SD_ONE, 10 * SD_ONE);
+    var lm2 = stroked(13, 12, lp2, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    var lb2 = stroked(13, 12, lp2, W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    check(sd_canvas_coverage_at(lm2, 1, 1), 255);                      # 58
+    check(sd_canvas_coverage_at(lb2, 1, 1), 127);                      # 59
+    check(sd_canvas_coverage_at(lm2, 0, 1), 0);                        # 60
+    check(cov_sum(lm2), cov_sum(lm));                                  # 61 — mirror images
+    check(cov_sum(lb2), cov_sum(lb));                                  # 62
+
+    # ── E) A SHARP V: (3,7.5) -> (20,10.5) -> (3,13.5), width 2 ────
+    # Interior angle 2*atan(3/17) = 20.02°, so miterLength / width = 1/sin(10.01°) = sqrt(298)/3 =
+    # 5.7542 and the tip sits at x = 20 + 5.754 on row 10. The bevel reaches x = 20 + 3/sqrt(298).
+    var vp = poly3(3 * SD_ONE, 7 * SD_ONE + H, 20 * SD_ONE, 10 * SD_ONE + H, 3 * SD_ONE, 13 * SD_ONE + H);
+    var v4 = stroked(30, 20, vp, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    var v20 = stroked(30, 20, vp, W2, SD_CAP_BUTT, SD_JOIN_MITER, 20 * SD_ONE);
+    var vbev = stroked(30, 20, vp, W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    check(cov_diff(v4, vbev), 0);                                      # 63 — limit 4 < 5.754: a bevel
+    check(sd_canvas_coverage_at(v4, 21, 10), 0);                       # 64 — no tip
+    check_in(sd_canvas_coverage_at(v4, 20, 10), 1, 64);                # 65 — just the bevel's 0.17 px
+    check(sd_canvas_coverage_at(v20, 22, 10), 255);                    # 66 — limit 20: the tip is there
+    check_in(sd_canvas_coverage_at(v20, 24, 10), 64, 191);             # 67 — narrowing: 1.25..1.75 px from it
+    check(sd_canvas_coverage_at(v20, 25, 10) > 0, 1);                  # 68 — the tip pixel (tip at 25.754)
+    check(sd_canvas_coverage_at(v20, 26, 10), 0);                      # 69 — and nothing past it
+    # ⭐ The exact integer boundary: 5.7542 * 65536 lies in (377108, 377109) — 377108^2 * 9 <
+    # 298 * 2^32 < 377109^2 * 9 — and both directions reduce exactly, so the test flips between them.
+    check(cov_diff(stroked(30, 20, vp, W2, SD_CAP_BUTT, SD_JOIN_MITER, 377108), vbev), 0);   # 70
+    check(cov_diff(stroked(30, 20, vp, W2, SD_CAP_BUTT, SD_JOIN_MITER, 377109), v20), 0);    # 71
+    # ⭐ A ratio of EXACTLY 1.25: segments (25, 0) then (7, 24), scaled by 1/2 — cos(turn) = 7/25,
+    # ratio = 1 / sqrt((1 + 7/25) / 2) = 5/4. At the limit it is still a miter (SVG: only "exceeds"
+    # bevels); one 16.16 step below, a bevel. The tip triangle is base 2.4 x height 0.9 px at hw = 2:
+    # 1.08 px^2, MEASURED as 274 coverage units.
+    var bp = poly3(2 * SD_ONE, 4 * SD_ONE, 14 * SD_ONE + H, 4 * SD_ONE, 18 * SD_ONE, 16 * SD_ONE);
+    var bmax = stroked(24, 20, bp, W4, SD_CAP_BUTT, SD_JOIN_MITER, SD_MITER_LIMIT_MAX);
+    var bbev = stroked(24, 20, bp, W4, SD_CAP_BUTT, SD_JOIN_BEVEL, 0);
+    check(cov_diff(stroked(24, 20, bp, W4, SD_CAP_BUTT, SD_JOIN_MITER, 81920), bmax), 0);    # 72
+    check(cov_diff(stroked(24, 20, bp, W4, SD_CAP_BUTT, SD_JOIN_MITER, 81919), bbev), 0);    # 73
+    check_in(cov_sum(bmax) - cov_sum(bbev), 255, 295);                 # 74
+    # miter_limit below 1.0 is 1.0: every real turn exceeds it.
+    check(cov_diff(stroked(24, 20, bp, W4, SD_CAP_BUTT, SD_JOIN_MITER, 0 - 5), bbev), 0);    # 75
+    check(cov_diff(stroked(13, 12, lp, W2, SD_CAP_BUTT, SD_JOIN_MITER, SD_ONE), lb), 0);     # 76
+
+    # ── F) A CLOSED SQUARE (4,4) (12,4) (12,12) (4,12), width 2: joins everywhere, no caps ──────
+    var sq = square(0);
+    var sqm = stroked(16, 16, sq, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    var sqb = stroked(16, 16, sq, W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    check(sd_canvas_coverage_at(sqm, 3, 3), 255);                      # 77 — the start/end vertex too
+    check(sd_canvas_coverage_at(sqm, 12, 3), 255);                     # 78
+    check(sd_canvas_coverage_at(sqm, 12, 12), 255);                    # 79
+    check(sd_canvas_coverage_at(sqm, 3, 12), 255);                     # 80
+    check(sd_canvas_coverage_at(sqb, 3, 3), 127);                      # 81
+    check(sd_canvas_coverage_at(sqb, 12, 3), 127);                     # 82
+    check(sd_canvas_coverage_at(sqb, 12, 12), 127);                    # 83
+    check(sd_canvas_coverage_at(sqb, 3, 12), 127);                     # 84
+    check(sd_canvas_coverage_at(sqm, 5, 5), 0);                        # 85 — hollow
+    check(sd_canvas_coverage_at(sqm, 4, 5), 255);                      # 86 — band [3,5]
+    check(cov_sum(sqm), (10 * 10 - 6 * 6) * 255);                      # 87 — [3,13]^2 minus [5,11]^2
+    # No caps on a closed subpath: a square or round cap at (4,4) would cover the bevel's cut corner.
+    check(cov_diff(stroked(16, 16, sq, W2, SD_CAP_SQUARE, SD_JOIN_BEVEL, ML4), sqb), 0);     # 88
+    check(cov_diff(stroked(16, 16, sq, W2, SD_CAP_ROUND, SD_JOIN_BEVEL, ML4), sqb), 0);      # 89
+    check(cov_diff(stroked(16, 16, sq, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4), sqm), 0);     # 90
+    # An explicit closing point equal to the moveto point: a zero-length closing segment, no extra join.
+    check(cov_diff(stroked(16, 16, square(1), W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4), sqb), 0);  # 91
+    check(cov_diff(stroked(16, 16, square(1), W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4), sqm), 0);  # 92
+    # The same square left OPEN is NOT the closed one: (4,4) gets two butt ends, not a join.
+    var osq = sd_path_new();
+    sd_path_moveto(osq, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(osq, 12 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(osq, 12 * SD_ONE, 12 * SD_ONE);
+    sd_path_lineto(osq, 4 * SD_ONE, 12 * SD_ONE);
+    sd_path_lineto(osq, 4 * SD_ONE, 4 * SD_ONE);
+    var osqb = stroked(16, 16, osq, W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    check(sd_canvas_coverage_at(osqb, 3, 3), 0);                       # 93 — two butt ends meet, no join
+    check(sd_canvas_coverage_at(osqb, 12, 3), 127);                    # 94
+
+    # ── G) NO SEGMENT AT ALL: lone moveto / coincident points at (8,8), width 4 (hw = 2) ────────
+    var lone = sd_path_new();
+    sd_path_moveto(lone, 8 * SD_ONE, 8 * SD_ONE);
+    var gsq = stroked(16, 16, lone, W4, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(sd_canvas_coverage_at(gsq, 6, 6), 255);                      # 95 — square [6,10]^2
+    check(sd_canvas_coverage_at(gsq, 9, 9), 255);                      # 96
+    check(sd_canvas_coverage_at(gsq, 10, 8), 0);                       # 97
+    check(sd_canvas_coverage_at(gsq, 7, 5), 0);                        # 98
+    check(cov_sum(gsq), 16 * 255);                                     # 99
+    var grd = stroked(16, 16, lone, W4, SD_CAP_ROUND, SD_JOIN_BEVEL, ML4);
+    check(sd_canvas_coverage_at(grd, 7, 7), 255);                      # 100 — corner (7,7) is 1.41 from the centre
+    check_in(sd_canvas_coverage_at(grd, 6, 6), 1, 127);                # 101 — clipped by the rim (MEASURED 73)
+    check(sd_canvas_coverage_at(grd, 5, 8), 0);                        # 102 — the rim touches x = 6 at one vertex
+    # 16-gon area 8 * sin(pi/8) * r^2 = 12.25 px^2 = 3,123 units; MEASURED 3,140.
+    check_in(cov_sum(grd), 3050, 3200);                                # 103
+    check(cov_sum(stroked(16, 16, lone, W4, SD_CAP_BUTT, SD_JOIN_ROUND, ML4)), 0);           # 104
+    var coin = sd_path_new();
+    sd_path_moveto(coin, 8 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(coin, 8 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(coin, 8 * SD_ONE, 8 * SD_ONE);
+    check(cov_diff(stroked(16, 16, coin, W4, SD_CAP_SQUARE, SD_JOIN_MITER, ML4), gsq), 0);   # 105
+    check(cov_diff(stroked(16, 16, coin, W4, SD_CAP_ROUND, SD_JOIN_MITER, ML4), grd), 0);    # 106
+    check(cov_sum(stroked(16, 16, coin, W4, SD_CAP_BUTT, SD_JOIN_MITER, ML4)), 0);           # 107
+    sd_path_close(coin);                                               # closed, still no segment
+    check(cov_diff(stroked(16, 16, coin, W4, SD_CAP_SQUARE, SD_JOIN_BEVEL, ML4), gsq), 0);   # 108
+
+    # ── H) ZERO-LENGTH SEGMENTS INSIDE A PATH ────
+    # (2,8) (2,8) (6,8) (6,8) (6,8) (6,12.5) (6,12.5) strokes exactly what (2,8) (6,8) (6,12.5) does:
+    # the repeats neither add a join nor pick up a garbage direction.
+    var zc = poly3(2 * SD_ONE, 8 * SD_ONE, 6 * SD_ONE, 8 * SD_ONE, 6 * SD_ONE, 12 * SD_ONE + H);
+    var zd = sd_path_new();
+    sd_path_moveto(zd, 2 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(zd, 2 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(zd, 6 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(zd, 6 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(zd, 6 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(zd, 6 * SD_ONE, 12 * SD_ONE + H);
+    sd_path_lineto(zd, 6 * SD_ONE, 12 * SD_ONE + H);
+    var zj = 0;
+    var zbad = 0;
+    while (zj < 3) {
+        var zc2 = 0;
+        while (zc2 < 3) {
+            if (cov_diff(stroked(16, 16, zd, W2, zc2, zj, ML4), stroked(16, 16, zc, W2, zc2, zj, ML4)) != 0) {
+                zbad = zbad + 1;
+            }
+            zc2 = zc2 + 1;
+        }
+        zj = zj + 1;
+    }
+    check(zbad, 0);                                                    # 109 — all nine cap x join pairs
+    var zm = stroked(16, 16, zd, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(sd_canvas_coverage_at(zm, 6, 7), 255);                       # 110 — the miter corner is there
+    check(sd_canvas_coverage_at(zm, 1, 8), 255);                       # 111 — and the start cap
+    # [1,7]x[7,9] (cap + segment + miter corner) = 12, [5,7]x[9,13.5] = 8 whole + 2 half pixels.
+    check(cov_sum(zm), 20 * 255 + 2 * 127);                            # 112
+
+    # ── I) 180° REVERSAL WITH MITER: a flat end, no spike ────
+    var rev = poly3(2 * SD_ONE, 5 * SD_ONE, 8 * SD_ONE, 5 * SD_ONE, 4 * SD_ONE, 5 * SD_ONE);
+    var revm = stroked(12, 10, rev, W2, SD_CAP_BUTT, SD_JOIN_MITER, SD_MITER_LIMIT_MAX);
+    var fwd = stroked(12, 10, seg(2 * SD_ONE, 5 * SD_ONE, 8 * SD_ONE, 5 * SD_ONE), W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    check(cov_diff(revm, fwd), 0);                                     # 113 — exactly the forward segment
+    check(sd_canvas_coverage_at(revm, 8, 4), 0);                       # 114
+    check(cov_diff(stroked(12, 10, rev, W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4), fwd), 0);      # 115
+    var revr = stroked(12, 10, rev, W2, SD_CAP_BUTT, SD_JOIN_ROUND, ML4);
+    check(sd_canvas_coverage_at(revr, 8, 4) > 0, 1);                   # 116 — round: a half disc
+    # A diagonal reversal (2,2) -> (8,6) -> (5,4): truncated offsets need not cancel exactly, but the
+    # reduced directions do, so the miter test sees P + D = 0 and bevels. Beyond the vertex: nothing.
+    var drev = poly3(2 * SD_ONE, 2 * SD_ONE, 8 * SD_ONE, 6 * SD_ONE, 5 * SD_ONE, 4 * SD_ONE);
+    var drevm = stroked(14, 12, drev, W2, SD_CAP_BUTT, SD_JOIN_MITER, SD_MITER_LIMIT_MAX);
+    var dseg = seg(2 * SD_ONE, 2 * SD_ONE, 8 * SD_ONE, 6 * SD_ONE);
+    var dfwd = stroked(14, 12, dseg, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    check_in(cov_sum(drevm) - cov_sum(dfwd), 0 - 8, 8);                # 117
+    check(sd_canvas_coverage_at(drevm, 9, 7), 0);                      # 118
+    check(sd_canvas_coverage_at(drevm, 10, 7), 0);                     # 119
+
+    # ── J) CURVES: no spike outside the band, no gap inside it ────
+    # Two smooth subpaths — an arch (cubic) and a sag (quad). sd_path_flatten at the stroker's tol
+    # yields the stroker's own polyline. With ROUND caps the stroke covers every point within hw of
+    # it, except outside each join's chord (hw * cos(turn/2) from the vertex) and the 16-gon's 2 % rim;
+    # and nothing reaches past hw * ratio. band_faults turns both into per-pixel checks with the
+    # half-diagonal added, taking the worst flattened turn from the polyline itself — and that worst
+    # turn is asserted small, so the spike bound stays within a tenth of a pixel of the band.
+    var cu = sd_path_new();
+    sd_path_moveto(cu, 4 * SD_ONE, 24 * SD_ONE);
+    sd_path_cubicto(cu, 4 * SD_ONE, 3 * SD_ONE, 36 * SD_ONE + H, 3 * SD_ONE, 36 * SD_ONE, 24 * SD_ONE);
+    sd_path_moveto(cu, 8 * SD_ONE, 27 * SD_ONE);
+    sd_path_quadto(cu, 20 * SD_ONE, 18 * SD_ONE, 34 * SD_ONE + H, 28 * SD_ONE);
+    var cpl = sd_path_flatten(cu, SD_ONE >> 2);
+    var cbreak = 0;
+    var cpts = sd_polyline_points(cpl);
+    var cq = 1;
+    while (cq < sd_polyline_count(cpl)) {
+        if (sd_point_x(load64(cpts + cq * 8)) == 8 * SD_ONE) {
+            if (sd_point_y(load64(cpts + cq * 8)) == 27 * SD_ONE) { cbreak = cq; }
+        }
+        cq = cq + 1;
+    }
+    check(sd_polyline_count(cpl) > 12, 1);                             # 120 — a real curve, many joins
+    var hw2 = 2 * SD_ONE;
+    var crmax = poly_rmax(cpl, cbreak);
+    check_in(crmax, SD_ONE + 1, 68000);                                # 121 — worst turn: ratio < 1.04
+    var cum = stroked(42, 32, cu, W4, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    check(band_faults(cum, cpl, cbreak, hw2, crmax), 0);               # 122
+    check(band_faults(stroked(42, 32, cu, W4, SD_CAP_ROUND, SD_JOIN_BEVEL, ML4), cpl, cbreak, hw2, crmax), 0);  # 123
+    var cumax = stroked(42, 32, cu, W4, SD_CAP_ROUND, SD_JOIN_MITER, SD_MITER_LIMIT_MAX);
+    check(band_faults(cumax, cpl, cbreak, hw2, crmax), 0);             # 124
+    # ...and the curve's miter stroke is within 2 % of its round-join stroke in total ink.
+    var cur = stroked(42, 32, cu, W4, SD_CAP_ROUND, SD_JOIN_ROUND, ML4);
+    check_in(sd_abs(cov_sum(cum) - cov_sum(cur)) * 100 / cov_sum(cur), 0, 2);   # 125
+
+    # ── K) BATCHES: a subpath that overflows the batch flushes mid-way ────
+    # A 200-gon of radius 11 px (0.35 px segments, fractional vertices) is 2,000 edges as a MITER
+    # stroke (MEASURED) — one batch at the real limit. With the limit cut to 1,800 it takes two, and
+    # the re-emitted overlap — backwards after the flush, forwards after the closing join — must
+    # keep both seams: every pixel within 1 level of the single-batch stroke. An open half-circle of
+    # a 480-gon (1,684 edges under BEVEL, MEASURED), cut to 900, likewise. ⚠ Not a full open circle:
+    # there the end cap lands on the start cap from another batch — the MAX case the stroke.cyr
+    # header owns up to. Group S sweeps irregular paths the same way.
+    # The ring's centre is off the pixel grid in y: its vertex 0, where the closing join meets
+    # segment 0, must not sit on a row boundary, or a seam there splits no pixel and cannot show.
+    var ring = ngon(16 * SD_ONE + H, 16 * SD_ONE + 20000, 11 * SD_ONE, 200, 200, 1);
+    var ring1 = stroked(33, 32, ring, 3 * SD_ONE, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    var arc = ngon(16 * SD_ONE, 16 * SD_ONE + H, 12 * SD_ONE + H, 480, 241, 0);
+    var arc1 = stroked(33, 32, arc, 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_BEVEL, ML4);
+    var keep_cap = SD_STROKE_BATCH_CAP;
+    SD_STROKE_BATCH_CAP = 1800;
+    var ring2 = stroked(33, 32, ring, 3 * SD_ONE, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    SD_STROKE_BATCH_CAP = 900;
+    var arc2 = stroked(33, 32, arc, 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_BEVEL, ML4);
+    SD_STROKE_BATCH_CAP = keep_cap;
+    check(cov_sum(ring1) > 0, 1);                                      # 126
+    check_in(cov_maxdiff(ring1, ring2), 0, 1);                         # 127
+    check_in(cov_maxdiff(arc1, arc2), 0, 1);                           # 128
+    check(sd_canvas_coverage_at(ring1, 16, 16), 0);                    # 129 — hollow
+
+    # ── L) CLIP + UNION: styled strokes land through fill_union like every other piece ─────────
+    var clcv = sd_canvas_new(16, 16);
+    sd_canvas_clip_push_rect(clcv, 0, 0, 8, 16);
+    sd_canvas_stroke_path_ex(clcv, sq, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    check(sd_canvas_coverage_at(clcv, 3, 3), 255);                     # 130 — inside the clip
+    check(sd_canvas_coverage_at(clcv, 12, 3), 0);                      # 131 — clipped away
+    sd_canvas_clip_pop(clcv);
+    sd_canvas_stroke_path_ex(clcv, lone, W4, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(sd_canvas_coverage_at(clcv, 3, 3), 255);                     # 132 — MAX keeps the earlier stroke
+    check(sd_canvas_coverage_at(clcv, 9, 9), 255);                     # 133
+
+    # ── M) ⛔ BYTE-IDENTITY: sd_canvas_stroke_path and _ex(ROUND, ROUND) vs the 0.5.5 stroker ─────
+    var ci = 0;
+    var idbad = 0;
+    var inked = 0;
+    while (ci < 5) {
+        var cp = corpus(ci);
+        var wi = 0;
+        while (wi < 3) {
+            var width = SD_ONE + wi * 45000;                           # 1.0, 1.69, 2.37 px
+            var ref = sd_canvas_new(24, 22);
+            ref_canvas_stroke_path(ref, cp, width);
+            var got = sd_canvas_new(24, 22);
+            sd_canvas_stroke_path(got, cp, width);
+            if (cov_diff(ref, got) != 0) { idbad = idbad + 1; }
+            var ex1 = sd_canvas_new(24, 22);
+            sd_canvas_stroke_path_ex(ex1, cp, width, SD_CAP_ROUND, SD_JOIN_ROUND, 0);
+            if (cov_diff(ref, ex1) != 0) { idbad = idbad + 1; }
+            var ex2 = sd_canvas_new(24, 22);
+            sd_canvas_stroke_path_ex(ex2, cp, width, SD_CAP_ROUND, SD_JOIN_ROUND, SD_MITER_LIMIT_MAX + SD_ONE);
+            if (cov_diff(ref, ex2) != 0) { idbad = idbad + 1; }
+            if (cov_sum(ref) > 0) { inked = inked + 1; }
+            wi = wi + 1;
+        }
+        ci = ci + 1;
+    }
+    check(idbad, 0);                                                   # 134 — 45 comparisons
+    check(inked, 15);                                                  # 135 — every one drew something
+    # Onto EXISTING coverage and under a clip: the union and the mask are part of the contract too.
+    var r1 = sd_canvas_new(24, 22);
+    var r2 = sd_canvas_new(24, 22);
+    sd_canvas_fill_path(r1, corpus(1), SD_FILL_EVEN_ODD);
+    sd_canvas_fill_path(r2, corpus(1), SD_FILL_EVEN_ODD);
+    sd_canvas_clip_push_rect(r1, 2, 1, 19, 20);
+    sd_canvas_clip_push_rect(r2, 2, 1, 19, 20);
+    ref_canvas_stroke_path(r1, corpus(3), 3 * SD_ONE);
+    sd_canvas_stroke_path(r2, corpus(3), 3 * SD_ONE);
+    check(cov_diff(r1, r2), 0);                                        # 136
+    check(sd_canvas_stroke_path(0, corpus(0), W2), SADISH_ERR_BOUNDS);  # 137
+    check(sd_canvas_stroke_path(r2, sd_path_new(), W2), SADISH_ERR_EMPTY_PATH);  # 138
+
+    # ── N) DRAWING AFTER A CLOSE; AN UNBOUNDED LIMIT ────
+    # "M 4,4 L 12,4 L 12,12 Z L 4,12": after the CLOSE the pen is back at the moveto point, as the fill
+    # reads it — the styled stroke is the closed triangle plus a new open subpath (4,4) -> (4,12).
+    var after = sd_path_new();
+    sd_path_moveto(after, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(after, 12 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(after, 12 * SD_ONE, 12 * SD_ONE);
+    sd_path_close(after);
+    sd_path_lineto(after, 4 * SD_ONE, 12 * SD_ONE);
+    var split = sd_path_new();
+    sd_path_moveto(split, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(split, 12 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(split, 12 * SD_ONE, 12 * SD_ONE);
+    sd_path_close(split);
+    sd_path_moveto(split, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(split, 4 * SD_ONE, 12 * SD_ONE);
+    var aft = stroked(18, 18, after, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(cov_diff(aft, stroked(18, 18, split, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4)), 0);  # 139
+    check(sd_canvas_coverage_at(aft, 3, 12), 255);                     # 140 — its square end cap
+    # A limit past SD_MITER_LIMIT_MAX is that maximum: no overflow in L * (P + D) (2^40 * 2^26.6).
+    check(cov_diff(stroked(13, 12, lp, W2, SD_CAP_BUTT, SD_JOIN_MITER, 1 << 40), lm), 0);    # 141
+
+    # ── O) PIECES THAT OVERLAP OTHER PIECES; A 1-LSB SEGMENT ────
+    # A zigzag of 6 px diagonals and 1 px flats at hw = 3: each 45° join's outer wedge reaches past
+    # the next vertex (1 px < hw * tan 45°) into the next segment's rect. Every piece is wound the same
+    # way, so that overlap adds winding; a wedge wound the other way would cancel it to 0 — a hole
+    # (MEASURED: 255 -> 40 there when the triangles are wound backwards). band_faults sees it: the
+    # overlap lies inside hw / ratio of the path, where every pixel must read 255.
+    var zz = sd_path_new();
+    var zx = 3 * SD_ONE;
+    var zy = 22 * SD_ONE + H;
+    sd_path_moveto(zz, zx, zy);
+    var zk = 0;
+    while (zk < 5) {
+        var nx = zx + 6 * SD_ONE;
+        var ny = zy - 6 * SD_ONE;
+        if ((zk & 1) != 0) {
+            nx = zx + SD_ONE;
+            ny = zy;
+        }
+        sd_path_lineto(zz, nx, ny);
+        zx = nx;
+        zy = ny;
+        zk = zk + 1;
+    }
+    var zpl = sd_path_flatten(zz, SD_ONE >> 2);
+    var zrm = poly_rmax(zpl, 0);
+    check_in(zrm, 70000, 71500);                                       # 142 — 1/cos(22.5°) = 1.0824
+    var zjoin = 0;
+    var zbadj = 0;
+    while (zjoin < 3) {
+        var zs = stroked(28, 28, zz, W6, SD_CAP_ROUND, zjoin, ML4);
+        zbadj = zbadj + band_faults(zs, zpl, 0, 3 * SD_ONE, zrm);
+        zjoin = zjoin + 1;
+    }
+    check(zbadj, 0);                                                   # 143 — miter, round, bevel
+
+    # (2,4.5) -> (12,4.5) -> +1 LSB diagonally -> (20,12.5): a 45° miter corner through a 1-LSB
+    # segment strokes within 2 levels of the same corner without it. Its offset needs |(1,1)| =
+    # 1.414 to 2^-20; the raw isqrt says 1, which puts the join corner 41 % of hw = 1.2 px out.
+    var tiny = sd_path_new();
+    sd_path_moveto(tiny, 2 * SD_ONE, 4 * SD_ONE + H);
+    sd_path_lineto(tiny, 12 * SD_ONE, 4 * SD_ONE + H);
+    sd_path_lineto(tiny, 12 * SD_ONE + 1, 4 * SD_ONE + H + 1);
+    sd_path_lineto(tiny, 20 * SD_ONE, 12 * SD_ONE + H);
+    var notiny = poly3(2 * SD_ONE, 4 * SD_ONE + H, 12 * SD_ONE, 4 * SD_ONE + H, 20 * SD_ONE, 12 * SD_ONE + H);
+    var tmm = stroked(26, 20, tiny, W6, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    check_in(cov_maxdiff(tmm, stroked(26, 20, notiny, W6, SD_CAP_BUTT, SD_JOIN_MITER, ML4)), 0, 2);  # 144
+    var tmb = stroked(26, 20, tiny, W6, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    check_in(cov_maxdiff(tmb, stroked(26, 20, notiny, W6, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4)), 0, 2);  # 145
+
+    # ── P) THE LIMIT'S CEILING: a one-unit window ────
+    # Down 12000 * 2^6 raw, then back (170, -12156) * 2^6: both reduce losslessly, P = 145,886,263,
+    # P + D = 14,263, and the ratio sqrt(2P / (P + D)) lies in (9373390, 9373391) / 65536 = 143.03.
+    # At L = 9373390, P * 2^33 - L^2 (P + D) = 7,687,396 < L: "L (P + D) < P * 2^33 / L" holds by
+    # less than one integer step, so a FLOOR in place of the ceiling would miter there. (Found by
+    # search; such windows only open near a reversal.) hw = 0.084 px keeps the 12 px tip on canvas;
+    # the path runs vertically because a 0.17 px HORIZONTAL sliver can fall between sub-scanlines
+    # and leave no ink at all — an earlier draft of this group compared three empty canvases.
+    var cp0 = sd_path_new();
+    sd_path_moveto(cp0, 10 * SD_ONE, 2 * SD_ONE);
+    sd_path_lineto(cp0, 10 * SD_ONE, 2 * SD_ONE + 768000);
+    sd_path_lineto(cp0, 10 * SD_ONE + 10880, 2 * SD_ONE + 768000 - 777984);
+    var cbev = stroked(20, 32, cp0, 11000, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    var cmit = stroked(20, 32, cp0, 11000, SD_CAP_BUTT, SD_JOIN_MITER, SD_MITER_LIMIT_MAX);
+    check(cov_diff(stroked(20, 32, cp0, 11000, SD_CAP_BUTT, SD_JOIN_MITER, 9373390), cbev), 0);  # 146
+    check(cov_diff(stroked(20, 32, cp0, 11000, SD_CAP_BUTT, SD_JOIN_MITER, 9373391), cmit), 0);  # 147
+    # The tip triangle: base 2 * 0.084 px x height 12 px = 1.0 px^2 (257 units); MEASURED 246.
+    check_in(cov_sum(cmit) - cov_sum(cbev), 200, 300);                 # 148
+
+    # ── Q) INSIDE A CURVE THE JOIN STYLE GIVES WAY ────
+    # A vertex the flattener put inside one curve mitres while its tip stays within 0.25 px of the
+    # disc — ratio <= 1 + 0.25 px / hw — and takes the round join past that, whatever `join` says.
+    # "M 10,30 C 50,5 10,5 50,30" has a true cusp at (30, 11.25); at width 4 its flattening turns
+    # 150° there, a ratio of 3.86 — under SVG's default limit 4, so a user-style MITER drew a tip
+    # 7.7 px out (MEASURED ink from row 3, a 6 px spike). The disc ends at y = 9.25: rows 0..8 empty.
+    var cusp = sd_path_new();
+    sd_path_moveto(cusp, 10 * SD_ONE, 30 * SD_ONE);
+    sd_path_cubicto(cusp, 50 * SD_ONE, 5 * SD_ONE, 10 * SD_ONE, 5 * SD_ONE, 50 * SD_ONE, 30 * SD_ONE);
+    var qcm = stroked(60, 40, cusp, W4, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    check(rows_sum(qcm, 0, 9), 0);                                     # 149 — no spike
+    check(rows_sum(qcm, 9, 10) > 0, 1);                                # 150 — the rounded cusp is there
+    check(cov_diff(qcm, stroked(60, 40, cusp, W4, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4)), 0);        # 151
+    check(cov_diff(qcm, stroked(60, 40, cusp, W4, SD_CAP_BUTT, SD_JOIN_ROUND, ML4)), 0);        # 152
+    # band_faults with the inner limit 1 + 0.25 / 2 = 1.125 as the worst ratio: nothing past
+    # hw * 1.125 (+ half a diagonal), nothing short of 255 inside hw / 1.125 (ROUND caps, which
+    # the band check assumes at the ends).
+    var qpl = sd_path_flatten(cusp, SD_ONE >> 2);
+    var qcr = stroked(60, 40, cusp, W4, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    check(band_faults(qcr, qpl, 0, 2 * SD_ONE, 73728), 0);             # 153
+    # A sharper one: "M 10,40 C 40,10 10,10 40,40" turns 161° at its cusp (ratio 6.06), under a limit of 10.
+    var cusp2 = sd_path_new();
+    sd_path_moveto(cusp2, 10 * SD_ONE, 40 * SD_ONE);
+    sd_path_cubicto(cusp2, 40 * SD_ONE, 10 * SD_ONE, 10 * SD_ONE, 10 * SD_ONE, 40 * SD_ONE, 40 * SD_ONE);
+    var qcm2 = stroked(50, 46, cusp2, W4, SD_CAP_ROUND, SD_JOIN_MITER, 10 * SD_ONE);
+    check(band_faults(qcm2, sd_path_flatten(cusp2, SD_ONE >> 2), 0, 2 * SD_ONE, 73728), 0);   # 154
+    # A reversal inside a curve: "M 10,10 C 30,10 30,10 10,10" runs out along y = 10 to x = 25
+    # (its t = 1/2 vertex, exactly) and back. At a corner that is a flat end; inside a curve it is
+    # a cusp, and the disc rounds it: pixel (25, 9) lies within 1.42 px of (25, 10), under the
+    # 16-gon's 1.96 — solid; (26, 9) is cut by the rim; (27, 9) is past it.
+    var crev = sd_path_new();
+    sd_path_moveto(crev, 10 * SD_ONE, 10 * SD_ONE);
+    sd_path_cubicto(crev, 30 * SD_ONE, 10 * SD_ONE, 30 * SD_ONE, 10 * SD_ONE, 10 * SD_ONE, 10 * SD_ONE);
+    var qrv = stroked(32, 20, crev, W4, SD_CAP_BUTT, SD_JOIN_MITER, SD_MITER_LIMIT_MAX);
+    check(sd_canvas_coverage_at(qrv, 25, 9), 255);                     # 155
+    check_in(sd_canvas_coverage_at(qrv, 26, 9), 1, 254);               # 156
+    check(sd_canvas_coverage_at(qrv, 27, 9), 0);                       # 157
+    # ⭐ The inner limit's boundary, exactly. "M 4,8 Q 6,10 8,8" flattens to ONE inner vertex, (6,9),
+    # between (2,1) and (2,-1) px: a ratio of sqrt(5)/2 = 73,271.3 / 65536. Both directions reduce
+    # losslessly, so the limit test is exact: 73,272 mitres, 73,271 does not. 1 + (2^30 / hw) is
+    # 73,272 at hw = 138,798 and 73,271 at hw = 138,799 — two widths 2 LSB apart.
+    var qq = sd_path_new();
+    sd_path_moveto(qq, 4 * SD_ONE, 8 * SD_ONE);
+    sd_path_quadto(qq, 6 * SD_ONE, 10 * SD_ONE, 8 * SD_ONE, 8 * SD_ONE);
+    var qqpl = poly3(4 * SD_ONE, 8 * SD_ONE, 6 * SD_ONE, 9 * SD_ONE, 8 * SD_ONE, 8 * SD_ONE);
+    check(sd_polyline_count(sd_path_flatten(qq, SD_ONE >> 2)), 3);     # 158 — one inner vertex
+    var qwm = 277596;
+    var qwd = 277598;
+    # hw 138,798: the curve under BEVEL strokes exactly the corner under MITER.
+    # (The corner reference is stroked FIRST: a LINETO run clears the curve flags a previous curve
+    # stroke left behind, so the quad's vertex is inner only because the quad marked it.)
+    var qqpm = stroked(14, 14, qqpl, qwm, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    var qqm = stroked(14, 14, qq, qwm, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    check(cov_diff(qqm, qqpm), 0);                                     # 159
+    # hw 138,799: no tip; the disc (with the bevel wedge under it) — within 2 levels of the ROUND corner.
+    var qqdm = stroked(14, 14, qqpl, qwd, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    var qqd = stroked(14, 14, qq, qwd, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    check(cov_diff(qqd, qqdm) > 0, 1);                                 # 160
+    check_in(cov_maxdiff(qqd, stroked(14, 14, qqpl, qwd, SD_CAP_BUTT, SD_JOIN_ROUND, ML4)), 0, 2);  # 161
+    # A gentle curve's vertices all mitre: group J's two curves under BEVEL stroke exactly their
+    # own flattenings as explicit corners under MITER (worst ratio 1.04 < the inner limit 1.125).
+    var cpoly = poly_path(cpl, cbreak);
+    var cub = stroked(42, 32, cu, W4, SD_CAP_ROUND, SD_JOIN_BEVEL, ML4);
+    check(cov_diff(cub, stroked(42, 32, cpoly, W4, SD_CAP_ROUND, SD_JOIN_MITER, ML4)), 0);        # 162
+    # ...but where a curve verb ENDS the user's style is back: "M 2,6 C 2,2 6,2 10,2 L 10,10" turns
+    # ~90° at (10,2), the cubic's own end point, so MITER and BEVEL differ in the outer corner pixel
+    # (10,1) — as group D's 255 and 127 — instead of both taking the inner rule's disc.
+    var qcv = sd_path_new();
+    sd_path_moveto(qcv, 2 * SD_ONE, 6 * SD_ONE);
+    sd_path_cubicto(qcv, 2 * SD_ONE, 2 * SD_ONE, 6 * SD_ONE, 2 * SD_ONE, 10 * SD_ONE, 2 * SD_ONE);
+    sd_path_lineto(qcv, 10 * SD_ONE, 10 * SD_ONE);
+    check_in(sd_canvas_coverage_at(stroked(13, 12, qcv, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4), 10, 1), 250, 255);   # 163
+    check_in(sd_canvas_coverage_at(stroked(13, 12, qcv, W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4), 10, 1), 100, 150);   # 164
+
+    # ── R) DRAWING AFTER A CLOSE, IN A LATER SUBPATH, AND WITH CURVES ────
+    # The pen returns to the moveto point of the subpath the CLOSE ends — the second one here.
+    var ra = sd_path_new();
+    sd_path_moveto(ra, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(ra, 12 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(ra, 12 * SD_ONE, 12 * SD_ONE);
+    sd_path_close(ra);
+    sd_path_moveto(ra, 30 * SD_ONE, 30 * SD_ONE);
+    sd_path_lineto(ra, 40 * SD_ONE, 30 * SD_ONE);
+    sd_path_lineto(ra, 40 * SD_ONE, 40 * SD_ONE);
+    sd_path_close(ra);
+    sd_path_lineto(ra, 30 * SD_ONE, 50 * SD_ONE);
+    var rb = sd_path_new();
+    sd_path_moveto(rb, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rb, 12 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rb, 12 * SD_ONE, 12 * SD_ONE);
+    sd_path_close(rb);
+    sd_path_moveto(rb, 30 * SD_ONE, 30 * SD_ONE);
+    sd_path_lineto(rb, 40 * SD_ONE, 30 * SD_ONE);
+    sd_path_lineto(rb, 40 * SD_ONE, 40 * SD_ONE);
+    sd_path_close(rb);
+    sd_path_moveto(rb, 30 * SD_ONE, 30 * SD_ONE);
+    sd_path_lineto(rb, 30 * SD_ONE, 50 * SD_ONE);
+    var rac = stroked(64, 64, ra, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(cov_diff(rac, stroked(64, 64, rb, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4)), 0);        # 165
+    check(sd_canvas_coverage_at(rac, 29, 49), 255);                    # 166 — the tail, from (30,30)
+    # A QUADTO and a CUBICTO after a CLOSE start there too.
+    var rq = sd_path_new();
+    sd_path_moveto(rq, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rq, 20 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rq, 20 * SD_ONE, 20 * SD_ONE);
+    sd_path_close(rq);
+    var rqm = sd_path_new();
+    sd_path_moveto(rqm, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rqm, 20 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rqm, 20 * SD_ONE, 20 * SD_ONE);
+    sd_path_close(rqm);
+    sd_path_moveto(rqm, 4 * SD_ONE, 4 * SD_ONE);
+    var rc = sd_path_new();
+    sd_path_moveto(rc, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rc, 20 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rc, 20 * SD_ONE, 20 * SD_ONE);
+    sd_path_close(rc);
+    var rcm = sd_path_new();
+    sd_path_moveto(rcm, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rcm, 20 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(rcm, 20 * SD_ONE, 20 * SD_ONE);
+    sd_path_close(rcm);
+    sd_path_moveto(rcm, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_quadto(rq, 4 * SD_ONE, 40 * SD_ONE, 40 * SD_ONE, 50 * SD_ONE);
+    sd_path_quadto(rqm, 4 * SD_ONE, 40 * SD_ONE, 40 * SD_ONE, 50 * SD_ONE);
+    sd_path_cubicto(rc, 4 * SD_ONE, 30 * SD_ONE, 30 * SD_ONE, 60 * SD_ONE, 40 * SD_ONE, 30 * SD_ONE);
+    sd_path_cubicto(rcm, 4 * SD_ONE, 30 * SD_ONE, 30 * SD_ONE, 60 * SD_ONE, 40 * SD_ONE, 30 * SD_ONE);
+    var rqc = stroked(64, 64, rq, W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4);
+    check(cov_diff(rqc, stroked(64, 64, rqm, W2, SD_CAP_BUTT, SD_JOIN_BEVEL, ML4)), 0);        # 167
+    check(sd_canvas_coverage_at(rqc, 4, 6), 255);                      # 168 — its first flattened segment
+    var rcc = stroked(64, 64, rc, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(cov_diff(rcc, stroked(64, 64, rcm, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4)), 0);      # 169
+    check(sd_canvas_coverage_at(rcc, 4, 6), 255);                      # 170
+
+    # ── S) BATCH LIMITS: dots, a raised cap, a starved cap, irregular seams ────
+    # 402 lone-moveto dots on a 4 px grid, width 2. At the smallest limit (SD_STROKE_BATCH_MIN) a
+    # batch holds 50 ROUND dots (16 edges each): 8 flushes. Every dot must survive them — identical
+    # to 400 copies of one dot — and the SQUARE ones are exactly 400 * 4 * 255.
+    var dots = sd_path_new();
+    var dq = 0;
+    while (dq < 400) {
+        sd_path_moveto(dots, (2 + (dq % 20) * 4) * SD_ONE, (2 + (dq / 20) * 4) * SD_ONE);
+        dq = dq + 1;
+    }
+    var keep_cap2 = SD_STROKE_BATCH_CAP;
+    SD_STROKE_BATCH_CAP = SD_STROKE_BATCH_MIN;
+    var dr = stroked(84, 84, dots, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    var dsq = stroked(84, 84, dots, W2, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    SD_STROKE_BATCH_CAP = keep_cap2;
+    var one = sd_path_new();
+    sd_path_moveto(one, 2 * SD_ONE, 2 * SD_ONE);
+    var d1 = stroked(84, 84, one, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    check(cov_sum(dr), 400 * cov_sum(d1));                             # 171
+    check(sd_canvas_coverage_at(dr, 77, 77), sd_canvas_coverage_at(d1, 1, 1));   # 172 — the last dot
+    check(cov_sum(dsq), 400 * 4 * 255);                                # 173
+    # A limit raised after the first styled stroke is held to the allocation (8,192 edges): 720
+    # ROUND dots (11,520 edges) stroke the same bytes as at the default, and nothing is written past
+    # the edge array. A limit below SD_STROKE_BATCH_MIN is held to it.
+    var dots2 = sd_path_new();
+    dq = 0;
+    while (dq < 720) {
+        sd_path_moveto(dots2, (2 + (dq % 30) * 4) * SD_ONE, (2 + (dq / 30) * 4) * SD_ONE);
+        dq = dq + 1;
+    }
+    var dd = stroked(122, 98, dots2, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    SD_STROKE_BATCH_CAP = 1 << 40;
+    var dhi = stroked(122, 98, dots2, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    SD_STROKE_BATCH_CAP = 10;
+    var dlo = stroked(122, 98, dots2, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    SD_STROKE_BATCH_CAP = SD_STROKE_BATCH_MIN;
+    var dmin = stroked(122, 98, dots2, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
+    SD_STROKE_BATCH_CAP = keep_cap2;
+    check(cov_sum(dd), 720 * cov_sum(d1));                             # 174
+    check(cov_diff(dhi, dd), 0);                                       # 175
+    check(cov_diff(dlo, dmin), 0);                                     # 176
+    check(cov_sum(dmin), 720 * cov_sum(d1));                           # 177
+    # ⭐ Seams at irregular places. Group K's rings have equal segments, where the re-emission's
+    # 16-segment bound decides; these do not. Every stroke at a lowered limit must stay within 1
+    # level of the single-batch stroke (0 on this code, MEASURED).
+    # S1: a 200-gon ring with ROUND joins (20 edges a unit, ~4,000 edges), the limit swept 800..1,100
+    # in steps of 7 — so the closing unit lands inside its 680-edge forward reserve at some of them.
+    var sring = ngon(16 * SD_ONE + H, 16 * SD_ONE + 20000, 11 * SD_ONE, 200, 200, 1);
+    var sref = stroked(33, 32, sring, 3 * SD_ONE, SD_CAP_BUTT, SD_JOIN_ROUND, ML4);
+    var sbad = 0;
+    var slim = 800;
+    while (slim < 1100) {
+        SD_STROKE_BATCH_CAP = slim;
+        var sgot = stroked(33, 32, sring, 3 * SD_ONE, SD_CAP_BUTT, SD_JOIN_ROUND, ML4);
+        if (cov_maxdiff(sref, sgot) > 1) { sbad = sbad + 1; }
+        slim = slim + 7;
+    }
+    SD_STROKE_BATCH_CAP = keep_cap2;
+    check(sbad, 0);                                                    # 178
+    # S2: 60 open wiggles of 60..129 segments, widths 0.3..5.3 px, every cap and join (ROUND/ROUND
+    # swapped for MITER), limit 800..1,099.
+    g_seed = 4242424242;
+    sbad = 0;
+    var si = 0;
+    while (si < 60) {
+        var sw = wiggle(60 + rnd(70));
+        var swid = 20000 + rnd(5 * SD_ONE);
+        var scap = rnd(3);
+        var sjoin = rnd(3);
+        if (scap == SD_CAP_ROUND) {
+            if (sjoin == SD_JOIN_ROUND) { sjoin = SD_JOIN_MITER; }
+        }
+        var sa = stroked(64, 64, sw, swid, scap, sjoin, ML4);
+        SD_STROKE_BATCH_CAP = 800 + rnd(300);
+        if (cov_maxdiff(sa, stroked(64, 64, sw, swid, scap, sjoin, ML4)) > 1) { sbad = sbad + 1; }
+        SD_STROKE_BATCH_CAP = keep_cap2;
+        si = si + 1;
+    }
+    check(sbad, 0);                                                    # 179
+    # S3: 50 closed blobs of 60..139 segments, widths 0.3..4.3 px, BUTT, every join, limit 800..1,299.
+    g_seed = 777;
+    sbad = 0;
+    si = 0;
+    while (si < 50) {
+        var sb = blob(60 + rnd(80));
+        var sbw = 20000 + rnd(4 * SD_ONE);
+        var sbj = rnd(3);
+        var sba = stroked(64, 64, sb, sbw, SD_CAP_BUTT, sbj, ML4);
+        SD_STROKE_BATCH_CAP = 800 + rnd(500);
+        if (cov_maxdiff(sba, stroked(64, 64, sb, sbw, SD_CAP_BUTT, sbj, ML4)) > 1) { sbad = sbad + 1; }
+        SD_STROKE_BATCH_CAP = keep_cap2;
+        si = si + 1;
+    }
+    check(sbad, 0);                                                    # 180
+
+    # ── T) OFF THE CANVAS; A CANVAS WHOSE STRIDE IS NOT ITS WIDTH ────
+    # A MITER corner around (1, 1) at width 6 reaches to y = -2 and x = -2: the flush's row range
+    # starts at the batch's lowest y, clamped to row 0, and spans clip at x = 0. Its bytes must be
+    # the same corner moved by (+8, +8) on a larger canvas, read 8 rows and columns in.
+    var toff = poly3(12 * SD_ONE, SD_ONE, SD_ONE, SD_ONE, SD_ONE, 12 * SD_ONE + H);
+    var tmov = poly3(20 * SD_ONE, 9 * SD_ONE, 9 * SD_ONE, 9 * SD_ONE, 9 * SD_ONE, 20 * SD_ONE + H);
+    var tco = stroked(14, 14, toff, W6, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    var tcm = stroked(22, 22, tmov, W6, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    var tbad = 0;
+    var ty = 0;
+    while (ty < 14) {
+        var tx = 0;
+        while (tx < 14) {
+            if (sd_canvas_coverage_at(tco, tx, ty) != sd_canvas_coverage_at(tcm, tx + 8, ty + 8)) { tbad = tbad + 1; }
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    check(tbad, 0);                                                    # 181
+    check(sd_canvas_coverage_at(tco, 0, 0), 255);                      # 182
+    # The walk addresses coverage rows by sd_canvas_stride, as sd_fill_impl does. A canvas header
+    # built by hand over a 13-byte-pitch buffer (8 px wide, 5 bytes of padding a row, padding set
+    # to 90): the visible bytes match a packed canvas, and no padding byte is written.
+    var tpk = stroked(8, 6, seg(SD_ONE, 3 * SD_ONE, 7 * SD_ONE, 3 * SD_ONE + H), W2, SD_CAP_SQUARE, SD_JOIN_BEVEL, ML4);
+    var tcv = sd_canvas_new(8, 6);
+    var tbuf = sd_alloc(13 * 6);
+    var tb = 0;
+    while (tb < 13 * 6) {
+        store8(tbuf + tb, 0);
+        if ((tb % 13) >= 8) { store8(tbuf + tb, 90); }
+        tb = tb + 1;
+    }
+    store64(tcv + SD_CANVAS_COVERAGE_OFFSET, tbuf);
+    store64(tcv + SD_CANVAS_STRIDE_OFFSET, 13);
+    var tseg = seg(SD_ONE, 3 * SD_ONE, 7 * SD_ONE, 3 * SD_ONE + H);
+    sd_canvas_stroke_path_ex(tcv, tseg, W2, SD_CAP_SQUARE, SD_JOIN_BEVEL, ML4);
+    tbad = 0;
+    var tpad = 0;
+    ty = 0;
+    while (ty < 6) {
+        var tx2 = 0;
+        while (tx2 < 13) {
+            var tbyte = load8(tbuf + ty * 13 + tx2);
+            if (tx2 < 8) {
+                if (tbyte != sd_canvas_coverage_at(tpk, tx2, ty)) { tbad = tbad + 1; }
+            } else {
+                if (tbyte != 90) { tpad = tpad + 1; }
+            }
+            tx2 = tx2 + 1;
+        }
+        ty = ty + 1;
+    }
+    check(cov_sum(tpk) > 0, 1);                                        # 183
+    check(tbad, 0);                                                    # 184
+    check(tpad, 0);                                                    # 185
+
+    # ── U) THE BRIDGE'S WIDTH; FLAGS THROUGH DE-DUPLICATION; ONE BATCH IS ONE FILL; SENTINEL ────
+    # Two butt-ended vertical strokes of width 1 in one path: [3.5, 4.5] and [4.5 + g, 5.5 + g] px.
+    # Pixel 4 holds both halves and a g-LSB gap. g = 1 is the shared-line truncation the walk
+    # bridges: one span, 255. g = 2 is a real gap: two spans, each floored — 8,192 + 8,191 raw per
+    # sub-scanline, 65,532 in all — 254.
+    var ug1 = seg(4 * SD_ONE, 2 * SD_ONE, 4 * SD_ONE, 8 * SD_ONE);
+    sd_path_moveto(ug1, 5 * SD_ONE + 1, 2 * SD_ONE);
+    sd_path_lineto(ug1, 5 * SD_ONE + 1, 8 * SD_ONE);
+    var ug2 = seg(4 * SD_ONE, 2 * SD_ONE, 4 * SD_ONE, 8 * SD_ONE);
+    sd_path_moveto(ug2, 5 * SD_ONE + 2, 2 * SD_ONE);
+    sd_path_lineto(ug2, 5 * SD_ONE + 2, 8 * SD_ONE);
+    check(sd_canvas_coverage_at(stroked(10, 10, ug1, SD_ONE, SD_CAP_BUTT, SD_JOIN_MITER, ML4), 4, 5), 255);   # 186
+    check(sd_canvas_coverage_at(stroked(10, 10, ug2, SD_ONE, SD_CAP_BUTT, SD_JOIN_MITER, ML4), 4, 5), 254);   # 187
+    # A duplicate point BEFORE a curve shifts the run left by one as it is de-duplicated; the curve
+    # flags must move with their points, or the cubic's end (10,2) — a corner — reads as a curve
+    # vertex and the MITER corner pixel (10,1) loses its tip to the disc (group Q, #163).
+    var udup = sd_path_new();
+    sd_path_moveto(udup, 2 * SD_ONE, 6 * SD_ONE);
+    sd_path_lineto(udup, 2 * SD_ONE, 6 * SD_ONE);
+    sd_path_cubicto(udup, 2 * SD_ONE, 2 * SD_ONE, 6 * SD_ONE, 2 * SD_ONE, 10 * SD_ONE, 2 * SD_ONE);
+    sd_path_lineto(udup, 10 * SD_ONE, 10 * SD_ONE);
+    var udm = stroked(13, 12, udup, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4);
+    check(cov_diff(udm, stroked(13, 12, qcv, W2, SD_CAP_BUTT, SD_JOIN_MITER, ML4)), 0);        # 188
+    # ⭐ A stroke that fits one batch is ONE nonzero fill, so it cannot depend on the order its
+    # pieces were emitted in: a 1,250-sample Lissajous (whole-pixel vertices, crossing itself
+    # dozens of times; MEASURED 7,942 edges under MITER, where 1,275 samples overflow the 8,192)
+    # strokes the same bytes walked backwards. A batch flushed early would meet its other half by
+    # MAX at different crossings in the two directions (MEASURED at a limit of 800: 60 pixels differ).
+    var ulf = stroked(200, 200, liss(1250, 0), 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    var ulr = stroked(200, 200, liss(1250, 1), 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(cov_sum(ulf) > 1000000, 1);                                  # 189
+    check(cov_diff(ulf, ulr), 0);                                      # 190
+    # Gears: closed, sharp teeth at MITER limit 10 — the forward re-emission after the closing join
+    # must reach far enough for the tips near vertex 0. 24 gears at limits 800..1,399, each within 1
+    # level of the single-batch stroke.
+    g_seed = 99;
+    sbad = 0;
+    si = 0;
+    while (si < 24) {
+        var ugp = gear(40 + rnd(80), SD_ONE / 2 + rnd(2 * SD_ONE));
+        var ugw = 20000 + rnd(4 * SD_ONE);
+        var ugj = rnd(3);
+        var uga = stroked(64, 64, ugp, ugw, SD_CAP_BUTT, ugj, 10 * SD_ONE);
+        SD_STROKE_BATCH_CAP = 800 + rnd(600);
+        if (cov_maxdiff(uga, stroked(64, 64, ugp, ugw, SD_CAP_BUTT, ugj, 10 * SD_ONE)) > 1) { sbad = sbad + 1; }
+        SD_STROKE_BATCH_CAP = keep_cap2;
+        si = si + 1;
+    }
+    check(sbad, 0);                                                    # 191
+    # A symmetric path splits symmetrically — a batch halved at 4,096 cuts a Lissajous at its middle
+    # walked either way. This one is not: a knot, then a tail that crosses nothing (MEASURED 7,635
+    # edges, one batch). Backwards, the tail comes first, and any early cut lands in the knot.
+    var ukf = stroked(460, 100, knot_tail(700, 700, 0), 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    var ukr = stroked(460, 100, knot_tail(700, 700, 1), 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    check(cov_diff(ukf, ukr), 0);                                      # 192
+    # Nothing in the whole suite wrote past the edge array — group S's raised limit included.
+    var sbadb = 0;
+    sn = 0;
+    while (sn < 262144) {
+        if (load8(sentinel + sn) != 165) { sbadb = sbadb + 1; }
+        sn = sn + 1;
+    }
+    check(sbadb, 0);                                                   # 193
+
+    if (g_fails == 0) {
+        var ok = "stroke_style_test: PASS (caps, joins, miter limit, degenerates, batches, round byte-identity)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "stroke_style_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

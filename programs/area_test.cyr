@@ -1,0 +1,1287 @@
+# programs/area_test.cyr — RUN test for the SD_AA_AREA coverage engine (src/coverage.cyr):
+# exact 2-axis signed-area cell accumulation, opt-in per canvas with sd_canvas_set_aa.
+#
+# ⭐⭐ THE ORACLE IS INDEPENDENT OF THE ENGINE. For every pixel, the test clips the polygon to the
+# pixel square (Sutherland-Hodgman, four half-planes) and takes the shoelace area of what is left.
+# Clipping a closed polygon to a half-plane preserves its winding number at every point inside
+# that half-plane, so the result is the integral of the winding over the pixel — for ANY polygon,
+# simple or self-intersecting — which is exactly the quantity the engine accumulates. Both sides
+# then apply the same rule map (NONZERO min(|s|, ONE); EVEN_ODD triangle fold) and the same byte
+# map c = (s*255) >> 16.
+# ⚠ WHY THE TOLERANCE IS ±1 AND NOT 0. Both sides truncate 16.16 intermediates: the engine at x on a
+# row boundary, y at a column crossing and the cell split; the oracle at each clip intersection and
+# the final /2 of the shoelace. Each is < 1 raw unit per piece, so for the few pieces per pixel
+# these shapes put in one pixel the two raw areas differ by a handful of units — and ANY raw
+# difference below 257 units moves c = floor(s*255 / 65536) by at most 1 (257 * 255 = 65,535 <
+# 65,536). The rule maps are 1-Lipschitz, so they cannot widen it. ⚠ The bound is per pixel and
+# grows with the pieces in it: thousands of edges through ONE pixel can drift further (see the
+# PRECISION note in src/coverage.cyr), so the oracle is never applied to a stacked case — group M
+# stacks 3,900 contours but asserts only the exact zeros the streak invariant guarantees.
+#
+# ⛔ THE STREAK INVARIANT is asserted three times over: pixels outside a polygon's bounding box
+# expanded by 1 px must be EXACTLY 0 (no tolerance), the oracle agreement covers every pixel of the
+# canvas, and group M amplifies a 1-raw-unit leak in any deposit until it shows as bytes. Polygons
+# sit partially off every side of the canvas, including negative coordinates.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "area_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- the consumer's hook (group A) -----------------------------------------------------------
+var g_arena = 0;
+
+fn hook_alloc(n): i64 {
+    return arena_alloc(g_arena, n);
+}
+
+# ---- deterministic PRNG: xorshift64, seeded per case -----------------------------------------
+var g_rng = 0;
+
+fn rnd(): i64 {
+    g_rng = g_rng ^ (g_rng << 13);
+    g_rng = g_rng ^ ((g_rng >> 7) & 0x1FFFFFFFFFFFFFF);
+    g_rng = g_rng ^ (g_rng << 17);
+    var r = g_rng;
+    if (r < 0) { r = 0 - r; }
+    return r;
+}
+
+# uniform in [lo, hi) raw units
+fn rnd_in(lo, hi): i64 {
+    return lo + (rnd() % (hi - lo));
+}
+
+# ---- shapes ----------------------------------------------------------------------------------
+fn rect_path(x0, y0, x1, y1): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0, y0);
+    sd_path_lineto(p, x1, y0);
+    sd_path_lineto(p, x1, y1);
+    sd_path_lineto(p, x0, y1);
+    sd_path_close(p);
+    return p;
+}
+
+# the same rect wound the other way
+fn rect_path_rev(x0, y0, x1, y1): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0, y0);
+    sd_path_lineto(p, x0, y1);
+    sd_path_lineto(p, x1, y1);
+    sd_path_lineto(p, x1, y0);
+    sd_path_close(p);
+    return p;
+}
+
+fn tri_path(ax, ay, bx, by, cx, cy): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, ax, ay);
+    sd_path_lineto(p, bx, by);
+    sd_path_lineto(p, cx, cy);
+    sd_path_close(p);
+    return p;
+}
+
+# A blob of two quads and a cubic, partly off the left and top of a 48x40 canvas.
+fn blob_path(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0 - 3 * SD_ONE, 6 * SD_ONE + 1234);
+    sd_path_quadto(p, 20 * SD_ONE, 0 - 9 * SD_ONE, 41 * SD_ONE + 777, 7 * SD_ONE);
+    sd_path_cubicto(p, 60 * SD_ONE, 20 * SD_ONE, 30 * SD_ONE, 50 * SD_ONE, 18 * SD_ONE + 4321, 33 * SD_ONE);
+    sd_path_quadto(p, 2 * SD_ONE, 45 * SD_ONE, 5 * SD_ONE + 99, 20 * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+fn fill_mode(cv, path, rule, mode): i64 {
+    sd_canvas_set_aa(cv, mode);
+    return sd_canvas_fill_path(cv, path, rule);
+}
+
+# bytes that differ between two same-sized canvases
+fn cov_diff(a, b): i64 {
+    var n = sd_canvas_width(a) * sd_canvas_height(a);
+    var pa = sd_canvas_coverage(a);
+    var pb = sd_canvas_coverage(b);
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(pa + i) != load8(pb + i)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn cov_sum(cv): i64 {
+    var n = sd_canvas_width(cv) * sd_canvas_height(cv);
+    var p = sd_canvas_coverage(cv);
+    var s = 0;
+    var i = 0;
+    while (i < n) {
+        s = s + load8(p + i);
+        i = i + 1;
+    }
+    return s;
+}
+
+# ================================================================
+# The oracle: a polygon (g_vx/g_vy, g_vn vertices, implicitly closed) clipped to each pixel.
+# ================================================================
+var OR_CAP = 4096;
+var g_vx = 0;
+var g_vy = 0;
+var g_vn = 0;
+var g_ax = 0;
+var g_ay = 0;
+var g_bx = 0;
+var g_by = 0;
+var g_frac = 0;        # set by or_worst: pixels whose oracle area is strictly between 0 and ONE
+
+fn or_init(): i64 {
+    g_vx = alloc(OR_CAP * 8);
+    g_vy = alloc(OR_CAP * 8);
+    g_ax = alloc(OR_CAP * 8);
+    g_ay = alloc(OR_CAP * 8);
+    g_bx = alloc(OR_CAP * 8);
+    g_by = alloc(OR_CAP * 8);
+    return 0;
+}
+
+fn or_add(x, y): i64 {
+    if (g_vn < OR_CAP) {
+        store64(g_vx + g_vn * 8, x);
+        store64(g_vy + g_vn * 8, y);
+        g_vn = g_vn + 1;
+    }
+    return 0;
+}
+
+# the oracle polygon as a path (moveto, linetos, close) — what sd_fill_impl sees
+fn or_path(): i64 {
+    var p = sd_path_new();
+    var i = 0;
+    while (i < g_vn) {
+        if (i == 0) {
+            sd_path_moveto(p, load64(g_vx), load64(g_vy));
+        } else {
+            sd_path_lineto(p, load64(g_vx + i * 8), load64(g_vy + i * 8));
+        }
+        i = i + 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+# ... wound the other way (same vertices, reverse order)
+fn or_path_rev(): i64 {
+    var p = sd_path_new();
+    var i = g_vn - 1;
+    while (i >= 0) {
+        if (i == g_vn - 1) {
+            sd_path_moveto(p, load64(g_vx + i * 8), load64(g_vy + i * 8));
+        } else {
+            sd_path_lineto(p, load64(g_vx + i * 8), load64(g_vy + i * 8));
+        }
+        i = i - 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+# Load a single-subpath path's flattened polyline into the oracle (same tol sd_fill_impl uses).
+fn or_from_flatten(path): i64 {
+    var pl = sd_path_flatten(path, SD_ONE >> 2);
+    var pts = sd_polyline_points(pl);
+    var n = sd_polyline_count(pl);
+    g_vn = 0;
+    var i = 0;
+    while (i < n) {
+        var pt = load64(pts + i * 8);
+        or_add(sd_point_x(pt), sd_point_y(pt));
+        i = i + 1;
+    }
+    return n;
+}
+
+# One Sutherland-Hodgman pass: keep the side of `axis` (0 = x, 1 = y) that is >= bound (ge = 1)
+# or <= bound (ge = 0). Returns the output vertex count.
+fn or_clip(ix, iy, n, ox, oy, axis, bound, ge): i64 {
+    var m = 0;
+    var i = 0;
+    while (i < n) {
+        var j = i - 1;
+        if (i == 0) { j = n - 1; }
+        var cx = load64(ix + i * 8);
+        var cy = load64(iy + i * 8);
+        var qx = load64(ix + j * 8);
+        var qy = load64(iy + j * 8);
+        var cval = cx;
+        var qval = qx;
+        if (axis != 0) { cval = cy; qval = qy; }
+        var cin = 0;
+        var qin = 0;
+        if (ge != 0) {
+            if (cval >= bound) { cin = 1; }
+            if (qval >= bound) { qin = 1; }
+        } else {
+            if (cval <= bound) { cin = 1; }
+            if (qval <= bound) { qin = 1; }
+        }
+        if (cin != qin) {
+            var hx = bound;
+            var hy = bound;
+            if (axis == 0) {
+                hy = qy + ((cy - qy) * (bound - qx)) / (cx - qx);
+            } else {
+                hx = qx + ((cx - qx) * (bound - qy)) / (cy - qy);
+            }
+            if (m < OR_CAP) {
+                store64(ox + m * 8, hx);
+                store64(oy + m * 8, hy);
+                m = m + 1;
+            }
+        }
+        if (cin != 0) {
+            if (m < OR_CAP) {
+                store64(ox + m * 8, cx);
+                store64(oy + m * 8, cy);
+                m = m + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+# Signed integral of the winding over pixel (px, py), in raw 16.16 area units (ONE = full).
+fn or_area(px, py): i64 {
+    var ox = px << SD_SHIFT;
+    var oy = py << SD_SHIFT;
+    var i = 0;
+    while (i < g_vn) {
+        store64(g_ax + i * 8, load64(g_vx + i * 8) - ox);
+        store64(g_ay + i * 8, load64(g_vy + i * 8) - oy);
+        i = i + 1;
+    }
+    var m = or_clip(g_ax, g_ay, g_vn, g_bx, g_by, 0, 0, 1);
+    m = or_clip(g_bx, g_by, m, g_ax, g_ay, 0, SD_ONE, 0);
+    m = or_clip(g_ax, g_ay, m, g_bx, g_by, 1, 0, 1);
+    m = or_clip(g_bx, g_by, m, g_ax, g_ay, 1, SD_ONE, 0);
+    var a2 = 0;
+    var k = 0;
+    while (k < m) {
+        var k2 = k + 1;
+        if (k2 == m) { k2 = 0; }
+        a2 = a2 + load64(g_ax + k * 8) * load64(g_ay + k2 * 8) - load64(g_ax + k2 * 8) * load64(g_ay + k * 8);
+        k = k + 1;
+    }
+    return a2 / (2 * SD_ONE);
+}
+
+# rule map + byte map, identical in spelling to the contract
+fn or_byte(area, rule): i64 {
+    var s = area;
+    if (s < 0) { s = 0 - s; }
+    if (rule == SD_FILL_NONZERO) {
+        if (s > SD_ONE) { s = SD_ONE; }
+    } else {
+        s = s % (2 * SD_ONE);
+        if (s > SD_ONE) { s = 2 * SD_ONE - s; }
+    }
+    return (s * 255) >> SD_SHIFT;
+}
+
+# Compare an AREA-filled canvas against the oracle over EVERY pixel. Returns the worst |delta|.
+# Also counts, into g_frac, the pixels whose oracle area is strictly between 0 and ONE.
+fn or_worst(cv, rule): i64 {
+    var w = sd_canvas_width(cv);
+    var h = sd_canvas_height(cv);
+    var worst = 0;
+    g_frac = 0;
+    var py = 0;
+    while (py < h) {
+        var px = 0;
+        while (px < w) {
+            var ar = or_area(px, py);
+            var sa = ar;
+            if (sa < 0) { sa = 0 - sa; }
+            if (sa > 0) {
+                if (sa < SD_ONE) { g_frac = g_frac + 1; }
+            }
+            var d = sd_canvas_coverage_at(cv, px, py) - or_byte(ar, rule);
+            if (d < 0) { d = 0 - d; }
+            if (d > worst) { worst = d; }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return worst;
+}
+
+# Pixels outside the oracle polygon's bounding box, expanded by 1 px, that are NOT exactly 0.
+fn streaks(cv): i64 {
+    var minx = load64(g_vx);
+    var maxx = minx;
+    var miny = load64(g_vy);
+    var maxy = miny;
+    var i = 1;
+    while (i < g_vn) {
+        var x = load64(g_vx + i * 8);
+        var y = load64(g_vy + i * 8);
+        if (x < minx) { minx = x; }
+        if (x > maxx) { maxx = x; }
+        if (y < miny) { miny = y; }
+        if (y > maxy) { maxy = y; }
+        i = i + 1;
+    }
+    var bx0 = sd_asr(minx, SD_SHIFT) - 1;
+    var bx1 = sd_asr(maxx + SD_ONE - 1, SD_SHIFT) + 1;
+    var by0 = sd_asr(miny, SD_SHIFT) - 1;
+    var by1 = sd_asr(maxy + SD_ONE - 1, SD_SHIFT) + 1;
+    var w = sd_canvas_width(cv);
+    var h = sd_canvas_height(cv);
+    var bad = 0;
+    var py = 0;
+    while (py < h) {
+        var px = 0;
+        while (px < w) {
+            var outside = 0;
+            if (px < bx0) { outside = 1; }
+            if (px >= bx1) { outside = 1; }
+            if (py < by0) { outside = 1; }
+            if (py >= by1) { outside = 1; }
+            if (outside != 0) {
+                if (sd_canvas_coverage_at(cv, px, py) != 0) { bad = bad + 1; }
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return bad;
+}
+
+# 255 * (shoelace area of the oracle polygon, px^2), truncated
+fn shoelace255(): i64 {
+    var a2 = 0;
+    var i = 0;
+    while (i < g_vn) {
+        var j = i + 1;
+        if (j == g_vn) { j = 0; }
+        a2 = a2 + load64(g_vx + i * 8) * load64(g_vy + j * 8) - load64(g_vx + j * 8) * load64(g_vy + i * 8);
+        i = i + 1;
+    }
+    if (a2 < 0) { a2 = 0 - a2; }
+    # a2 is twice the area with 32 fraction bits: area255 = a2 * 255 / 2^33 (a2 < 2^44 here)
+    return (a2 * 255) >> 33;
+}
+
+# A star-shaped (hence SIMPLE) polygon: n vertices at increasing angles about (cx, cy), radii in
+# [rmin, rmax) px.
+fn gen_star(cx, cy, n, rmin, rmax): i64 {
+    g_vn = 0;
+    var two_pi = 411775;
+    var step = two_pi / n;
+    var k = 0;
+    while (k < n) {
+        var ang = k * step + (rnd() % (step / 2));
+        var r = rnd_in(rmin * SD_ONE, rmax * SD_ONE);
+        or_add(cx + sd_fixed_mul(r, sd_cos(ang)), cy + sd_fixed_mul(r, sd_sin(ang)));
+        k = k + 1;
+    }
+    return 0;
+}
+
+# Arbitrary vertices in [lo, hi) px — generally SELF-INTERSECTING.
+fn gen_wild(n, lo, hi): i64 {
+    g_vn = 0;
+    var k = 0;
+    while (k < n) {
+        or_add(rnd_in(lo * SD_ONE, hi * SD_ONE), rnd_in(lo * SD_ONE, hi * SD_ONE));
+        k = k + 1;
+    }
+    return 0;
+}
+
+# A {n/2} star polygon (every second vertex of a regular n-gon): n = 5 is the pentagram.
+fn gen_pentagram(cx, cy, r, n): i64 {
+    g_vn = 0;
+    var two_pi = 411775;
+    var k = 0;
+    while (k < n) {
+        var ang = ((k * 2) % n) * (two_pi / n) + 1000;
+        or_add(cx + sd_fixed_mul(r, sd_cos(ang)), cy + sd_fixed_mul(r, sd_sin(ang)));
+        k = k + 1;
+    }
+    return 0;
+}
+
+# The canary block allocated right behind the accumulator in group A (0 until then).
+var g_canary = 0;
+
+# canary bytes that no longer read 0xA5
+fn canary_bad(): i64 {
+    var bad = 0;
+    var k = 0;
+    while (k < 4096) {
+        if (load8(g_canary + k) != 165) { bad = bad + 1; }
+        k = k + 1;
+    }
+    return bad;
+}
+
+# non-zero pixels in column >= xmin OR row >= ymin
+fn lit_outside(cv, xmin, ymin): i64 {
+    var n = 0;
+    var py = 0;
+    while (py < sd_canvas_height(cv)) {
+        var px = 0;
+        while (px < sd_canvas_width(cv)) {
+            var out = 0;
+            if (px >= xmin) { out = 1; }
+            if (py >= ymin) { out = 1; }
+            if (out != 0) {
+                if (sd_canvas_coverage_at(cv, px, py) != 0) { n = n + 1; }
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return n;
+}
+
+# Group M's leak amplifier: `n` copies each of three contours in rows 0..2 (y 0.1..2.9), all right
+# of x = 13.6 empty. Between them every deposit statement in the engine runs, each once per row per
+# copy (the per-piece ones several times), with a winding sign that is the SAME across the copies:
+#   K5  (1.3,0.1) -> (13.6,2.9) -> (13.6,0.1)            slanted on-canvas pieces + vertical in-canvas
+#   K4  (-3,0.1) -> (6.3,2.9) -> (-3,2.9)                slanted straddling x = 0 + vertical left of it
+#   K13 (-2,2.9) -> (-2,0.1) -> (-6,0.1) -> (-7,2.9)     vertical left of x = 0 + slanted wholly left
+# Horizontal edges are dropped by sd_edge_add, so it is 6 edges per copy.
+fn amp_path(n): i64 {
+    var one = SD_ONE;
+    var p = sd_path_new();
+    var k = 0;
+    while (k < n) {
+        sd_path_moveto(p, one + 19661, 6553);
+        sd_path_lineto(p, 13 * one + 39313, 2 * one + 58983);
+        sd_path_lineto(p, 13 * one + 39313, 6553);
+        sd_path_close(p);
+        sd_path_moveto(p, 0 - 3 * one - 111, 6560);
+        sd_path_lineto(p, 6 * one + 19667, 2 * one + 58979);
+        sd_path_lineto(p, 0 - 3 * one - 111, 2 * one + 58979);
+        sd_path_close(p);
+        sd_path_moveto(p, 0 - 2 * one - 5, 2 * one + 58990);
+        sd_path_lineto(p, 0 - 2 * one - 5, 6571);
+        sd_path_lineto(p, 0 - 6 * one, 6571);
+        sd_path_lineto(p, 0 - 7 * one + 3, 2 * one + 58990);
+        sd_path_close(p);
+        k = k + 1;
+    }
+    return p;
+}
+
+# Group M, part 2: four contours in pixel row 0 (y 0.1..0.9), each going DOWN in `steps` short
+# edges and back UP in one vertical edge at x = 13.6. A closed contour has as much up as down, so a
+# leak paid once per edge (or per row segment, or per piece) whatever its sign cancels between
+# amp_path's copies; here the down side has `steps` times the segments of the up side, and it does
+# not. Down sides: a zig-zag straddling x = 0 (-1.3 <-> 5.7), a vertical staircase on the canvas
+# (3.3 <-> 3.7), one left of x = 0 (-2.3 <-> -1.7), a zig-zag wholly left (-5.3 <-> -2.7).
+# steps + 1 edges per contour.
+fn zz_path(steps): i64 {
+    var one = SD_ONE;
+    var y0 = 6553;
+    var step = (58982 - y0) / steps;
+    var xr = 13 * one + 39313;
+    var p = sd_path_new();
+    var kind = 0;
+    while (kind < 4) {
+        var xa = 0 - one - 19661;
+        var xb = 5 * one + 45875;
+        if (kind == 1) { xa = 3 * one + 19661; xb = 3 * one + 45875; }
+        if (kind == 2) { xa = 0 - 2 * one - 19661; xb = 0 - one - 45875; }
+        if (kind == 3) { xa = 0 - 5 * one - 19661; xb = 0 - 2 * one - 45875; }
+        sd_path_moveto(p, xr, y0);
+        sd_path_lineto(p, xa, y0);
+        var prevx = xa;
+        var yy = y0;
+        var i = 1;
+        while (i <= steps) {
+            var x = xa;
+            if ((i % 2) == 1) { x = xb; }
+            yy = y0 + i * step;
+            if (kind == 1) { sd_path_lineto(p, prevx, yy); }
+            if (kind == 2) { sd_path_lineto(p, prevx, yy); }
+            sd_path_lineto(p, x, yy);
+            prevx = x;
+            i = i + 1;
+        }
+        sd_path_lineto(p, xr, yy);
+        sd_path_close(p);
+        kind = kind + 1;
+    }
+    return p;
+}
+
+# Group N: a zig-zag contour of `n` linetos down columns 0..1 (n + 1 edges, none horizontal), then
+# the rect [10, 20] x [1, 4.3] (2 edges). n + 3 edges in all.
+fn zig_path(n): i64 {
+    var one = SD_ONE;
+    var p = sd_path_new();
+    var step = (38 * one) / n;
+    sd_path_moveto(p, one / 2, one);
+    var i = 1;
+    while (i <= n) {
+        var x = one / 2;
+        if ((i % 2) == 1) { x = one + one / 2; }
+        sd_path_lineto(p, x, one + i * step);
+        i = i + 1;
+    }
+    sd_path_close(p);
+    var y43 = 4 * one + (3 * one) / 10;
+    sd_path_moveto(p, 10 * one, one);
+    sd_path_lineto(p, 20 * one, one);
+    sd_path_lineto(p, 20 * one, y43);
+    sd_path_lineto(p, 10 * one, y43);
+    sd_path_close(p);
+    return p;
+}
+
+var CW = 48;
+var CH = 40;
+var g_worst_nz = 0;
+var g_worst_eo = 0;
+
+# Fill the oracle polygon on a CW x CH AREA canvas under `rule`, both windings. Returns the number
+# of failed properties (oracle > ±1, a streak, CW != CCW); tracks the worst deltas seen.
+fn poly_case(rule): i64 {
+    var bad = 0;
+    var cv = sd_canvas_new(CW, CH);
+    fill_mode(cv, or_path(), rule, SD_AA_AREA);
+    var worst = or_worst(cv, rule);
+    if (rule == SD_FILL_NONZERO) {
+        if (worst > g_worst_nz) { g_worst_nz = worst; }
+    } else {
+        if (worst > g_worst_eo) { g_worst_eo = worst; }
+    }
+    if (worst > 1) { bad = bad + 1; }
+    if (streaks(cv) != 0) { bad = bad + 1; }
+    # checked BEFORE the reversed fill: a CCW fill deposits exactly the negation, so an
+    # out-of-bounds write would cancel itself out of the canary by the end of this case
+    if (canary_bad() != 0) { bad = bad + 1; }
+    var rv = sd_canvas_new(CW, CH);
+    fill_mode(rv, or_path_rev(), rule, SD_AA_AREA);
+    if (cov_diff(cv, rv) != 0) { bad = bad + 1; }
+    return bad;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var ONE = SD_ONE;
+
+    # ── A) ALLOCATION: THE ACCUMULATOR IS LAZY, GLOBAL, AND EXACTLY (w+1)*8 ──
+    # Warm the DEFAULT engine's fixed scratch first (its exact figures are programs/alloc_test.cyr's
+    # business), so what this group measures is the AREA engine's own cost and nothing else.
+    var warm = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(warm, rect_path(ONE, ONE, 5 * ONE, 5 * ONE), SD_FILL_NONZERO);
+    g_arena = arena_new_growable(4194304);
+    var cv32 = sd_canvas_new(32, 32);
+    var tri32 = tri_path(ONE + 3000, 2 * ONE, 30 * ONE, 9 * ONE + 5, 7 * ONE, 29 * ONE + 40000);
+    check(sd_canvas_set_aa(cv32, SD_AA_AREA), SADISH_OK);             # 1
+    # ⛔⛔ THE PROCESS'S FIRST AREA FILL RUNS UNDER AN ARENA HOOK. With no hook sd_alloc IS alloc, so
+    # only a hooked first use can tell `alloc` from `sd_alloc` for the accumulator — and one drawn
+    # from the arena would dangle after the reset below.
+    check(sd_alloc_set(&hook_alloc), 0);                              # 2
+    var g0 = alloc_used();
+    var a0 = arena_used(g_arena);
+    check(sd_canvas_fill_path(cv32, tri32, SD_FILL_NONZERO), SADISH_OK);  # 3
+    check(alloc_used() - g0, 33 * 8);                                 # 4 — (w+1)*8 on the global heap
+    check(arena_used(g_arena) - a0, 0);                               # 5 — and not one byte on the hook
+    check(sd_canvas_coverage_at(cv32, 8, 10), 255);                   # 6 — the work is real
+    g0 = alloc_used();
+    a0 = arena_used(g_arena);
+    sd_canvas_fill_path(cv32, tri32, SD_FILL_EVEN_ODD);
+    check(alloc_used() - g0, 0);                                      # 7 — warm: 0 on the heap
+    check(arena_used(g_arena) - a0, 0);                               # 8 — 0 on the arena
+    var cv16 = sd_canvas_new(16, 16);
+    sd_canvas_set_aa(cv16, SD_AA_AREA);
+    g0 = alloc_used();
+    a0 = arena_used(g_arena);
+    sd_canvas_fill_path(cv16, tri32, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 0);                                      # 9 — narrower: no regrow
+    check(arena_used(g_arena) - a0, 0);                               # 10
+    var cv64 = sd_canvas_new(64, 64);
+    sd_canvas_set_aa(cv64, SD_AA_AREA);
+    g0 = alloc_used();
+    a0 = arena_used(g_arena);
+    sd_canvas_fill_path(cv64, tri32, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 65 * 8);                                 # 11 — wider: regrown, exactly
+    check(arena_used(g_arena) - a0, 0);                               # 12
+    # ⛔ A CANARY right behind the accumulator. The bump allocator hands out the next global block
+    # at the accumulator's end, and no later canvas here is wider than 64 px, so every AREA fill in
+    # this suite runs on this block. A piece deposited past slot w — a missing right-of-canvas clamp
+    # — lands in the canary instead of in dead memory; poly_case (group H) and group K read it.
+    g_canary = alloc(4096);
+    check(g_canary, _sd_area_acc + 65 * 8);                           # 13 — adjacent, so it guards
+    var ck = 0;
+    while (ck < 4096) {
+        store8(g_canary + ck, 165);
+        ck = ck + 1;
+    }
+    g0 = alloc_used();
+    sd_canvas_fill_path(cv64, tri32, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 0);                                      # 14 — and remembered
+    # Curves, a stroke and a path clip on an AREA canvas under the hook: the flatten mid-points,
+    # stroke pieces and the clip's temp canvas are the seam's; the global heap sees nothing.
+    var blob = blob_path();
+    g0 = alloc_used();
+    a0 = arena_used(g_arena);
+    sd_canvas_fill_path(cv64, blob, SD_FILL_NONZERO);
+    sd_canvas_stroke_path(cv64, tri32, 3 * ONE);
+    sd_canvas_clip_push_path(cv64, blob, SD_FILL_NONZERO);
+    sd_canvas_fill_union(cv64, tri32, SD_FILL_NONZERO);
+    sd_canvas_clip_pop(cv64);
+    check(alloc_used() - g0, 0);                                      # 15
+    check(arena_used(g_arena) - a0 > 0, 1);                           # 16 — the arena paid for it
+    check(sd_alloc_set(0), &hook_alloc);                              # 17
+    arena_reset(g_arena);
+    # No hook: a warm straight-line AREA fill costs the heap exactly 0 as well.
+    var cvn = sd_canvas_new(64, 64);
+    var trin = tri_path(ONE + 3000, 2 * ONE, 60 * ONE, 9 * ONE + 5, 7 * ONE, 59 * ONE);
+    sd_canvas_set_aa(cvn, SD_AA_AREA);
+    g0 = alloc_used();
+    sd_canvas_fill_path(cvn, trin, SD_FILL_NONZERO);
+    sd_canvas_fill_union(cvn, trin, SD_FILL_EVEN_ODD);
+    check(alloc_used() - g0, 0);                                      # 18
+
+    or_init();
+
+    # ── B) THE SWITCH: DEFAULT, SET, READ BACK, REFUSE ──
+    var cvb = sd_canvas_new(8, 8);
+    check(sd_canvas_aa(cvb), SD_AA_SUBSCANLINE);                      # 19 — the default
+    check(SD_AA_SUBSCANLINE, 0);                                      # 20
+    check(SD_AA_AREA, 1);                                             # 21
+    check(SD_CANVAS_SIZE, 48);                                        # 22
+    check(sd_canvas_set_aa(cvb, 2), SADISH_ERR_BOUNDS);               # 23
+    check(sd_canvas_aa(cvb), SD_AA_SUBSCANLINE);                      # 24 — unchanged
+    check(sd_canvas_set_aa(cvb, 0 - 1), SADISH_ERR_BOUNDS);           # 25
+    check(sd_canvas_set_aa(0, SD_AA_AREA), SADISH_ERR_BOUNDS);        # 26
+    check(sd_canvas_set_aa(cvb, SD_AA_AREA), SADISH_OK);              # 27
+    check(sd_canvas_aa(cvb), SD_AA_AREA);                             # 28
+    check(sd_canvas_set_aa(cvb, 7), SADISH_ERR_BOUNDS);               # 29
+    check(sd_canvas_aa(cvb), SD_AA_AREA);                             # 30 — still AREA
+    # back to SUBSCANLINE: bytes identical to a canvas that never left the default
+    var hbar = rect_path(0, 0, 8 * ONE, 4 * ONE + (3 * ONE) / 10);
+    check(sd_canvas_set_aa(cvb, SD_AA_SUBSCANLINE), SADISH_OK);       # 31
+    sd_canvas_fill_path(cvb, hbar, SD_FILL_NONZERO);
+    var cvfresh = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(cvfresh, hbar, SD_FILL_NONZERO);
+    check(cov_diff(cvb, cvfresh), 0);                                 # 32
+    check(sd_canvas_coverage_at(cvb, 3, 4), 63);                      # 33 — and it IS the sub-scanline value
+    # ⚠ The default is STORED, not inherited from zeroed memory. A consumer's frame arena is not
+    # scrubbed on reset: a canvas built on bytes that last held SD_AA_AREA must still come up
+    # SUBSCANLINE, or the default engine would silently change under dhancha's arena.
+    check(sd_alloc_set(&hook_alloc), 0);                              # 34
+    var junk = arena_alloc(g_arena, 4096);
+    var jk = 0;
+    while (jk < 4096) {
+        store64(junk + jk, SD_AA_AREA);
+        jk = jk + 8;
+    }
+    arena_reset(g_arena);
+    var cvj = sd_canvas_new(8, 8);
+    check(cvj, junk);                                                 # 35 — on the recycled bytes
+    check(sd_canvas_aa(cvj), SD_AA_SUBSCANLINE);                      # 36
+    sd_canvas_fill_path(cvj, hbar, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(cvj, 3, 4), 63);                      # 37
+    check(sd_alloc_set(0), &hook_alloc);                              # 38
+    arena_reset(g_arena);
+
+    # ── C) INTEGER-ALIGNED RECTANGLES: BOTH ENGINES ARE EXACT, SO THEY AGREE BYTE FOR BYTE ──
+    var rdiff = 0;
+    var rk = 0;
+    while (rk < 6) {
+        var x0 = 0;
+        var y0 = 0;
+        var x1 = 0;
+        var y1 = 0;
+        if (rk == 0) { x0 = 2; y0 = 2; x1 = 6; y1 = 6; }
+        if (rk == 1) { x0 = 0; y0 = 0; x1 = CW; y1 = CH; }
+        if (rk == 2) { x0 = 0 - 5; y0 = 3; x1 = 7; y1 = 50; }
+        if (rk == 3) { x0 = 40; y0 = 0 - 9; x1 = 70; y1 = 11; }
+        if (rk == 4) { x0 = 13; y0 = 17; x1 = 14; y1 = 18; }
+        if (rk == 5) { x0 = 0 - 20; y0 = 0 - 20; x1 = 100; y1 = 100; }
+        var rule = rk % 2;
+        var ca = sd_canvas_new(CW, CH);
+        var cs = sd_canvas_new(CW, CH);
+        var rp = rect_path(x0 * ONE, y0 * ONE, x1 * ONE, y1 * ONE);
+        fill_mode(ca, rp, rule, SD_AA_AREA);
+        sd_canvas_fill_path(cs, rp, rule);
+        rdiff = rdiff + cov_diff(ca, cs);
+        # overlapping second rect by union, both engines
+        var rp2 = rect_path((x0 + 1) * ONE, (y0 + 2) * ONE, (x1 + 3) * ONE, (y1 - 1) * ONE);
+        sd_canvas_fill_union(ca, rp2, rule);
+        sd_canvas_fill_union(cs, rp2, rule);
+        rdiff = rdiff + cov_diff(ca, cs);
+        rk = rk + 1;
+    }
+    check(rdiff, 0);                                                  # 39
+    # and wound the other way, both rules: byte-identical
+    var cwr = sd_canvas_new(CW, CH);
+    var ccr = sd_canvas_new(CW, CH);
+    fill_mode(cwr, rect_path(0 - 3 * ONE, 5 * ONE + 3, 20 * ONE + 999, 44 * ONE), SD_FILL_EVEN_ODD, SD_AA_AREA);
+    fill_mode(ccr, rect_path_rev(0 - 3 * ONE, 5 * ONE + 3, 20 * ONE + 999, 44 * ONE), SD_FILL_EVEN_ODD, SD_AA_AREA);
+    check(cov_diff(cwr, ccr), 0);                                     # 40
+    var cr = sd_canvas_new(8, 8);
+    fill_mode(cr, rect_path(2 * ONE, 2 * ONE, 6 * ONE, 6 * ONE), SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(cr, 2, 2), 255);                      # 41
+    check(sd_canvas_coverage_at(cr, 5, 5), 255);                      # 42
+    check(sd_canvas_coverage_at(cr, 6, 5), 0);                        # 43
+    check(sd_canvas_coverage_at(cr, 1, 5), 0);                        # 44
+    check(cov_sum(cr), 16 * 255);                                     # 45
+
+    # ── D) VERTICAL EDGE AT x = 4.3 / 4.7: ANALYTIC IN X, BOTH ENGINES AGREE ──
+    # 0.3 = 19,660 raw -> (19660*255) >> 16 = 76; 0.7 = 45,875 raw -> 178.
+    var e43 = 4 * ONE + (3 * ONE) / 10;
+    var e47 = 4 * ONE + (7 * ONE) / 10;
+    var cv43 = sd_canvas_new(8, 8);
+    fill_mode(cv43, rect_path(0, 0, e43, 8 * ONE), SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(cv43, 4, 4), (19660 * 255) >> 16);    # 46 — 76
+    check(sd_canvas_coverage_at(cv43, 3, 4), 255);                    # 47
+    check(sd_canvas_coverage_at(cv43, 5, 4), 0);                      # 48
+    var cv47 = sd_canvas_new(8, 8);
+    fill_mode(cv47, rect_path(0, 0, e47, 8 * ONE), SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(cv47, 4, 0), (45875 * 255) >> 16);    # 49 — 178
+    check(sd_canvas_coverage_at(cv47, 4, 7), 178);                    # 50
+    var sv43 = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(sv43, rect_path(0, 0, e43, 8 * ONE), SD_FILL_NONZERO);
+    var sv47 = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(sv47, rect_path(0, 0, e47, 8 * ONE), SD_FILL_NONZERO);
+    check(cov_diff(cv43, sv43), 0);                                   # 51 — identical here
+    check(cov_diff(cv47, sv47), 0);                                   # 52
+
+    # ── E) HORIZONTAL EDGE AT y = 4.3 / 4.7: WHERE THE ENGINES PART ──
+    # AREA is exact: 76 / 178. SUBSCANLINE samples y at 4.125 / 4.375 / 4.625 / 4.875 and so can
+    # only say 1/4 or 3/4 of a pixel: 63 / 191 — documented here, and asserted, as the difference.
+    var h43 = sd_canvas_new(8, 8);
+    fill_mode(h43, rect_path(0, 0, 8 * ONE, e43), SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(h43, 3, 4), 76);                      # 53
+    check(sd_canvas_coverage_at(h43, 0, 4), 76);                      # 54 — the x = 0 edge
+    check(sd_canvas_coverage_at(h43, 7, 4), 76);                      # 55 — the x = w edge
+    check(sd_canvas_coverage_at(h43, 3, 3), 255);                     # 56
+    check(sd_canvas_coverage_at(h43, 3, 5), 0);                       # 57
+    var h47 = sd_canvas_new(8, 8);
+    fill_mode(h47, rect_path(0, 0, 8 * ONE, e47), SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(h47, 5, 4), 178);                     # 58
+    var s43 = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(s43, rect_path(0, 0, 8 * ONE, e43), SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(s43, 5, 4), 63);                      # 59 — SUBSCANLINE, quantized
+    var s47 = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(s47, rect_path(0, 0, 8 * ONE, e47), SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(s47, 5, 4), 191);                     # 60 — SUBSCANLINE, quantized
+
+    # ── F) DIAGONALS: A 45° HALF-PLANE AND A TRIANGLE WITH KNOWN AREAS ──
+    # (0,0)(8,0)(0,8): the hypotenuse x + y = 8 halves every pixel on it -> 32,768 -> 127.
+    var cvd = sd_canvas_new(8, 8);
+    fill_mode(cvd, tri_path(0, 0, 8 * ONE, 0, 0, 8 * ONE), SD_FILL_NONZERO, SD_AA_AREA);
+    var dbad = 0;
+    var dj = 0;
+    while (dj < 8) {
+        if (sd_canvas_coverage_at(cvd, 7 - dj, dj) != 127) { dbad = dbad + 1; }
+        if (dj < 7) {
+            if (sd_canvas_coverage_at(cvd, 6 - dj, dj) != 255) { dbad = dbad + 1; }
+        }
+        if (dj > 0) {
+            if (sd_canvas_coverage_at(cvd, 8 - dj, dj) != 0) { dbad = dbad + 1; }
+        }
+        dj = dj + 1;
+    }
+    check(dbad, 0);                                                   # 61
+    check(cov_sum(cvd), 28 * 255 + 8 * 127);                          # 62
+    # That fill left 32,768 in its sink slot (index 8, written by row 0's column-7 piece and never
+    # read). A 9-wide canvas reads index 8 as a real column: every row's slots must start at 0.
+    var cvz = sd_canvas_new(9, 3);
+    fill_mode(cvz, rect_path(ONE, ONE, 2 * ONE, 2 * ONE), SD_FILL_NONZERO, SD_AA_AREA);
+    check(cov_sum(cvz), 255);                                         # 63
+    # (0,0)(4,0)(0,2): x = 4 - 2y. Row 0: pixel 3 holds 1/4 (63), pixel 2 3/4 (191); row 1: pixel 1
+    # holds 1/4, pixel 0 3/4.
+    var cvt = sd_canvas_new(8, 8);
+    fill_mode(cvt, tri_path(0, 0, 4 * ONE, 0, 0, 2 * ONE), SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(cvt, 1, 0), 255);                     # 64
+    check(sd_canvas_coverage_at(cvt, 2, 0), 191);                     # 65
+    check(sd_canvas_coverage_at(cvt, 3, 0), 63);                      # 66
+    check(sd_canvas_coverage_at(cvt, 4, 0), 0);                       # 67
+    check(sd_canvas_coverage_at(cvt, 0, 1), 191);                     # 68
+    check(sd_canvas_coverage_at(cvt, 1, 1), 63);                      # 69
+    check(sd_canvas_coverage_at(cvt, 2, 1), 0);                       # 70
+    # A triangle with a vertex INSIDE a row: apex (3.5, 2.5), base y = 5 from x = 1 to 6.
+    # Row 2 holds the tip: the part y in [2.5, 3] is a triangle of height 0.5 and base 1 = 0.25 px^2,
+    # centred on pixel 3 (x 3..4) -> 63 on the area engine.
+    var cva = sd_canvas_new(8, 8);
+    var apex = tri_path(3 * ONE + ONE / 2, 2 * ONE + ONE / 2, 6 * ONE, 5 * ONE, ONE, 5 * ONE);
+    fill_mode(cva, apex, SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(cva, 3, 2), 63);                      # 71
+    check(sd_canvas_coverage_at(cva, 2, 2), 0);                       # 72
+    check(sd_canvas_coverage_at(cva, 3, 4), 255);                     # 73
+
+    # ── G) EVEN-ODD: NESTED CONTOURS, A HOLE, THE PENTAGRAM ──
+    # Two squares wound the SAME way: nonzero fills the middle, even-odd empties it.
+    var nest = rect_path(ONE, ONE, 9 * ONE, 9 * ONE);
+    sd_path_moveto(nest, 3 * ONE, 3 * ONE);
+    sd_path_lineto(nest, 7 * ONE, 3 * ONE);
+    sd_path_lineto(nest, 7 * ONE, 7 * ONE);
+    sd_path_lineto(nest, 3 * ONE, 7 * ONE);
+    sd_path_close(nest);
+    var gnz = sd_canvas_new(10, 10);
+    fill_mode(gnz, nest, SD_FILL_NONZERO, SD_AA_AREA);
+    var geo = sd_canvas_new(10, 10);
+    fill_mode(geo, nest, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    check(sd_canvas_coverage_at(gnz, 5, 5), 255);                     # 74
+    check(sd_canvas_coverage_at(geo, 5, 5), 0);                       # 75
+    check(sd_canvas_coverage_at(geo, 2, 5), 255);                     # 76 — the ring
+    check(sd_canvas_coverage_at(geo, 9, 5), 0);                       # 77 — outside
+    # Fractional nesting: outer [1.5, 8.5], inner [3.25, 6.75], same winding. Pixel (3, 5) sees the
+    # ring over x 3..3.25 and both contours over 3.25..4: winding integral 1.75 -> fold -> 0.25 -> 63
+    # even-odd, 255 nonzero. Wound as a HOLE instead: 1 - 0.75 = 0.25 -> 63 under both rules.
+    var q = ONE / 4;
+    var fr = rect_path(ONE + 2 * q, ONE + 2 * q, 8 * ONE + 2 * q, 8 * ONE + 2 * q);
+    sd_path_moveto(fr, 3 * ONE + q, 3 * ONE + q);
+    sd_path_lineto(fr, 6 * ONE + 3 * q, 3 * ONE + q);
+    sd_path_lineto(fr, 6 * ONE + 3 * q, 6 * ONE + 3 * q);
+    sd_path_lineto(fr, 3 * ONE + q, 6 * ONE + 3 * q);
+    sd_path_close(fr);
+    var fnz = sd_canvas_new(10, 10);
+    fill_mode(fnz, fr, SD_FILL_NONZERO, SD_AA_AREA);
+    var feo = sd_canvas_new(10, 10);
+    fill_mode(feo, fr, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    check(sd_canvas_coverage_at(fnz, 3, 5), 255);                     # 78
+    check(sd_canvas_coverage_at(feo, 3, 5), 63);                      # 79
+    check(sd_canvas_coverage_at(feo, 1, 5), 127);                     # 80 — outer edge at 1.5
+    check(sd_canvas_coverage_at(feo, 3, 3), (ONE - 9 * ONE / 16) * 255 >> 16);  # 81 — corner: 7/16 of ring
+    var hole = rect_path(ONE + 2 * q, ONE + 2 * q, 8 * ONE + 2 * q, 8 * ONE + 2 * q);
+    sd_path_moveto(hole, 3 * ONE + q, 3 * ONE + q);
+    sd_path_lineto(hole, 3 * ONE + q, 6 * ONE + 3 * q);
+    sd_path_lineto(hole, 6 * ONE + 3 * q, 6 * ONE + 3 * q);
+    sd_path_lineto(hole, 6 * ONE + 3 * q, 3 * ONE + q);
+    sd_path_close(hole);
+    var hnz = sd_canvas_new(10, 10);
+    fill_mode(hnz, hole, SD_FILL_NONZERO, SD_AA_AREA);
+    var heo = sd_canvas_new(10, 10);
+    fill_mode(heo, hole, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    check(sd_canvas_coverage_at(hnz, 3, 5), 63);                      # 82
+    check(sd_canvas_coverage_at(heo, 3, 5), 63);                      # 83
+    check(sd_canvas_coverage_at(hnz, 5, 5), 0);                       # 84
+    check(cov_diff(hnz, heo), 0);                                     # 85 — a true hole: rules agree
+    # The pentagram: its centre has winding 2 — nonzero fills it, even-odd leaves it empty.
+    gen_pentagram(16 * ONE, 16 * ONE, 14 * ONE, 5);
+    var pent = or_path();
+    var pnz = sd_canvas_new(32, 32);
+    fill_mode(pnz, pent, SD_FILL_NONZERO, SD_AA_AREA);
+    var peo = sd_canvas_new(32, 32);
+    fill_mode(peo, pent, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    check(sd_canvas_coverage_at(pnz, 16, 16), 255);                   # 86
+    check(sd_canvas_coverage_at(peo, 16, 16), 0);                     # 87
+    check(or_worst(pnz, SD_FILL_NONZERO) <= 1, 1);                    # 88 — and every pixel, vs the oracle
+    check(or_worst(peo, SD_FILL_EVEN_ODD) <= 1, 1);                   # 89
+    check(streaks(pnz) + streaks(peo), 0);                            # 90
+
+    # ── H) RANDOM POLYGONS vs THE ORACLE: NO STREAKS, EXACT AREA, ORIENTATION-FREE ──
+    # 40 simple star-shaped polygons (3..16 vertices) centred anywhere in [-12, 60) x [-12, 52)
+    # — off every side of the 48x40 canvas, negative coordinates included — and 40 SELF-INTERSECTING
+    # ones (random vertices in [-16, 64) px), each under both rules, each wound both ways.
+    var hbad = 0;
+    var seed = 1;
+    while (seed <= 40) {
+        g_rng = seed * 2654435761 + 12345;
+        gen_star(rnd_in(0 - 12 * ONE, 60 * ONE), rnd_in(0 - 12 * ONE, 52 * ONE), 3 + rnd() % 14, 1, 30);
+        hbad = hbad + poly_case(SD_FILL_NONZERO);
+        hbad = hbad + poly_case(SD_FILL_EVEN_ODD);
+        seed = seed + 1;
+    }
+    check(hbad, 0);                                                   # 91
+    hbad = 0;
+    seed = 1;
+    while (seed <= 40) {
+        g_rng = seed * 40503 + 977;
+        gen_wild(3 + rnd() % 12, 0 - 16, 64);
+        hbad = hbad + poly_case(SD_FILL_NONZERO);
+        hbad = hbad + poly_case(SD_FILL_EVEN_ODD);
+        seed = seed + 1;
+    }
+    check(hbad, 0);                                                   # 92
+    # {n/2} star polygons (n = 5, 7, 9, 11) straddling the corners.
+    hbad = 0;
+    var sk = 0;
+    while (sk < 4) {
+        var sx = 0 - 4 * ONE;
+        var sy = 0 - 3 * ONE;
+        if (sk == 1) { sx = 50 * ONE; }
+        if (sk == 2) { sy = 43 * ONE; }
+        if (sk == 3) { sx = 45 * ONE; sy = 38 * ONE; }
+        gen_pentagram(sx, sy, 20 * ONE + sk * 1000, 5 + 2 * sk);
+        hbad = hbad + poly_case(SD_FILL_NONZERO);
+        hbad = hbad + poly_case(SD_FILL_EVEN_ODD);
+        sk = sk + 1;
+    }
+    check(hbad, 0);                                                   # 93
+    # FAR off-canvas: slanted edges running 3-4 canvas widths past the right edge, far up, far left
+    # and wholly outside. Pieces past column w must deposit nothing — the canary behind the
+    # accumulator is where a missing clamp would write, and poly_case reads it — and the far-left
+    # cover must still reach column 0.
+    hbad = 0;
+    g_vn = 0;
+    or_add(40 * ONE + 3, 0 - 20 * ONE);
+    or_add(190 * ONE + 777, 18 * ONE);
+    or_add(30 * ONE, 70 * ONE + 5);
+    hbad = hbad + poly_case(SD_FILL_NONZERO);
+    g_vn = 0;
+    or_add(0 - 150 * ONE, 0 - 60 * ONE);
+    or_add(20 * ONE + 999, 7 * ONE);
+    or_add(0 - 90 * ONE, 90 * ONE);
+    hbad = hbad + poly_case(SD_FILL_EVEN_ODD);
+    # near-horizontal edges that cross x = w INSIDE one pixel row and run on to x = 150: the only
+    # geometry where a row piece starts on the canvas and ends 100 px past it
+    g_vn = 0;
+    or_add(10 * ONE, 10 * ONE + 13000);
+    or_add(150 * ONE, 10 * ONE + 59000);
+    or_add(150 * ONE + 5, 30 * ONE);
+    or_add(10 * ONE + 7, 30 * ONE + 33000);
+    hbad = hbad + poly_case(SD_FILL_EVEN_ODD);
+    g_vn = 0;
+    or_add(60 * ONE, 0 - 5 * ONE);
+    or_add(170 * ONE, 20 * ONE + 1);
+    or_add(55 * ONE, 45 * ONE);
+    hbad = hbad + poly_case(SD_FILL_NONZERO);
+    var far = sd_canvas_new(CW, CH);
+    fill_mode(far, or_path(), SD_FILL_NONZERO, SD_AA_AREA);
+    hbad = hbad + cov_sum(far);                                       # wholly right: nothing
+    check(hbad, 0);                                                   # 94
+    # Sum of coverage vs shoelace area, simple polygons wholly on the canvas. Each pixel's byte is
+    # floor(s*255/ONE) with s within a few raw units of the true area, so the deficit
+    # area255 - sum is at least -1 (rounding of the raw error over the whole polygon is far below
+    # one byte) and at most one byte per FRACTIONAL pixel (g_frac, counted by the oracle) plus 1.
+    var abad = 0;
+    seed = 1;
+    while (seed <= 20) {
+        g_rng = seed * 7919 + 3;
+        gen_star(rnd_in(18 * ONE, 30 * ONE), rnd_in(16 * ONE, 24 * ONE), 3 + rnd() % 14, 2, 15);
+        var ac = sd_canvas_new(CW, CH);
+        fill_mode(ac, or_path(), SD_FILL_NONZERO, SD_AA_AREA);
+        or_worst(ac, SD_FILL_NONZERO);
+        var deficit = shoelace255() - cov_sum(ac);
+        if (deficit < 0 - 1) { abad = abad + 1; }
+        if (deficit > g_frac + 1) { abad = abad + 1; }
+        if (g_frac == 0) { abad = abad + 1; }       # the polygon really had edges inside pixels
+        seed = seed + 1;
+    }
+    check(abad, 0);                                                   # 95
+    check(g_worst_nz <= 1, 1);                                        # 96
+    check(g_worst_eo <= 1, 1);                                        # 97
+
+    # ── I) CURVES: QUAD + CUBIC BLOB, THROUGH THE ENGINE'S OWN FLATTENING ──
+    # sd_path_flatten with the fill's tolerance yields the very polyline sd_fill_impl rasterizes, so
+    # the oracle applies unchanged.
+    var cb = sd_canvas_new(CW, CH);
+    fill_mode(cb, blob, SD_FILL_NONZERO, SD_AA_AREA);
+    check(or_from_flatten(blob) > 20, 1);                             # 98 — really subdivided
+    check(or_worst(cb, SD_FILL_NONZERO) <= 1, 1);                     # 99
+    check(streaks(cb), 0);                                            # 100
+    var cbe = sd_canvas_new(CW, CH);
+    fill_mode(cbe, blob, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    check(or_worst(cbe, SD_FILL_EVEN_ODD) <= 1, 1);                   # 101
+    check(sd_canvas_coverage_at(cb, 20, 15), 255);                    # 102 — interior
+    # vs the default engine: the same shape, differing only by the y quantization
+    var cbs = sd_canvas_new(CW, CH);
+    sd_canvas_fill_path(cbs, blob, SD_FILL_NONZERO);
+    var cmax = 0;
+    var ci = 0;
+    while (ci < CW * CH) {
+        var dd = load8(sd_canvas_coverage(cb) + ci) - load8(sd_canvas_coverage(cbs) + ci);
+        if (dd < 0) { dd = 0 - dd; }
+        if (dd > cmax) { cmax = dd; }
+        ci = ci + 1;
+    }
+    check(cmax > 0, 1);                                               # 103 — the engines do differ
+    check(cmax < 64, 1);                                              # 104 — by an AA step, not a shape
+
+    # ── J) EVERY PRODUCER HONOURS THE CANVAS: UNION, CLIP MULTIPLY, CLIP MASK, STROKE ──
+    # union: fill S1, union S2 == max(S1, S2) byte for byte
+    g_rng = 99991;
+    gen_star(20 * ONE, 18 * ONE, 9, 4, 17);
+    var s1 = or_path();
+    gen_wild(7, 0 - 4, 52);
+    var s2 = or_path();
+    var cu = sd_canvas_new(CW, CH);
+    fill_mode(cu, s1, SD_FILL_NONZERO, SD_AA_AREA);
+    sd_canvas_fill_union(cu, s2, SD_FILL_EVEN_ODD);
+    var c1 = sd_canvas_new(CW, CH);
+    fill_mode(c1, s1, SD_FILL_NONZERO, SD_AA_AREA);
+    var c2 = sd_canvas_new(CW, CH);
+    fill_mode(c2, s2, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    var ubad = 0;
+    var upart = 0;
+    ci = 0;
+    while (ci < CW * CH) {
+        var u1 = load8(sd_canvas_coverage(c1) + ci);
+        var u2 = load8(sd_canvas_coverage(c2) + ci);
+        var um = u1;
+        if (u2 > um) { um = u2; }
+        if (load8(sd_canvas_coverage(cu) + ci) != um) { ubad = ubad + 1; }
+        if (u1 != 0) {
+            if (u2 != 0) {
+                if (u1 != u2) { upart = upart + 1; }
+            }
+        }
+        ci = ci + 1;
+    }
+    check(ubad, 0);                                                   # 105
+    check(upart > 0, 1);                                              # 106 — the shapes really overlap
+    # clip multiply: fill under a path clip == (unclipped * mask) / 255 byte for byte, and the mask
+    # is the AREA coverage of the clip path
+    var clipp = tri_path(0 - 5 * ONE, 3 * ONE + 7, 50 * ONE, 12 * ONE + 999, 10 * ONE, 44 * ONE);
+    var cm = sd_canvas_new(CW, CH);
+    sd_canvas_set_aa(cm, SD_AA_AREA);
+    sd_canvas_clip_push_path(cm, clipp, SD_FILL_NONZERO);
+    sd_canvas_fill_path(cm, s1, SD_FILL_NONZERO);
+    var maskc = sd_canvas_new(CW, CH);
+    fill_mode(maskc, clipp, SD_FILL_NONZERO, SD_AA_AREA);
+    var mask = load64(load64(cm + SD_CANVAS_CLIP_OFFSET));
+    var mbad = 0;
+    var mdiff = 0;
+    var mfrac = 0;
+    var maskd = sd_canvas_new(CW, CH);
+    sd_canvas_fill_path(maskd, clipp, SD_FILL_NONZERO);
+    ci = 0;
+    while (ci < CW * CH) {
+        var mk = load8(mask + ci);
+        if (mk != load8(sd_canvas_coverage(maskc) + ci)) { mbad = mbad + 1; }
+        if (mk != load8(sd_canvas_coverage(maskd) + ci)) { mdiff = mdiff + 1; }
+        var want = (load8(sd_canvas_coverage(c1) + ci) * mk) / 255;
+        if (load8(sd_canvas_coverage(cm) + ci) != want) { mbad = mbad + 1; }
+        if (mk > 0) {
+            if (mk < 255) {
+                if (load8(sd_canvas_coverage(c1) + ci) > 0) { mfrac = mfrac + 1; }
+            }
+        }
+        ci = ci + 1;
+    }
+    check(mbad, 0);                                                   # 107
+    check(mdiff > 0, 1);                                              # 108 — the mask is NOT the default engine's
+    check(mfrac > 0, 1);                                              # 109 — fractional mask over ink
+    sd_canvas_clip_pop(cm);
+    # clip_push_path's mask detects its engine: a clip whose bottom edge is at y = 4.3, then a
+    # full-canvas fill. AREA canvas -> row 4 reads 76; SUBSCANLINE canvas -> 63 (4 sub-scanlines
+    # cannot produce 76).
+    var full = rect_path(0, 0, 8 * ONE, 8 * ONE);
+    var ka = sd_canvas_new(8, 8);
+    sd_canvas_set_aa(ka, SD_AA_AREA);
+    sd_canvas_clip_push_path(ka, hbar, SD_FILL_NONZERO);
+    sd_canvas_fill_path(ka, full, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(ka, 2, 4), 76);                       # 110
+    check(sd_canvas_coverage_at(ka, 2, 3), 255);                      # 111
+    check(sd_canvas_coverage_at(ka, 2, 5), 0);                        # 112
+    check(sd_canvas_aa(ka), SD_AA_AREA);                              # 113 — the parent kept its mode
+    var ks = sd_canvas_new(8, 8);
+    sd_canvas_clip_push_path(ks, hbar, SD_FILL_NONZERO);
+    sd_canvas_fill_path(ks, full, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(ks, 2, 4), 63);                       # 114
+    # the mask is built at push time: switching the parent to AREA afterwards does not rebuild it
+    sd_canvas_set_aa(ks, SD_AA_AREA);
+    sd_canvas_clear(ks);
+    sd_canvas_fill_path(ks, full, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(ks, 2, 4), 63);                       # 115
+    # stroke: (1,4)-(7,4), width 1.6 -> band y in [3.2, 4.8]. AREA: rows 3 and 4 each 0.8 covered
+    # -> (52428*255) >> 16 = 203. SUBSCANLINE: 3 of 4 sub-scanlines -> 191.
+    var sl = sd_path_new();
+    sd_path_moveto(sl, ONE, 4 * ONE);
+    sd_path_lineto(sl, 7 * ONE, 4 * ONE);
+    var ta = sd_canvas_new(8, 8);
+    sd_canvas_set_aa(ta, SD_AA_AREA);
+    check(sd_canvas_stroke_path(ta, sl, (16 * ONE) / 10), SADISH_OK); # 116
+    check(sd_canvas_coverage_at(ta, 4, 3), 203);                      # 117
+    check(sd_canvas_coverage_at(ta, 4, 4), 203);                      # 118
+    check(sd_canvas_coverage_at(ta, 4, 2), 0);                        # 119
+    var ts = sd_canvas_new(8, 8);
+    sd_canvas_stroke_path(ts, sl, (16 * ONE) / 10);
+    check(sd_canvas_coverage_at(ts, 4, 3), 191);                      # 120
+    # union over existing AREA coverage: MAX never lowers a byte; a plain fill overwrites
+    var tu = sd_canvas_new(8, 8);
+    sd_canvas_set_aa(tu, SD_AA_AREA);
+    sd_canvas_fill_path(tu, full, SD_FILL_NONZERO);
+    sd_canvas_fill_union(tu, hbar, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(tu, 2, 6), 255);                      # 121 — union kept the old 255
+    sd_canvas_fill_path(tu, hbar, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(tu, 2, 6), 0);                        # 122 — overwrite did not
+
+    # ── K) THE CANARY behind the accumulator (group A) is untouched after every fill above ──
+    check(canary_bad(), 0);                                           # 123
+
+    # ── L) THE CAPACITY BOUNDARY: A CANVAS EXACTLY ONE PIXEL WIDER THAN THE BLOCK ──
+    # The live block is group A's 65 slots (w = 64). A 65-px canvas needs 66: its last column's
+    # piece writes slot 65, 8 B past the old block — straight into the canary. An off-by-one in the
+    # regrow test (w <= cap) or in the capacity it records (w + 2) skips the regrow and hits it.
+    check(_sd_area_acc_cap, 65);                                      # 124 — group A's block is live
+    var cv65 = sd_canvas_new(65, 4);
+    sd_canvas_set_aa(cv65, SD_AA_AREA);
+    var r65 = rect_path(10 * ONE, 0, 64 * ONE + ONE / 2, 4 * ONE);    # right edge mid-column 64
+    g0 = alloc_used();
+    sd_canvas_fill_path(cv65, r65, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 66 * 8);                                 # 125 — regrown, exactly
+    check(canary_bad(), 0);                                           # 126 — not written past the old block
+    check(sd_canvas_coverage_at(cv65, 64, 2), 127);                   # 127 — the last column is real
+    # a fresh canary behind the NEW block guards every fill below (none is wider than 65 px)
+    var cvfill = 0;
+    g_canary = alloc(4096);
+    check(g_canary, _sd_area_acc + 66 * 8);                           # 128 — adjacent
+    while (cvfill < 4096) {
+        store8(g_canary + cvfill, 165);
+        cvfill = cvfill + 1;
+    }
+    g0 = alloc_used();
+    sd_canvas_fill_path(cv65, r65, SD_FILL_EVEN_ODD);
+    check(alloc_used() - g0, 0);                                      # 129 — warm at the new width
+    check(canary_bad(), 0);                                           # 130
+
+    # ── M) THE STREAK INVARIANT, TO THE RAW UNIT ──
+    # A leak needs 258 raw units in a row's running sum before one byte shows (257 * 255 < 65,536),
+    # which no shape above puts in a row — a deposit leaking 1 unit per piece passed every check. So
+    # amplify: 1,300 copies of each amp_path contour (7,800 edges, under the cap) in the same three
+    # rows. Every deposit statement then runs >= 1,300 times per row with one winding sign, so a
+    # 1-unit leak anywhere leaves >= 1,300 units (>= 5 bytes) right of x = 13.6. Pristine: 0, exactly.
+    var amp = amp_path(1300);
+    var cma = sd_canvas_new(20, 5);
+    fill_mode(cma, amp, SD_FILL_NONZERO, SD_AA_AREA);
+    check(load64(_sd_fill_ectx + 8), 7800);                           # 131 — all of it reached the engine
+    check(lit_outside(cma, 15, 3), 0);                                # 132 — nonzero: nothing leaked
+    check(sd_canvas_coverage_at(cma, 5, 1), 255);                     # 133 — the work is real
+    var cme = sd_canvas_new(20, 5);
+    fill_mode(cme, amp, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    check(lit_outside(cme, 15, 3), 0);                                # 134 — even-odd: nothing leaked
+    check(lit_outside(cma, 0, 0), 38);                                # 135 — three rows were lit
+    # part 2 (zz_path): 2,000 down edges against 1 up edge per contour, all in row 0 — a leak of
+    # either sign per edge, row segment or piece leaves >= 1,999 units (7 bytes) right of x = 13.6
+    var zz = zz_path(2000);
+    var cza = sd_canvas_new(20, 3);
+    fill_mode(cza, zz, SD_FILL_NONZERO, SD_AA_AREA);
+    check(load64(_sd_fill_ectx + 8), 8004);                           # 136 — under the cap: AREA ran
+    check(lit_outside(cza, 15, 1), 0);                                # 137
+    check(sd_canvas_coverage_at(cza, 10, 0), 255);                    # 138 — the work is real
+    var cze = sd_canvas_new(20, 3);
+    fill_mode(cze, zz, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    check(lit_outside(cze, 15, 1), 0);                                # 139
+    check(canary_bad(), 0);                                           # 140
+
+    # ── N) EDGE-LIST OVERFLOW: AREA RUNS BELOW THE CAP, THE DEFAULT LOOP AT IT ──
+    # sd_edge_add drops edges silently at SD_FLATTEN_CAP, leaving a contour open; the area engine
+    # would then streak to the right edge (MEASURED before the guard: 28 of 40 rows lit at x = 79 on
+    # an 80-px canvas). zig_path(cap - 4) is cap - 1 edges; the triangle appended below adds ONE
+    # edge before the list is full and loses its other two.
+    var cap = SD_FLATTEN_CAP;
+    var p1 = zig_path(cap - 4);
+    var n1 = sd_canvas_new(64, 40);
+    fill_mode(n1, p1, SD_FILL_NONZERO, SD_AA_AREA);
+    check(load64(_sd_fill_ectx + 8), cap - 1);                        # 141
+    check(sd_canvas_coverage_at(n1, 15, 4), 76);                      # 142 — one under the cap: AREA
+    check(lit_outside(n1, 21, 40), 0);                                # 143
+    var p2 = zig_path(cap - 4);
+    sd_path_moveto(p2, 30 * ONE, 10 * ONE);
+    sd_path_lineto(p2, 40 * ONE, 38 * ONE);
+    sd_path_lineto(p2, 30 * ONE, 38 * ONE);
+    sd_path_close(p2);
+    var n2 = sd_canvas_new(64, 40);
+    fill_mode(n2, p2, SD_FILL_NONZERO, SD_AA_AREA);
+    check(load64(_sd_fill_ectx + 8), cap);                            # 144 — full: possibly truncated
+    check(sd_canvas_coverage_at(n2, 15, 4), 63);                      # 145 — the default loop ran
+    check(lit_outside(n2, 41, 40), 0);                                # 146 — no streak past the triangle
+    var s2c = sd_canvas_new(64, 40);
+    sd_canvas_fill_path(s2c, p2, SD_FILL_NONZERO);
+    check(cov_diff(n2, s2c), 0);                                      # 147 — byte for byte the default
+    check(sd_canvas_aa(n2), SD_AA_AREA);                              # 148 — the canvas keeps its mode
+    fill_mode(n2, p2, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    sd_canvas_fill_path(s2c, p2, SD_FILL_EVEN_ODD);
+    check(cov_diff(n2, s2c) + lit_outside(n2, 41, 40), 0);            # 149 — even-odd too
+    check(canary_bad(), 0);                                           # 150
+
+    # ── O) WHERE THE RULE MAPS ARE AN APPROXIMATION (documented in src/coverage.cyr) ──
+    # Both fold the INTEGRAL of the winding. Two coincident rects to x = 4.3 integrate to 0.6 in
+    # pixel 4 -> 152, where the region really covers 0.3 (76 — which the default engine, deciding
+    # per x span, does report). A bow-tie inside one pixel integrates to 0 — its lobes wind opposite
+    # ways — though it covers a real area (the default engine says 86).
+    var co = rect_path(0, 0, e43, 8 * ONE);
+    sd_path_moveto(co, 0, 0);
+    sd_path_lineto(co, e43, 0);
+    sd_path_lineto(co, e43, 8 * ONE);
+    sd_path_lineto(co, 0, 8 * ONE);
+    sd_path_close(co);
+    var coa = sd_canvas_new(8, 8);
+    fill_mode(coa, co, SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(coa, 4, 4), 152);                     # 151
+    var cos = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(cos, co, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(cos, 4, 4), 76);                      # 152
+    var bow = sd_path_new();
+    sd_path_moveto(bow, 7 * ONE + 5000, 7 * ONE + 5000);
+    sd_path_lineto(bow, 7 * ONE + 60000, 7 * ONE + 60000);
+    sd_path_lineto(bow, 7 * ONE + 60000, 7 * ONE + 5000);
+    sd_path_lineto(bow, 7 * ONE + 5000, 7 * ONE + 60000);
+    sd_path_close(bow);
+    var bwa = sd_canvas_new(8, 8);
+    fill_mode(bwa, bow, SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(bwa, 7, 7), 0);                       # 153
+    var bws = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(bws, bow, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(bws, 7, 7) > 0, 1);                   # 154
+
+    # ── P) VERTICAL EDGES AT COLUMN BOUNDARIES: INSIDE COLUMN 0, AND ONE RAW UNIT SHORT OF A COLUMN ──
+    # A vertical piece has its own branch: x <= 0 deposits its whole height into slot 0, anything
+    # else splits by its x fraction. Groups D and O put the edge at 4.3 and rects at integer x, so a
+    # column-0 test spelled `x < ONE` (what `sd_asr(x, 16) <= 0` gives) would draw an edge at 0.5 as
+    # full cover and pass every check above. Both engines are exact on vertical edges and whole rows.
+    var q05 = sd_canvas_new(8, 8);
+    fill_mode(q05, rect_path(ONE / 2, ONE, 4 * ONE, 6 * ONE), SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(q05, 0, 3), (32768 * 255) >> 16);     # 155 — 127, not 255
+    check(sd_canvas_coverage_at(q05, 1, 3), 255);                     # 156
+    check(sd_canvas_coverage_at(q05, 0, 0), 0);                       # 157
+    var s05 = sd_canvas_new(8, 8);
+    sd_canvas_fill_path(s05, rect_path(ONE / 2, ONE, 4 * ONE, 6 * ONE), SD_FILL_NONZERO);
+    check(cov_diff(q05, s05), 0);                                     # 158
+    # a rect from left of the canvas to x = 0.3: its right edge in column 0, winding the other way
+    var e03 = (3 * ONE) / 10;
+    var q03 = sd_canvas_new(8, 8);
+    fill_mode(q03, rect_path_rev(0 - 2 * ONE, 0, e03, 8 * ONE), SD_FILL_EVEN_ODD, SD_AA_AREA);
+    check(sd_canvas_coverage_at(q03, 0, 5), (19660 * 255) >> 16);     # 159 — 76
+    check(sd_canvas_coverage_at(q03, 1, 5), 0);                       # 160
+    check(lit_outside(q03, 1, 8), 0);                                 # 161
+    # one raw unit short of x = 3: column 2 holds 65,535 / 65,536 -> 254, column 3 nothing
+    var q3m = sd_canvas_new(8, 8);
+    fill_mode(q3m, rect_path(0, 0, 3 * ONE - 1, 8 * ONE), SD_FILL_NONZERO, SD_AA_AREA);
+    check(sd_canvas_coverage_at(q3m, 2, 2), (65535 * 255) >> 16);     # 162 — 254
+    check(sd_canvas_coverage_at(q3m, 3, 2) + lit_outside(q3m, 3, 8), 0);  # 163
+
+    if (g_fails == 0) {
+        var ok = "area_test: PASS (exact 2-axis coverage vs a pixel-clip oracle; no streaks; opt-in)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "area_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

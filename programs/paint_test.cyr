@@ -1,0 +1,1560 @@
+# programs/paint_test.cyr — RUN test for gradient paint (src/paint.cyr): linear + radial gradients,
+# multi-stop ramps, PAD / REPEAT / REFLECT, stop alpha, degenerate geometry, sd_canvas_blit_paint_at
+# placement + clipping + stride, the 16.16 precision bound, and the allocation contract (A-L); then
+# EXACT t — every pixel reads its spread-mapped floor(t * 2^16), on axes of any length and any
+# direction, with hard stops and sub-cell bands landing on the right pixels — pinned against
+# references independent of paint.cyr's arithmetic (M-U).
+#
+# ⚠ Coverage is written into the canvas BY HAND (memset / store8) rather than filled from a path, so
+# every expected byte below is a closed-form value, and no fill scratch lands inside an allocation
+# window. The paint is the only thing under test.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "paint_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- the consumer's hook for group L ----------------------------------------------------------
+var g_arena = 0;
+
+fn hook_alloc(n): i64 {
+    return arena_alloc(g_arena, n);
+}
+
+# ---- helpers ------------------------------------------------------------------------------------
+var RGB_MASK = 16777215;
+
+# A w*h canvas whose every pixel has full coverage.
+fn pt_full(w, h): i64 {
+    var cv = sd_canvas_new(w, h);
+    memset(sd_canvas_coverage(cv), 255, w * h);
+    return cv;
+}
+
+# 1 when every channel of packed `c` is within `tol` of (r, g, b).
+fn pt_near(c, r, g, b, tol): i64 {
+    if (sd_abs(sd_color_r(c) - r) > tol) { return 0; }
+    if (sd_abs(sd_color_g(c) - g) > tol) { return 0; }
+    if (sd_abs(sd_color_b(c) - b) > tol) { return 0; }
+    return 1;
+}
+
+# Differing bytes between two buffers.
+fn pt_diff(pa, pb, n): i64 {
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(pa + i) != load8(pb + i)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+# Surface pixel (x, y) and (x2, y2) differ?
+fn pt_ne(s, x, y, x2, y2): i64 {
+    if (sd_surface_pixel_at(s, x, y) != sd_surface_pixel_at(s, x2, y2)) { return 1; }
+    return 0;
+}
+
+# Pixels of a 1-row surface whose colour is not color_at(g, 16x + 8) — the exact centre t of pixel x
+# on a 4096 px axis from 0.
+fn pt_row_vs_color_at(s, g, w): i64 {
+    var bad = 0;
+    var x = 0;
+    while (x < w) {
+        if (sd_surface_pixel_at(s, x, 0) != (sd_gradient_color_at(g, 16 * x + 8) & RGB_MASK)) { bad = bad + 1; }
+        x = x + 1;
+    }
+    return bad;
+}
+
+# Monotonicity violations along row 0: red must not rise, blue must not fall.
+fn pt_monotone_violations(s, w): i64 {
+    var bad = 0;
+    var x = 1;
+    while (x < w) {
+        var p = sd_surface_pixel_at(s, x - 1, 0);
+        var c = sd_surface_pixel_at(s, x, 0);
+        if (sd_color_r(c) > sd_color_r(p)) { bad = bad + 1; }
+        if (sd_color_b(c) < sd_color_b(p)) { bad = bad + 1; }
+        x = x + 1;
+    }
+    return bad;
+}
+
+# Place `cv` (cw*ch) onto a 16x16 surface cleared to `bg` at (dx, dy) and compare every surface pixel
+# against `ref` (the same paint blitted at the origin of a cw*ch surface): inside the placed rect it
+# must equal ref(sx-dx, sy-dy), outside it must still be `bg`. Returns the mismatches.
+fn pt_placed_mismatches(cv, g, ref, cw, ch, dx, dy, bg): i64 {
+    var s = sd_surface_new(16, 16);
+    sd_clear(s, bg);
+    sd_canvas_blit_paint_at(cv, s, g, dx, dy);
+    var bad = 0;
+    var sy = 0;
+    while (sy < 16) {
+        var sx = 0;
+        while (sx < 16) {
+            var want = bg;
+            var cx = sx - dx;
+            var cy = sy - dy;
+            if (cx >= 0) {
+                if (cx < cw) {
+                    if (cy >= 0) {
+                        if (cy < ch) { want = sd_surface_pixel_at(ref, cx, cy); }
+                    }
+                }
+            }
+            if (sd_surface_pixel_at(s, sx, sy) != want) { bad = bad + 1; }
+            sx = sx + 1;
+        }
+        sy = sy + 1;
+    }
+    return bad;
+}
+
+# ---- exact-t references (groups M-T) ------------------------------------------------------------
+var g_seed = 20260915;
+
+fn pt_rnd(m): i64 {
+    g_seed = g_seed * 6364136223846793005 + 1442695040888963407;
+    return ((g_seed >> 33) & 2147483647) % m;
+}
+
+# floor(a / b) for b > 0 (Cyrius '/' truncates toward zero).
+fn pt_fdiv(a, b): i64 {
+    var q = a / b;
+    if (q * b > a) { q = q - 1; }
+    return q;
+}
+
+# floor(sqrt(n * 2^32)) for 0 <= n < 2^63, digit by digit two bits at a time — independent of
+# paint.cyr's Newton root and of its q / q + 1 correction. The remainder is left in g_sqrt_rem.
+var g_sqrt_rem = 0;
+
+fn pt_isqrt96(n): i64 {
+    var root = 0;
+    var rem = 0;
+    var p = 47;
+    while (p >= 0) {
+        var bits = 0;
+        if (2 * p >= 32) { bits = (n >> (2 * p - 32)) & 3; }
+        rem = (rem << 2) | bits;
+        var trial = (root << 2) | 1;
+        if (rem >= trial) {
+            rem = rem - trial;
+            root = (root << 1) | 1;
+        } else {
+            root = root << 1;
+        }
+        p = p - 1;
+    }
+    g_sqrt_rem = rem;
+    return root;
+}
+
+# The spread-mapped floor parameter for a pixel whose exact t * 2^16 is `t` + (frac ? a fraction : 0):
+# PAD clamps; REPEAT is t mod 1; REFLECT is t mod 2, mirrored as 2 - (t mod 2) past 1 — whose floor
+# is 131072 - m - 1 when the fraction is non-zero.
+fn pt_spread_ref(spread, t, frac): i64 {
+    if (spread == SD_SPREAD_PAD) {
+        if (t < 0) { return 0; }
+        if (t > 65536) { return 65536; }
+        return t;
+    }
+    if (spread == SD_SPREAD_REPEAT) { return t & 65535; }
+    var m = t & 131071;
+    if (m > 65536) { return 131072 - m - frac; }
+    if (m == 65536) {
+        if (frac != 0) { return 65535; }
+    }
+    return m;
+}
+
+# Every ramp cell a different colour from its neighbours, with no stop inside a cell (all offsets are
+# multiples of 1/1024), so a pixel off by one 16.16 cell boundary reads a different colour.
+fn pt_zigzag(g): i64 {
+    var j = 0;
+    while (j < 4) {
+        sd_gradient_add_stop(g, j * 16384, sd_rgb(j * 60, 0, 0));
+        sd_gradient_add_stop(g, j * 16384 + 16320, sd_rgb(j * 60, 0, 255));
+        j = j + 1;
+    }
+    sd_gradient_add_stop(g, SD_ONE, sd_rgb(240, 0, 0));
+    return 0;
+}
+
+# Geometry of the bracketing gradients: linear (g_ga, g_gb) -> (g_gc, g_gd), or radial centre
+# (g_ga, g_gb) radius g_gc; spread g_gspread.
+var g_glin = 1;
+var g_ga = 0;
+var g_gb = 0;
+var g_gc = 0;
+var g_gd = 0;
+var g_gspread = 0;
+
+# Canvas pixel (px, py) — the canvas's only covered pixel — painted at (dx, dy) through a gradient
+# with a hard red|blue stop at `o`; returns the surface pixel. The gradient lives on g_arena (hooked).
+fn pt_hard(cv, s, o, px, py, dx, dy): i64 {
+    arena_reset(g_arena);
+    var g = 0;
+    if (g_glin != 0) {
+        g = sd_gradient_linear(g_ga, g_gb, g_gc, g_gd);
+    } else {
+        g = sd_gradient_radial(g_ga, g_gb, g_gc);
+    }
+    sd_gradient_add_stop(g, o, sd_rgb(255, 0, 0));
+    sd_gradient_add_stop(g, o, sd_rgb(0, 0, 255));
+    sd_gradient_set_spread(g, g_gspread);
+    sd_canvas_blit_paint_at(cv, s, g, dx, dy);
+    return sd_surface_pixel_at(s, px + dx, py + dy);
+}
+
+# ⭐ The bracket that pins a pixel's t exactly: with its spread-mapped floor parameter `tp`, a stop at
+# tp must paint it BLUE and one at tp + 1 RED — the marked-cell (stop search) path; and the ramp-cell
+# boundaries around tp, which mark nothing, must do the same through the table. Wrong answers, 0..4.
+fn pt_bracket(cv, s, tp, px, py, dx, dy): i64 {
+    var RED = sd_rgb(255, 0, 0);
+    var BLUE = sd_rgb(0, 0, 255);
+    var bad = 0;
+    if (pt_hard(cv, s, tp, px, py, dx, dy) != BLUE) { bad = bad + 1; }
+    if (tp < 65536) {
+        if (pt_hard(cv, s, tp + 1, px, py, dx, dy) != RED) { bad = bad + 1; }
+    }
+    var cb = (tp >> 6) << 6;
+    if (pt_hard(cv, s, cb, px, py, dx, dy) != BLUE) { bad = bad + 1; }
+    if (cb < 65536) {
+        if (pt_hard(cv, s, cb + 64, px, py, dx, dy) != RED) { bad = bad + 1; }
+    }
+    return bad;
+}
+
+# Linear pixels of a w*h surface whose colour is not color_at(g, spread_ref(T)) at the exact floor
+# T = floor(N * 2^16 / L2), from the geometry in 1/256 px units (pixel centre = 256x + 128), or that
+# changed where the coverage is 0 (bg must survive). g's spread must be `spread`.
+fn pt_lin_ref_mismatches(s, cv, g, spread, w, h, ax, ay, bx, by, bg): i64 {
+    var cov = sd_canvas_coverage(cv);
+    var ux = bx - ax;
+    var uy = by - ay;
+    var l2 = ux * ux + uy * uy;
+    var bad = 0;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var c = sd_surface_pixel_at(s, x, y);
+            if (load8(cov + y * sd_canvas_stride(cv) + x) == 0) {
+                if (c != bg) { bad = bad + 1; }
+            } else {
+                var num = ((256 * x + 128 - ax) * ux + (256 * y + 128 - ay) * uy) * 65536;
+                var tt = pt_fdiv(num, l2);
+                var fr = 0;
+                if (num - tt * l2 != 0) { fr = 1; }
+                if (c != (sd_gradient_color_at(g, pt_spread_ref(spread, tt, fr)) & RGB_MASK)) { bad = bad + 1; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return bad;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var RED   = sd_rgb(255, 0, 0);   # 0xFF0000 = 16711680
+    var GREEN = sd_rgb(0, 255, 0);
+    var BLUE  = sd_rgb(0, 0, 255);   # 0x0000FF = 255
+    var BLACK = sd_rgb(0, 0, 0);
+    var HALF  = SD_ONE >> 1;
+
+    # ── A) 2-STOP LINEAR, red -> blue across a 256 px row ──
+    # Pixel x samples its centre: t = (x + 0.5) / 256, t16 = 256x + 128 — a multiple of the ramp cell
+    # (64), so the paint is the analytic colour rounded to nearest: r = (255 (65536 - t16) + 32768) >> 16.
+    var row = pt_full(256, 1);
+    var sa = sd_surface_new(256, 1);
+    var ga = sd_gradient_linear(0, 0, 256 * SD_ONE, 0);
+    check(ga != 0, 1);                                                  #1
+    check(sd_gradient_stop_count(ga), 0);                               #2
+    check(sd_gradient_add_stop(ga, 0, RED), SADISH_OK);                 #3
+    check(sd_gradient_add_stop(ga, SD_ONE, BLUE), SADISH_OK);           #4
+    check(sd_canvas_blit_paint(row, sa, ga), SADISH_OK);                #5
+    var off1 = 0;
+    var exact = 0;
+    var agree = 0;
+    var x = 0;
+    while (x < 256) {
+        var t16 = 256 * x + 128;
+        var er = (255 * (65536 - t16) + 32768) / 65536;
+        var eb = (255 * t16 + 32768) / 65536;
+        var c = sd_surface_pixel_at(sa, x, 0);
+        if (pt_near(c, er, 0, eb, 1) == 0) { off1 = off1 + 1; }
+        if (c == sd_rgb(er, 0, eb)) { exact = exact + 1; }
+        if (c == (sd_gradient_color_at(ga, t16) & RGB_MASK)) { agree = agree + 1; }
+        x = x + 1;
+    }
+    check(off1, 0);                                                     #6 — every pixel within ±1
+    check(exact, 256);                                                  #7 — MEASURED: all 256 exact
+    check(agree, 256);                                                  #8 — the blit reads what color_at says
+    check(sd_surface_pixel_at(sa, 0, 0), RED);                          #9 — t = 0.5/256 rounds to red
+    check(sd_surface_pixel_at(sa, 255, 0), BLUE);                       #10
+    check(sd_surface_pixel_at(sa, 127, 0), sd_rgb(128, 0, 127));        #11 — t = 127.5/256
+    check(sd_surface_pixel_at(sa, 128, 0), sd_rgb(127, 0, 128));        #12 — t = 128.5/256
+    check(pt_monotone_violations(sa, 256), 0);                          #13
+    check(load8(sd_surface_pixels(sa) + 100 * 4 + 3), 255);             #14 — dst alpha byte opaque
+    check(sd_gradient_color_at(ga, 0), 4294901760);                     #15 — 0xFFFF0000: alpha 255 + red
+    check(sd_gradient_color_at(ga, SD_ONE), 4278190335);                #16 — 0xFF0000FF
+    # The same closed form DOWN a 1x256 column: the y half-pixel and the qy path.
+    var col = pt_full(1, 256);
+    var sv = sd_surface_new(1, 256);
+    var gv = sd_gradient_linear(0, 0, 0, 256 * SD_ONE);
+    sd_gradient_add_stop(gv, 0, RED);
+    sd_gradient_add_stop(gv, SD_ONE, BLUE);
+    sd_canvas_blit_paint(col, sv, gv);
+    exact = 0;
+    var yv = 0;
+    while (yv < 256) {
+        var tv = 256 * yv + 128;
+        var ev = sd_rgb((255 * (65536 - tv) + 32768) / 65536, 0, (255 * tv + 32768) / 65536);
+        if (sd_surface_pixel_at(sv, 0, yv) == ev) { exact = exact + 1; }
+        yv = yv + 1;
+    }
+    check(exact, 256);                                                  #17
+    # A 45-degree axis (0,0) -> (64,64) px: pixel (x, y) has t = (x + y + 1) / 128, t16 = 512 (x + y + 1).
+    var cvq = pt_full(64, 64);
+    var sq = sd_surface_new(64, 64);
+    var gq = sd_gradient_linear(0, 0, 64 * SD_ONE, 64 * SD_ONE);
+    sd_gradient_add_stop(gq, 0, RED);
+    sd_gradient_add_stop(gq, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvq, sq, gq);
+    var qmis = 0;
+    yv = 0;
+    while (yv < 64) {
+        var xq = 0;
+        while (xq < 64) {
+            var wq = sd_gradient_color_at(gq, 512 * (xq + yv + 1)) & RGB_MASK;
+            if (sd_surface_pixel_at(sq, xq, yv) != wq) { qmis = qmis + 1; }
+            xq = xq + 1;
+        }
+        yv = yv + 1;
+    }
+    check(qmis, 0);                                                     #18
+    # A stop added AFTER the ramp was built reaches the next blit (the dirty flag) ...
+    check(sd_gradient_add_stop(ga, HALF, GREEN), SADISH_OK);            #19
+    sd_canvas_blit_paint(row, sa, ga);
+    check(sd_surface_pixel_at(sa, 128, 0), sd_rgb(0, 254, 1));          #20
+    # ... and sd_gradient_color_at, with no blit in between.
+    sd_gradient_add_stop(ga, HALF, RED);
+    check(sd_gradient_color_at(ga, HALF) & RGB_MASK, RED);              #21
+
+    # ── B) MULTI-STOP: red @0, green @0.5, blue @1 ──
+    var sb = sd_surface_new(256, 1);
+    var gb = sd_gradient_linear(0, 0, 256 * SD_ONE, 0);
+    sd_gradient_add_stop(gb, 0, RED);
+    sd_gradient_add_stop(gb, HALF, GREEN);
+    sd_gradient_add_stop(gb, SD_ONE, BLUE);
+    sd_canvas_blit_paint(row, sb, gb);
+    check(sd_gradient_color_at(gb, HALF) & RGB_MASK, GREEN);            #22 — green exactly at the middle
+    check(sd_surface_pixel_at(sb, 127, 0), sd_rgb(1, 254, 0));          #23 — t16 32640: last red->green step
+    check(sd_surface_pixel_at(sb, 128, 0), sd_rgb(0, 254, 1));          #24 — t16 32896: first green->blue step
+    var pb = sd_surface_pixel_at(sb, 64, 0);                            # t = 64.5/256: red/green blend
+    check(pt_near(pb, 127, 129, 0, 1), 1);                              #25
+    var pb2 = sd_surface_pixel_at(sb, 192, 0);                          # t = 192.5/256: green/blue blend
+    check(pt_near(pb2, 0, 127, 128, 1), 1);                             #26
+    check(sd_surface_pixel_at(sb, 0, 0), sd_rgb(254, 1, 0));            #27 — t16 128 on a half-length segment
+    check(sd_surface_pixel_at(sb, 255, 0), sd_rgb(0, 1, 254));          #28
+
+    # ── C) HARD STOPS: two stops at one offset ──
+    # red [0, 0.5) | blue [0.5, 1]: pixel 127 (t16 32640) is red, 128 (t16 32896) blue.
+    var sc = sd_surface_new(256, 1);
+    var gc = sd_gradient_linear(0, 0, 256 * SD_ONE, 0);
+    sd_gradient_add_stop(gc, 0, RED);
+    sd_gradient_add_stop(gc, HALF, RED);
+    sd_gradient_add_stop(gc, HALF, BLUE);
+    sd_gradient_add_stop(gc, SD_ONE, BLUE);
+    sd_canvas_blit_paint(row, sc, gc);
+    var reds = 0;
+    var blues = 0;
+    x = 0;
+    while (x < 256) {
+        if (sd_surface_pixel_at(sc, x, 0) == RED) { reds = reds + 1; }
+        if (sd_surface_pixel_at(sc, x, 0) == BLUE) { blues = blues + 1; }
+        x = x + 1;
+    }
+    check(sd_surface_pixel_at(sc, 127, 0), RED);                        #29
+    check(sd_surface_pixel_at(sc, 128, 0), BLUE);                       #30
+    check(reds, 128);                                                   #31 — nothing in between
+    check(blues, 128);                                                  #32
+    check(sd_gradient_color_at(gc, HALF - 1) & RGB_MASK, RED);          #33 — t < o: the earlier stop
+    check(sd_gradient_color_at(gc, HALF) & RGB_MASK, BLUE);             #34 — t >= o: the LATER stop
+    # An offset that is NOT a multiple of 1/1024: 0.3 (19660) lies inside ramp cell 307 (19648..19712),
+    # so that cell is marked and flips EXACTLY at 19660. Pixel 76 (t16 19584) is before 0.3, pixel 77
+    # (t16 19840) after it; the exact flip is pinned by color_at (and at pixel level by group N).
+    var sc2 = sd_surface_new(256, 1);
+    var gc2 = sd_gradient_linear(0, 0, 256 * SD_ONE, 0);
+    sd_gradient_add_stop(gc2, 19660, RED);
+    sd_gradient_add_stop(gc2, 19660, BLUE);
+    sd_canvas_blit_paint(row, sc2, gc2);
+    check(sd_surface_pixel_at(sc2, 76, 0), RED);                        #35
+    check(sd_surface_pixel_at(sc2, 77, 0), BLUE);                       #36
+    check(sd_gradient_color_at(gc2, 19659) & RGB_MASK, RED);            #37 — no lag: 19659 is before the stop
+    check(sd_gradient_color_at(gc2, 19660) & RGB_MASK, BLUE);           #38 — 19660 is on it
+    # Equal offsets keep INSERTION order even when added out of order around them: (blue then red)
+    # at 0.5 makes t >= 0.5 start from red.
+    var gc3 = sd_gradient_linear(0, 0, 256 * SD_ONE, 0);
+    sd_gradient_add_stop(gc3, HALF, BLUE);
+    sd_gradient_add_stop(gc3, SD_ONE, BLUE);
+    sd_gradient_add_stop(gc3, 0, RED);
+    sd_gradient_add_stop(gc3, HALF, RED);
+    check(sd_gradient_color_at(gc3, HALF - 64) & RGB_MASK, BLUE);      #39 — red->blue reaches blue
+    check(sd_gradient_color_at(gc3, HALF) & RGB_MASK, RED);             #40 — then restarts at red
+
+    # ── D) STOPS OUT OF ORDER == STOPS IN ORDER, byte for byte ──
+    # Five stops (the block grows 4 -> 8), two with alpha, offsets that clamp, over a patterned dst
+    # with patterned coverage, REFLECT on a slanted axis.
+    var cvd = sd_canvas_new(256, 4);
+    var covd = sd_canvas_coverage(cvd);
+    var i = 0;
+    while (i < 1024) {
+        store8(covd + i, (i * 37 + 11) & 255);
+        i = i + 1;
+    }
+    var sd1 = sd_surface_new(256, 4);
+    var sd2 = sd_surface_new(256, 4);
+    i = 0;
+    while (i < 256 * 4 * 4) {
+        store8(sd_surface_pixels(sd1) + i, (i * 7 + 13) & 255);
+        store8(sd_surface_pixels(sd2) + i, (i * 7 + 13) & 255);
+        i = i + 1;
+    }
+    var gd1 = sd_gradient_linear(20 * SD_ONE, 0, 120 * SD_ONE, 40 * SD_ONE);
+    sd_gradient_add_stop(gd1, 0, RED);
+    sd_gradient_add_stop(gd1, 16384, sd_rgba(0, 255, 0, 200));
+    sd_gradient_add_stop(gd1, 39321, BLUE);
+    sd_gradient_add_stop(gd1, 52428, sd_rgb(255, 255, 0));
+    sd_gradient_add_stop(gd1, SD_ONE, sd_rgba(0, 255, 255, 90));
+    sd_gradient_set_spread(gd1, SD_SPREAD_REFLECT);
+    var gd2 = sd_gradient_linear(20 * SD_ONE, 0, 120 * SD_ONE, 40 * SD_ONE);
+    sd_gradient_add_stop(gd2, 52428, sd_rgb(255, 255, 0));
+    sd_gradient_add_stop(gd2, SD_ONE + 999, sd_rgba(0, 255, 255, 90));
+    sd_gradient_add_stop(gd2, 16384, sd_rgba(0, 255, 0, 200));
+    check(sd_gradient_add_stop(gd2, 0 - 777, RED), SADISH_OK);          #41 — a 4th stop: still in the first block
+    check(sd_gradient_add_stop(gd2, 39321, BLUE), SADISH_OK);           #42 — the 5th grows it
+    check(sd_gradient_stop_count(gd2), 5);                              #43
+    sd_gradient_set_spread(gd2, SD_SPREAD_REFLECT);
+    sd_canvas_blit_paint(cvd, sd1, gd1);
+    sd_canvas_blit_paint(cvd, sd2, gd2);
+    check(pt_diff(sd_surface_pixels(sd1), sd_surface_pixels(sd2), 256 * 4 * 4), 0);   #44
+    var dmis = 0;
+    var tt = 0 - 70000;
+    while (tt < 200000) {
+        if (sd_gradient_color_at(gd1, tt) != sd_gradient_color_at(gd2, tt)) { dmis = dmis + 1; }
+        tt = tt + 37;
+    }
+    check(dmis, 0);                                                     #45
+    # ...and the stable pair from group C, in order vs out of order, over every t.
+    var gc4 = sd_gradient_linear(0, 0, 256 * SD_ONE, 0);
+    sd_gradient_add_stop(gc4, 0, RED);
+    sd_gradient_add_stop(gc4, HALF, BLUE);
+    sd_gradient_add_stop(gc4, HALF, RED);
+    sd_gradient_add_stop(gc4, SD_ONE, BLUE);
+    dmis = 0;
+    tt = 0 - 1000;
+    while (tt < 67000) {
+        if (sd_gradient_color_at(gc3, tt) != sd_gradient_color_at(gc4, tt)) { dmis = dmis + 1; }
+        tt = tt + 13;
+    }
+    check(dmis, 0);                                                     #46
+
+    # ── E) RADIAL ──
+    # Centre on the corner (32, 32) of a 64x64 canvas, r = 24 px, red -> blue, PAD.
+    var cve = pt_full(64, 64);
+    var se = sd_surface_new(64, 64);
+    var ge = sd_gradient_radial(32 * SD_ONE, 32 * SD_ONE, 24 * SD_ONE);
+    sd_gradient_add_stop(ge, 0, RED);
+    sd_gradient_add_stop(ge, SD_ONE, BLUE);
+    check(sd_canvas_blit_paint(cve, se, ge), SADISH_OK);                #47
+    # (31,31) is 0.707 px from the centre: t16 = 46340 * 65536 / (24 * 65536) = 1930 -> cell 30.
+    check(sd_surface_pixel_at(se, 31, 31), sd_gradient_color_at(ge, 1930) & RGB_MASK);   #48
+    check(pt_near(sd_surface_pixel_at(se, 31, 31), 255, 0, 0, 8), 1);   #49 — ~ the first stop
+    var sym = 0;
+    var outside_bad = 0;
+    var inside_bad = 0;
+    var ref_bad = 0;
+    var y = 0;
+    while (y < 64) {
+        x = 0;
+        while (x < 64) {
+            sym = sym + pt_ne(se, x, y, 63 - x, y) + pt_ne(se, x, y, x, 63 - y) + pt_ne(se, x, y, y, x);
+            # squared centre distance in half-pixel units: (2x - 63)^2 + (2y - 63)^2 vs (2r)^2
+            var d2h = (2 * x - 63) * (2 * x - 63) + (2 * y - 63) * (2 * y - 63);
+            var c = sd_surface_pixel_at(se, x, y);
+            if (d2h >= 48 * 48) {
+                if (c != BLUE) { outside_bad = outside_bad + 1; }
+            }
+            if (d2h < 46 * 46) {
+                if (c == BLUE) { inside_bad = inside_bad + 1; }
+            }
+            # the reference t, through geom's own sd_isqrt
+            var ex = (x << 16) + HALF - 32 * SD_ONE;
+            var ey = (y << 16) + HALF - 32 * SD_ONE;
+            var tr = (sd_isqrt(ex * ex + ey * ey) << 16) / (24 * SD_ONE);
+            if (c != (sd_gradient_color_at(ge, tr) & RGB_MASK)) { ref_bad = ref_bad + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    check(sym, 0);                                                      #50 — mirror x, mirror y, diagonal
+    check(outside_bad, 0);                                              #51 — every centre at >= r: the last stop
+    check(inside_bad, 0);                                               #52 — every centre inside r - 1 px: not
+    check(ref_bad, 0);                                                  #53 — t = floor(sqrt(d^2)) / r, every pixel
+    var mono = 0;
+    x = 33;
+    while (x < 64) {
+        var rin = sd_color_r(sd_surface_pixel_at(se, x - 1, 32));
+        if (sd_color_r(sd_surface_pixel_at(se, x, 32)) > rin) { mono = mono + 1; }
+        x = x + 1;
+    }
+    check(mono, 0);                                                     #54 — red falls outward
+    check(sd_surface_pixel_at(se, 0, 0), BLUE);                         #55
+    # The fast root agrees with sd_isqrt: squares, their neighbours, and a pseudo-random sweep of
+    # magnitudes up to 2^62.
+    var rbad = 0;
+    var k = 0;
+    while (k < 31) {
+        var base = (1 << k) + k * 7;
+        var sq = base * base;
+        if (_sd_paint_isqrt(sq) != sd_isqrt(sq)) { rbad = rbad + 1; }
+        if (_sd_paint_isqrt(sq - 1) != sd_isqrt(sq - 1)) { rbad = rbad + 1; }
+        if (_sd_paint_isqrt(sq + 1) != sd_isqrt(sq + 1)) { rbad = rbad + 1; }
+        k = k + 1;
+    }
+    var seed = 12345;
+    k = 0;
+    while (k < 4000) {
+        seed = seed * 6364136223846793005 + 1442695040888963407;
+        var nn = (seed >> 1) >> ((seed >> 20) & 63);
+        if (_sd_paint_isqrt(nn) != sd_isqrt(nn)) { rbad = rbad + 1; }
+        k = k + 1;
+    }
+    check(rbad, 0);                                                     #56
+    check(_sd_paint_isqrt(0), 0);                                       #57
+    check(_sd_paint_isqrt(4611686018427387904), 2147483648);            #58 — 2^62
+    check(_sd_paint_isqrt(9223372036854775807), 3037000499);            #59 — the i64 ceiling
+    # The long division agrees with the direct FLOOR division wherever the product fits, and hands
+    # back the remainder in [0, b) — negative numerators included.
+    var qbad = 0;
+    var a = 0 - 300;
+    while (a <= 300) {
+        var bb = 1;
+        while (bb < 5000) {
+            var q16 = _sd_paint_divq(a, bb, 16);
+            if (q16 != pt_fdiv(a * 65536, bb)) { qbad = qbad + 1; }
+            if (a * 65536 - q16 * bb != _sd_paint_rem) { qbad = qbad + 1; }
+            var q40 = _sd_paint_divq(a, bb, 40);
+            if (q40 != pt_fdiv(a * 1099511627776, bb)) { qbad = qbad + 1; }
+            if (_sd_paint_rem < 0) { qbad = qbad + 1; }
+            if (_sd_paint_rem >= bb) { qbad = qbad + 1; }
+            bb = bb + 97;
+        }
+        a = a + 7;
+    }
+    check(qbad, 0);                                                     #60
+
+    # ── F) SPREAD: REPEAT and REFLECT, including t < 0 ──
+    # A 64 px axis from x = 128 to 192 on a 256 px row: pixel x has t = (x + 0.5 - 128) / 64, so
+    # pixels left of 128 have NEGATIVE t.
+    var sfp = sd_surface_new(256, 1);
+    var sfr = sd_surface_new(256, 1);
+    var sff = sd_surface_new(256, 1);
+    var gf = sd_gradient_linear(128 * SD_ONE, 0, 192 * SD_ONE, 0);
+    sd_gradient_add_stop(gf, 0, RED);
+    sd_gradient_add_stop(gf, SD_ONE, BLUE);
+    sd_canvas_blit_paint(row, sfp, gf);                                 # PAD (the default)
+    check(sd_gradient_set_spread(gf, SD_SPREAD_REPEAT), SADISH_OK);     #61
+    sd_canvas_blit_paint(row, sfr, gf);
+    check(sd_gradient_set_spread(gf, SD_SPREAD_REFLECT), SADISH_OK);    #62
+    sd_canvas_blit_paint(row, sff, gf);
+    var pad_bad = 0;
+    var rep_bad = 0;
+    var ref_mirror = 0;
+    var ref_period = 0;
+    x = 0;
+    while (x < 256) {
+        if (x < 128) {
+            if (sd_surface_pixel_at(sfp, x, 0) != RED) { pad_bad = pad_bad + 1; }
+        }
+        if (x >= 192) {
+            if (sd_surface_pixel_at(sfp, x, 0) != BLUE) { pad_bad = pad_bad + 1; }
+        }
+        if (x < 192) {
+            rep_bad = rep_bad + pt_ne(sfr, x, 0, x + 64, 0);            # period 1 in t = 64 px
+        }
+        ref_mirror = ref_mirror + pt_ne(sff, x, 0, 255 - x, 0);         # t <-> -t about p0
+        if (x < 128) {
+            ref_period = ref_period + pt_ne(sff, x, 0, x + 128, 0);     # period 2 in t = 128 px
+        }
+        x = x + 1;
+    }
+    check(pad_bad, 0);                                                  #63
+    check(rep_bad, 0);                                                  #64
+    check(ref_mirror, 0);                                               #65
+    check(ref_period, 0);                                               #66
+    var mir2 = 0;
+    k = 0;
+    while (k < 64) {
+        mir2 = mir2 + pt_ne(sff, 192 + k, 0, 191 - k, 0);               # t <-> 2 - t about p1
+        k = k + 1;
+    }
+    check(mir2, 0);                                                     #67
+    # Just before p0, t = -0.5/64: REPEAT reads fract = 1 - 1/128 (nearly blue); REFLECT reads
+    # +1/128 (nearly red), identical to the pixel just after p0. A truncating modulo would read red
+    # under REPEAT.
+    check(pt_near(sd_surface_pixel_at(sfr, 127, 0), 0, 0, 255, 4), 1);  #68
+    check(sd_surface_pixel_at(sff, 127, 0), sd_surface_pixel_at(sff, 128, 0));   #69
+    check(pt_near(sd_surface_pixel_at(sff, 127, 0), 255, 0, 0, 4), 1);  #70
+    # The three modes really differ at a negative t.
+    check(sd_surface_pixel_at(sfp, 100, 0) != sd_surface_pixel_at(sfr, 100, 0), 1);   #71
+    check(sd_surface_pixel_at(sfr, 100, 0) != sd_surface_pixel_at(sff, 100, 0), 1);   #72
+    # color_at applies spread to any t.
+    check(sd_gradient_color_at(gf, 0 - 16384), sd_gradient_color_at(gf, 16384));      #73 — REFLECT: -t
+    check(sd_gradient_color_at(gf, 81920), sd_gradient_color_at(gf, 49152));          #74 — 2 - t
+    check(sd_gradient_color_at(gf, 131072 + 100), sd_gradient_color_at(gf, 100));    #75 — period 2
+    check(sd_gradient_color_at(gf, 0 - 131072 * 5 + 100), sd_gradient_color_at(gf, 100));   #76
+    check(sd_gradient_color_at(gf, SD_ONE), 4278190335);                #77 — t = 1 is the last stop
+    sd_gradient_set_spread(gf, SD_SPREAD_REPEAT);
+    check(sd_gradient_color_at(gf, 0 - 16384), sd_gradient_color_at(gf, 49152));      #78 — fract(-0.25) = 0.75
+    check(sd_gradient_color_at(gf, 5 * SD_ONE + 100), sd_gradient_color_at(gf, 100)); #79
+    sd_gradient_set_spread(gf, SD_SPREAD_PAD);
+    check(sd_gradient_color_at(gf, 0 - 5 * SD_ONE), 4294901760);        #80 — PAD: red
+    check(sd_gradient_color_at(gf, 7 * SD_ONE), 4278190335);            #81 — PAD: blue
+    check(sd_gradient_set_spread(gf, 3), SADISH_ERR_BOUNDS);            #82
+    check(sd_gradient_set_spread(gf, 0 - 1), SADISH_ERR_BOUNDS);        #83
+    check(sd_gradient_color_at(gf, 0 - 5 * SD_ONE), 4294901760);        #84 — still PAD
+    # Radial REPEAT / REFLECT: centre (32, 32.5) px so row 32 has distance |x + 0.5 - 32| exactly;
+    # r = 8 px.
+    var cvr = pt_full(64, 64);
+    var srr = sd_surface_new(64, 64);
+    var srf = sd_surface_new(64, 64);
+    var gr = sd_gradient_radial(32 * SD_ONE, 32 * SD_ONE + HALF, 8 * SD_ONE);
+    sd_gradient_add_stop(gr, 0, RED);
+    sd_gradient_add_stop(gr, SD_ONE, BLUE);
+    sd_gradient_set_spread(gr, SD_SPREAD_REPEAT);
+    sd_canvas_blit_paint(cvr, srr, gr);
+    sd_gradient_set_spread(gr, SD_SPREAD_REFLECT);
+    sd_canvas_blit_paint(cvr, srf, gr);
+    var rr_bad = 0;
+    k = 0;
+    while (k < 16) {
+        rr_bad = rr_bad + pt_ne(srr, 32 + k, 32, 40 + k, 32);           # dist d and d + r
+        if (k < 8) {
+            rr_bad = rr_bad + pt_ne(srf, 32 + k, 32, 47 - k, 32);       # dist d and 2r - d
+        }
+        k = k + 1;
+    }
+    check(rr_bad, 0);                                                   #85
+    check(sd_surface_pixel_at(srr, 40, 32) != sd_surface_pixel_at(srr, 39, 32), 1);   #86 — REPEAT restarts
+    check(pt_near(sd_surface_pixel_at(srf, 39, 32), 0, 0, 255, 20), 1); #87 — REFLECT turns at blue
+    check(pt_near(sd_surface_pixel_at(srf, 40, 32), 0, 0, 255, 20), 1); #88
+
+    # ── G) STOP ALPHA × COVERAGE ──
+    var cvg = sd_canvas_new(4, 1);
+    var covg = sd_canvas_coverage(cvg);
+    store8(covg + 0, 255);
+    store8(covg + 1, 128);
+    store8(covg + 2, 0);
+    store8(covg + 3, 255);
+    var sg = sd_surface_new(4, 1);
+    sd_clear(sg, BLUE);
+    var gg = sd_gradient_linear(0, 0, SD_ONE, 0);
+    sd_gradient_add_stop(gg, 0, sd_rgba(255, 0, 0, 128));
+    sd_canvas_blit_paint(cvg, sg, gg);
+    check(sd_surface_pixel_at(sg, 0, 0), sd_rgb(128, 0, 127));          #89 — alpha 128 over blue
+    check(sd_surface_pixel_at(sg, 1, 0), sd_rgb(64, 0, 191));           #90 — coverage 128 x alpha 128 = 64
+    check(sd_surface_pixel_at(sg, 2, 0), BLUE);                         #91 — no coverage: untouched
+    check(load8(sd_surface_pixels(sg) + 4 + 3), 255);                   #92 — dst alpha opaque
+    sd_clear(sg, BLUE);
+    var gg1 = sd_gradient_linear(0, 0, SD_ONE, 0);
+    sd_gradient_add_stop(gg1, 0, sd_rgba(255, 0, 0, 1));
+    sd_canvas_blit_paint(cvg, sg, gg1);
+    check(sd_surface_pixel_at(sg, 0, 0), sd_rgb(1, 0, 254));            #93 — alpha 1 barely tints
+    check(sd_surface_pixel_at(sg, 1, 0), BLUE);                         #94 — 128 * 1 / 255 = 0: nothing
+    # interpolated alpha, straight: opaque white @0 -> alpha 1 @1
+    var ga2 = sd_gradient_linear(0, 0, SD_ONE, 0);
+    sd_gradient_add_stop(ga2, 0, sd_rgb(255, 255, 255));
+    sd_gradient_add_stop(ga2, SD_ONE, sd_rgba(255, 255, 255, 1));
+    check(sd_color_a(sd_gradient_color_at(ga2, 0)), 255);               #95 — the legacy 0 byte reads 255
+    check(sd_color_a(sd_gradient_color_at(ga2, SD_ONE)), 1);            #96
+    check(sd_color_a(sd_gradient_color_at(ga2, HALF)), 128);            #97 — (255 + 1) / 2
+    check(sd_gradient_color_at(ga2, HALF) & RGB_MASK, RGB_MASK);        #98 — straight: colour stays white
+    # red, opaque -> alpha 1, along the 256 px row over black: red channel IS the source alpha.
+    var sg2 = sd_surface_new(256, 1);
+    var ga3 = sd_gradient_linear(0, 0, 256 * SD_ONE, 0);
+    sd_gradient_add_stop(ga3, 0, RED);
+    sd_gradient_add_stop(ga3, SD_ONE, sd_rgba(255, 0, 0, 1));
+    sd_canvas_blit_paint(row, sg2, ga3);
+    check(sd_surface_pixel_at(sg2, 0, 0), RED);                         #99
+    check(sd_surface_pixel_at(sg2, 255, 0), sd_rgb(1, 0, 0));           #100
+    check(sd_surface_pixel_at(sg2, 128, 0), sd_rgb(128, 0, 0));         #101 — alpha (255*32640 + 32896 + 32768) >> 16
+    check(pt_monotone_violations(sg2, 256), 0);                         #102
+    # ⭐ An OPAQUE paint is sd_canvas_blit_at: a one-stop gradient and a same-colour two-stop gradient
+    # over partial coverage and a patterned dst produce identical bytes to the solid blit.
+    var so1 = sd_surface_new(256, 4);
+    var so2 = sd_surface_new(256, 4);
+    var so3 = sd_surface_new(256, 4);
+    memcpy(sd_surface_pixels(so1), sd_surface_pixels(sd1), 256 * 4 * 4);
+    memcpy(sd_surface_pixels(so2), sd_surface_pixels(sd1), 256 * 4 * 4);
+    memcpy(sd_surface_pixels(so3), sd_surface_pixels(sd1), 256 * 4 * 4);
+    var solid_c = sd_rgb(40, 200, 90);
+    sd_canvas_blit_at(cvd, so1, solid_c, 0, 0);
+    var g1s = sd_gradient_radial(10 * SD_ONE, 3 * SD_ONE, 50 * SD_ONE);
+    sd_gradient_add_stop(g1s, 30000, solid_c);
+    sd_canvas_blit_paint(cvd, so2, g1s);
+    var g2s = sd_gradient_linear(0, 0, 77 * SD_ONE, 5 * SD_ONE);
+    sd_gradient_add_stop(g2s, 0, solid_c);
+    sd_gradient_add_stop(g2s, SD_ONE, sd_rgba(40, 200, 90, 255));
+    sd_canvas_blit_paint(cvd, so3, g2s);
+    check(pt_diff(sd_surface_pixels(so1), sd_surface_pixels(so2), 256 * 4 * 4), 0);   #103
+    check(pt_diff(sd_surface_pixels(so1), sd_surface_pixels(so3), 256 * 4 * 4), 0);   #104
+    check(pt_diff(sd_surface_pixels(so1), sd_surface_pixels(sd1), 256 * 4 * 4) > 0, 1);   #105 — it painted
+
+    # ── H) DEGENERATE GEOMETRY, NO STOPS, BAD ARGUMENTS ──
+    var cvh = pt_full(16, 4);
+    var sh = sd_surface_new(16, 4);
+    var gh = sd_gradient_linear(10 * SD_ONE, 5 * SD_ONE, 10 * SD_ONE, 5 * SD_ONE);   # p0 == p1
+    sd_gradient_add_stop(gh, 0, RED);
+    sd_gradient_add_stop(gh, HALF, GREEN);
+    sd_gradient_add_stop(gh, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvh, sh, gh);
+    var nblue = 0;
+    y = 0;
+    while (y < 4) {
+        x = 0;
+        while (x < 16) {
+            if (sd_surface_pixel_at(sh, x, y) == BLUE) { nblue = nblue + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    check(nblue, 64);                                                   #106 — zero-length axis: the LAST stop
+    sd_gradient_set_spread(gh, SD_SPREAD_REPEAT);
+    sd_clear(sh, BLACK);
+    sd_canvas_blit_paint(cvh, sh, gh);
+    check(sd_surface_pixel_at(sh, 0, 0), BLUE);                         #107 — whatever the spread
+    # The 2^-8 px floor: an axis of 255 raw is degenerate, one of 256 raw is not.
+    var gth = sd_gradient_linear(8 * SD_ONE, 0, 8 * SD_ONE + 255, 0);
+    sd_gradient_add_stop(gth, 0, RED);
+    sd_gradient_add_stop(gth, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvh, sh, gth);
+    check(sd_surface_pixel_at(sh, 3, 0), BLUE);                         #108 — degenerate: last stop left of p0
+    var gtk = sd_gradient_linear(8 * SD_ONE, 0, 8 * SD_ONE + 256, 0);
+    sd_gradient_add_stop(gtk, 0, RED);
+    sd_gradient_add_stop(gtk, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvh, sh, gtk);
+    check(sd_surface_pixel_at(sh, 7, 0), RED);                          #109 — a real (tiny) axis: PAD red before p0
+    check(sd_surface_pixel_at(sh, 8, 0), BLUE);                         #110 — and blue past p1
+    var gr0 = sd_gradient_radial(8 * SD_ONE, 2 * SD_ONE, 0);
+    sd_gradient_add_stop(gr0, 0, RED);
+    sd_gradient_add_stop(gr0, SD_ONE, BLUE);
+    sd_clear(sh, BLACK);
+    sd_canvas_blit_paint(cvh, sh, gr0);
+    check(sd_surface_pixel_at(sh, 8, 2), BLUE);                         #111 — r == 0: last stop, even at the centre
+    var grn = sd_gradient_radial(8 * SD_ONE, 2 * SD_ONE, 0 - SD_ONE);
+    sd_gradient_add_stop(grn, 0, RED);
+    sd_gradient_add_stop(grn, SD_ONE, BLUE);
+    sd_clear(sh, BLACK);
+    sd_canvas_blit_paint(cvh, sh, grn);
+    check(sd_surface_pixel_at(sh, 8, 2), BLUE);                         #112 — r < 0 likewise
+    var gr1 = sd_gradient_radial(8 * SD_ONE, 2 * SD_ONE, 1);
+    sd_gradient_add_stop(gr1, 0, RED);
+    sd_gradient_add_stop(gr1, SD_ONE, BLUE);
+    sd_clear(sh, BLACK);
+    sd_canvas_blit_paint(cvh, sh, gr1);
+    check(sd_surface_pixel_at(sh, 8, 2), BLUE);                         #113 — r = 1 raw is real; centre 0.7 px past
+    # zero stops paint nothing
+    var g0 = sd_gradient_linear(0, 0, 16 * SD_ONE, 0);
+    sd_clear(sh, GREEN);
+    check(sd_canvas_blit_paint(cvh, sh, g0), SADISH_OK);                #114
+    check(sd_surface_pixel_at(sh, 5, 1), GREEN);                        #115
+    check(sd_gradient_color_at(g0, HALF), 0);                           #116
+    check(sd_gradient_stop_count(g0), 0);                               #117
+    # one stop is solid
+    sd_gradient_add_stop(g0, 12345, sd_rgb(9, 8, 7));
+    sd_canvas_blit_paint(cvh, sh, g0);
+    check(sd_surface_pixel_at(sh, 0, 0), sd_rgb(9, 8, 7));              #118
+    check(sd_surface_pixel_at(sh, 15, 3), sd_rgb(9, 8, 7));             #119
+    check(sd_gradient_color_at(g0, 0 - 99999), sd_gradient_color_at(g0, 99999));      #120
+    # bad arguments
+    check(sd_canvas_blit_paint(cvh, sh, 0), SADISH_ERR_BOUNDS);         #121
+    check(sd_canvas_blit_paint(0, sh, g0), SADISH_ERR_BOUNDS);          #122
+    check(sd_canvas_blit_paint(cvh, 0, g0), SADISH_ERR_BOUNDS);         #123
+    check(sd_gradient_add_stop(0, 0, RED), SADISH_ERR_BOUNDS);          #124
+    check(sd_gradient_set_spread(0, SD_SPREAD_PAD), SADISH_ERR_BOUNDS); #125
+    check(sd_gradient_color_at(0, 0), 0);                               #126
+
+    # ── I) sd_canvas_blit_paint_at: placement + clipping on every side ──
+    # An 8x8 canvas under a slanted linear paint (every pixel a different colour from its
+    # neighbours) and a reference blit at the origin. Edge-straddling placements on MID rows come
+    # first, so a mis-clipped column shows up wrapped into a neighbouring row before it can land
+    # outside the buffer.
+    var cvi = pt_full(8, 8);
+    var gi = sd_gradient_linear(0, 0, 9 * SD_ONE, 4 * SD_ONE);
+    sd_gradient_add_stop(gi, 0, RED);
+    sd_gradient_add_stop(gi, HALF, GREEN);
+    sd_gradient_add_stop(gi, SD_ONE, BLUE);
+    var refi = sd_surface_new(8, 8);
+    sd_canvas_blit_paint(cvi, refi, gi);
+    check(pt_ne(refi, 0, 0, 1, 0) + pt_ne(refi, 0, 0, 0, 1), 2);        #127 — the reference varies in x and y
+    var BG = sd_rgb(3, 3, 3);
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 5, 3, BG), 0);      #128 — fully inside
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 0 - 3, 4, BG), 0);  #129 — left edge, mid rows
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 12, 4, BG), 0);     #130 — right edge, mid rows
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 4, 0 - 5, BG), 0);  #131 — top edge
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 4, 13, BG), 0);     #132 — bottom edge
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 0 - 3, 0 - 3, BG), 0);   #133 — top-left corner
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 13, 13, BG), 0);    #134 — bottom-right corner
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 13, 0 - 6, BG), 0); #135 — top-right corner
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 0 - 7, 15, BG), 0); #136 — bottom-left, one pixel
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 16, 0, BG), 0);     #137 — just off the right
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 0, 0 - 8, BG), 0);  #138 — just off the top
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 100, 0 - 100, BG), 0);   #139
+    check(pt_placed_mismatches(cvi, gi, refi, 8, 8, 0 - 100, 100, BG), 0);   #140
+    # the same for a radial paint (the per-pixel sqrt path)
+    var gi2 = sd_gradient_radial(2 * SD_ONE, 6 * SD_ONE, 7 * SD_ONE);
+    sd_gradient_add_stop(gi2, 0, RED);
+    sd_gradient_add_stop(gi2, SD_ONE, BLUE);
+    var refi2 = sd_surface_new(8, 8);
+    sd_canvas_blit_paint(cvi, refi2, gi2);
+    check(pt_placed_mismatches(cvi, gi2, refi2, 8, 8, 0 - 2, 5, BG), 0);     #141
+    check(pt_placed_mismatches(cvi, gi2, refi2, 8, 8, 11, 0 - 1, BG), 0);    #142
+    var sI = sd_surface_new(16, 16);
+    check(sd_canvas_blit_paint_at(cvi, sI, gi, 0 - 50, 0 - 50), SADISH_OK);  #143 — fully off: still OK
+
+    # ── J) A WRAPPED SURFACE: stride != width*4 ──
+    # A 32-byte SdSurface header over a WIDER, TALLER buffer: 32 px pitch, 10 rows, an 8x8 window
+    # at column 4 of row 1. The buffer holds a byte pattern (so a blend reading the wrong row reads
+    # the wrong value), a pristine copy of it is kept, and a PACKED 8x8 reference surface holds the
+    # same pattern the window does. The paint is translucent so every pixel reads its destination.
+    var pitch = 32 * 4;
+    var nbuf = pitch * 10;
+    var buf = alloc(nbuf);
+    var pristine = alloc(nbuf);
+    i = 0;
+    while (i < nbuf) {
+        store8(buf + i, (i * 11 + 5) & 255);
+        i = i + 1;
+    }
+    memcpy(pristine, buf, nbuf);
+    var win = buf + pitch + 4 * 4;
+    var ws = alloc(32);
+    store64(ws + 0, 8);
+    store64(ws + 8, 8);
+    store64(ws + 16, win);
+    store64(ws + 24, pitch);
+    var refj = sd_surface_new(8, 8);
+    y = 0;
+    while (y < 8) {
+        memcpy(sd_surface_pixels(refj) + y * 32, win + y * pitch, 32);
+        y = y + 1;
+    }
+    var gj = sd_gradient_linear(0, 0, 8 * SD_ONE, 8 * SD_ONE);
+    sd_gradient_add_stop(gj, 0, sd_rgba(255, 0, 0, 200));
+    sd_gradient_add_stop(gj, SD_ONE, sd_rgba(0, 0, 255, 150));
+    var cvj = pt_full(8, 8);
+    store8(sd_canvas_coverage(cvj) + 2 * 8 + 3, 0);                     # one uncovered pixel: stays pattern
+    check(sd_surface_stride(ws), 128);                                  #144
+    check(sd_canvas_blit_paint_at(cvj, ws, gj, 1, 1), SADISH_OK);       #145
+    sd_canvas_blit_paint_at(cvj, refj, gj, 1, 1);
+    var jbad = 0;
+    var jpainted = 0;
+    var bo = 0;
+    while (bo < nbuf) {
+        var want = load8(pristine + bo);
+        var rowb = bo / pitch;
+        var colb = (bo % pitch) / 4;
+        var chan = bo % 4;
+        if (rowb >= 1) {
+            if (rowb < 9) {
+                if (colb >= 4) {
+                    if (colb < 12) {
+                        want = load8(sd_surface_pixels(refj) + ((rowb - 1) * 8 + (colb - 4)) * 4 + chan);
+                    }
+                }
+            }
+        }
+        if (load8(buf + bo) != want) { jbad = jbad + 1; }
+        if (load8(buf + bo) != load8(pristine + bo)) { jpainted = jpainted + 1; }
+        bo = bo + 1;
+    }
+    check(jbad, 0);                                                     #146 — window == packed ref; rest pristine
+    check(jpainted > 150, 1);                                           #147 — the comparison saw ink (48 px x ~3-4 B)
+    check(load8(win + pitch + 4 + 3), 255);                             #148 — window (1,1) alpha: row 1 at the pitch
+    check(load8(win + 32 + 4 + 3), load8(pristine + pitch + 16 + 32 + 4 + 3));   #149 — NOT at width*4
+    # canvas (3,2) is uncovered: window pixel (4,3) keeps all four pristine bytes
+    check(pt_diff(win + 3 * pitch + 4 * 4, pristine + pitch + 16 + 3 * pitch + 4 * 4, 4), 0);   #150
+
+    # ── K) THE PRECISION BOUND: 4096 px rows ──
+    var cvk = pt_full(4096, 1);
+    var sk = sd_surface_new(4096, 1);
+    var gk = sd_gradient_linear(0, 0, 4096 * SD_ONE, 0);
+    sd_gradient_add_stop(gk, 0, RED);
+    sd_gradient_add_stop(gk, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvk, sk, gk);
+    check(pt_monotone_violations(sk, 4096), 0);                         #151
+    check(pt_row_vs_color_at(sk, gk, 4096), 0);                         #152 — pixel x reads t16 = 16x + 8, all 4096
+    check(sd_surface_pixel_at(sk, 0, 0), RED);                          #153
+    check(pt_near(sd_surface_pixel_at(sk, 4095, 0), 0, 0, 255, 1), 1);  #154
+    # Near the bound: a 32,000 px axis starting 16,000 px LEFT of the canvas. t(x) = (x + 16000.5) /
+    # 32000 and the pixel must read EXACTLY its floor t16 (|d|^2 ~ 2^62: a remainder doubled naively
+    # would overflow). A dot product scaled by 2^16 would have overflowed long before this.
+    var gk2 = sd_gradient_linear(0 - 16000 * SD_ONE, 0, 16000 * SD_ONE, 0);
+    pt_zigzag(gk2);
+    sd_canvas_blit_paint(cvk, sk, gk2);
+    var kbad = 0;
+    x = 0;
+    while (x < 4096) {
+        var tref = ((2 * x + 32001) * 32768) / 32000;
+        if (sd_surface_pixel_at(sk, x, 0) != (sd_gradient_color_at(gk2, tref) & RGB_MASK)) { kbad = kbad + 1; }
+        x = x + 1;
+    }
+    check(kbad, 0);                                                     #155
+    var gk2m = sd_gradient_linear(0 - 16000 * SD_ONE, 0, 16000 * SD_ONE, 0);
+    sd_gradient_add_stop(gk2m, 0, RED);
+    sd_gradient_add_stop(gk2m, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvk, sk, gk2m);
+    check(pt_monotone_violations(sk, 4096), 0);                         #156
+    check(sd_surface_pixel_at(sk, 0, 0) != sd_surface_pixel_at(sk, 4095, 0), 1);   #157 — it moved (~32 levels)
+    # The same bound on a diagonal: (-16000, -16000) -> (16000, 16000), t(x, 0) = (x + 32001) / 64000;
+    # |d|^2 ~ 2^63 — the largest the bound allows.
+    var gk3 = sd_gradient_linear(0 - 16000 * SD_ONE, 0 - 16000 * SD_ONE, 16000 * SD_ONE, 16000 * SD_ONE);
+    pt_zigzag(gk3);
+    sd_canvas_blit_paint(cvk, sk, gk3);
+    kbad = 0;
+    x = 0;
+    while (x < 4096) {
+        var tref3 = ((x + 32001) * 65536) / 64000;
+        if (sd_surface_pixel_at(sk, x, 0) != (sd_gradient_color_at(gk3, tref3) & RGB_MASK)) { kbad = kbad + 1; }
+        x = x + 1;
+    }
+    check(kbad, 0);                                                     #158
+    # Radial near the bound: centre (-12000, 0.5) px, r = 16000 px; row 0 is 12000.5 .. 16095.5 px
+    # away (squares ~2^60). The distance is a perfect square so t16 is exact: (2x + 24001) * 32768 / 16000.
+    var gk4 = sd_gradient_radial(0 - 12000 * SD_ONE, HALF, 16000 * SD_ONE);
+    sd_gradient_add_stop(gk4, 0, RED);
+    sd_gradient_add_stop(gk4, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvk, sk, gk4);
+    kbad = 0;
+    var kpad = 0;
+    x = 0;
+    while (x < 4096) {
+        var tref4 = ((2 * x + 24001) * 32768) / 16000;
+        if (sd_surface_pixel_at(sk, x, 0) != (sd_gradient_color_at(gk4, tref4) & RGB_MASK)) { kbad = kbad + 1; }
+        if (x >= 4000) {
+            if (sd_surface_pixel_at(sk, x, 0) != BLUE) { kpad = kpad + 1; }
+        }
+        x = x + 1;
+    }
+    check(kbad, 0);                                                     #159
+    check(kpad, 0);                                                     #160 — x >= 3999.5 is past r: blue
+    check(sd_surface_pixel_at(sk, 3900, 0) != BLUE, 1);                 #161 — and inside it is not
+    check(pt_monotone_violations(sk, 4096), 0);                         #162
+
+    # ── L) ALLOCATION: gradients on the seam, blits allocate NOTHING ──
+    # Everything the blits below touch (canvases, surfaces) exists before any window opens.
+    var cvl = pt_full(32, 32);
+    var sl = sd_surface_new(32, 32);
+    g_arena = arena_new_growable(1048576);
+    check(g_arena != 0, 1);                                             #163
+    # L1 — construction under an arena hook: the object + stops + ramp land on the arena, exactly.
+    check(sd_alloc_set(&hook_alloc), 0);                                #164
+    var heap0 = alloc_used();
+    var ar0 = arena_used(g_arena);
+    var gl = sd_gradient_linear(0, 0, 32 * SD_ONE, 9 * SD_ONE);
+    sd_gradient_add_stop(gl, 0, RED);
+    sd_gradient_add_stop(gl, HALF, sd_rgba(0, 255, 0, 100));
+    sd_gradient_add_stop(gl, SD_ONE, BLUE);
+    # MEASURED 4,256 B: the 88 B object + 4 * 16 B of stops + 1025 * 4 B of ramp, 8-aligned to 4,104
+    check(arena_used(g_arena) - ar0, 88 + 64 + 4104);                   #165
+    check(alloc_used() - heap0, 0);                                     #166
+    var glr = sd_gradient_radial(16 * SD_ONE, 16 * SD_ONE, 12 * SD_ONE);
+    sd_gradient_add_stop(glr, 0, RED);
+    sd_gradient_add_stop(glr, 20000, GREEN);
+    sd_gradient_add_stop(glr, 40000, sd_rgba(0, 0, 255, 180));
+    ar0 = arena_used(g_arena);
+    sd_gradient_add_stop(glr, SD_ONE, BLUE);
+    check(arena_used(g_arena) - ar0, 0);                                #167 — the 4th stop fits
+    sd_gradient_add_stop(glr, 50000, GREEN);
+    check(arena_used(g_arena) - ar0, 8 * 16);                           #168 — the 5th doubles the block: 128 B
+    check(alloc_used() - heap0, 0);                                     #169
+    # L2 — the FIRST blit (ramp dirty) and every one after, still under the hook: 0 B on both.
+    ar0 = arena_used(g_arena);
+    heap0 = alloc_used();
+    check(sd_canvas_blit_paint_at(cvl, sl, gl, 3, 0 - 2), SADISH_OK);   #170
+    sd_canvas_blit_paint(cvl, sl, glr);
+    check(arena_used(g_arena) - ar0, 0);                                #171 — first blits: no ramp allocation
+    check(alloc_used() - heap0, 0);                                     #172
+    var sp = 0;
+    k = 0;
+    while (k < 12) {
+        sd_gradient_set_spread(gl, sp);
+        sd_gradient_set_spread(glr, sp);
+        sd_canvas_blit_paint_at(cvl, sl, gl, k, 0);
+        sd_canvas_blit_paint_at(cvl, sl, glr, 0, k);
+        sd_gradient_color_at(glr, k * 9999);
+        sp = sp + 1;
+        if (sp > SD_SPREAD_REFLECT) { sp = 0; }
+        k = k + 1;
+    }
+    sd_gradient_add_stop(gl, 7000, GREEN);                              # dirties the ramp; 4th stop, no growth
+    sd_canvas_blit_paint(cvl, sl, gl);                                  # rebuild in place
+    check(arena_used(g_arena) - ar0, 0);                                #173 — 24 blits + a rebuild: 0 B on the arena
+    check(alloc_used() - heap0, 0);                                     #174 — and 0 B on the heap
+    check(sd_alloc_set(0), &hook_alloc);                                #175
+    arena_reset(g_arena);                                               # gl / glr are dead from here
+    # L3 — no hook: construction costs the heap exactly the same 4,256 B, blits 0.
+    heap0 = alloc_used();
+    var gn = sd_gradient_radial(5 * SD_ONE, 5 * SD_ONE, 30 * SD_ONE);
+    check(alloc_used() - heap0, 4256);                                  #176
+    sd_gradient_add_stop(gn, 0, GREEN);
+    sd_gradient_add_stop(gn, SD_ONE, RED);
+    heap0 = alloc_used();
+    k = 0;
+    while (k < 10) {
+        sd_gradient_set_spread(gn, k % 3);
+        sd_canvas_blit_paint_at(cvl, sl, gn, k - 5, 5 - k);
+        k = k + 1;
+    }
+    check(alloc_used() - heap0, 0);                                     #177
+    check(sd_surface_pixel_at(sl, 5, 5) != 0, 1);                       #178 — the blits painted
+
+    # ── M) EXACT t ON AXES THAT ARE NOT A POWER OF TWO ──
+    # A pixel centre exactly ON a stop takes the later stop whatever the axis length: t * 2^32 carries
+    # its remainder, so it is never a hair low (a truncated per-pixel step read the cell below).
+    var cvm = pt_full(1024, 1);
+    var smm = sd_surface_new(1024, 1);
+    # (0,0) -> (7,0) px, red | blue at 0.5: pixel 3's centre, 3.5 px, is t = 0.5 exactly.
+    var gm1 = sd_gradient_linear(0, 0, 7 * SD_ONE, 0);
+    sd_gradient_add_stop(gm1, HALF, RED);
+    sd_gradient_add_stop(gm1, HALF, BLUE);
+    sd_canvas_blit_paint(cvm, smm, gm1);
+    check(sd_surface_pixel_at(smm, 3, 0), BLUE);                        #179
+    check(sd_surface_pixel_at(smm, 2, 0), RED);                         #180
+    # 0 -> 100 px, a hard stop at 0.125: pixel 12's centre, 12.5 px, is on it.
+    var gm2 = sd_gradient_linear(0, 0, 100 * SD_ONE, 0);
+    sd_gradient_add_stop(gm2, 0, RED);
+    sd_gradient_add_stop(gm2, 8192, RED);
+    sd_gradient_add_stop(gm2, 8192, BLUE);
+    sd_gradient_add_stop(gm2, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvm, smm, gm2);
+    check(sd_surface_pixel_at(smm, 12, 0), BLUE);                       #181
+    check(sd_surface_pixel_at(smm, 11, 0), RED);                        #182
+    # 0.5 -> 1000.5 px: pixel x has t = x / 1000 exactly. A hard stop at 0.5 flips at pixel 500 ...
+    var gm3 = sd_gradient_linear(HALF, 0, 1000 * SD_ONE + HALF, 0);
+    sd_gradient_add_stop(gm3, HALF, RED);
+    sd_gradient_add_stop(gm3, HALF, BLUE);
+    sd_canvas_blit_paint(cvm, smm, gm3);
+    check(sd_surface_pixel_at(smm, 500, 0), BLUE);                      #183
+    check(sd_surface_pixel_at(smm, 499, 0), RED);                       #184
+    # ... and with red@0, red@1, blue@1, pixel 1000 (t = 1 exactly) reads entry 1024 — blue — not 1023.
+    var gm4 = sd_gradient_linear(HALF, 0, 1000 * SD_ONE + HALF, 0);
+    sd_gradient_add_stop(gm4, 0, RED);
+    sd_gradient_add_stop(gm4, SD_ONE, RED);
+    sd_gradient_add_stop(gm4, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvm, smm, gm4);
+    check(sd_surface_pixel_at(smm, 1000, 0), BLUE);                     #185
+    check(sd_surface_pixel_at(smm, 999, 0), RED);                       #186
+    check(sd_gradient_color_at(gm4, SD_ONE) & RGB_MASK, BLUE);          #187
+    # REPEAT on 0.5 -> 100.5 px, red -> blue: pixel x has t = x / 100, so pixels 0, 100 ... 1000 sit
+    # on a seam (fract 0) and are exactly red; pixel 99 (t = 0.99) is nearly blue.
+    var gm5 = sd_gradient_linear(HALF, 0, 100 * SD_ONE + HALF, 0);
+    sd_gradient_add_stop(gm5, 0, RED);
+    sd_gradient_add_stop(gm5, SD_ONE, BLUE);
+    sd_gradient_set_spread(gm5, SD_SPREAD_REPEAT);
+    sd_canvas_blit_paint(cvm, smm, gm5);
+    var seams = 0;
+    var xm = 0;
+    while (xm <= 1000) {
+        if (sd_surface_pixel_at(smm, xm, 0) == RED) { seams = seams + 1; }
+        xm = xm + 100;
+    }
+    check(seams, 11);                                                   #188
+    check(pt_near(sd_surface_pixel_at(smm, 99, 0), 0, 0, 255, 4), 1);   #189
+    check(pt_near(sd_surface_pixel_at(smm, 101, 0), 255, 0, 0, 4), 1);  #190
+    # REFLECT: pixel 100 (t = 1) is blue, 200 (t = 2) red, and 101 (t = 1.01) mirrors 99 (t = 0.99).
+    sd_gradient_set_spread(gm5, SD_SPREAD_REFLECT);
+    sd_canvas_blit_paint(cvm, smm, gm5);
+    check(sd_surface_pixel_at(smm, 100, 0), BLUE);                      #191
+    check(sd_surface_pixel_at(smm, 200, 0), RED);                       #192
+    check(sd_surface_pixel_at(smm, 101, 0), sd_surface_pixel_at(smm, 99, 0));   #193
+    # Every pixel of that row against the exact floor t16, through a ramp whose neighbouring cells
+    # differ, under REPEAT and REFLECT; then a 3 px REPEAT axis over the 4096 px row.
+    var gm6 = sd_gradient_linear(HALF, 0, 100 * SD_ONE + HALF, 0);
+    pt_zigzag(gm6);
+    sd_gradient_set_spread(gm6, SD_SPREAD_REPEAT);
+    sd_canvas_blit_paint(cvm, smm, gm6);
+    check(pt_lin_ref_mismatches(smm, cvm, gm6, SD_SPREAD_REPEAT, 1024, 1, 128, 0, 25728, 0, 0), 0);    #194
+    sd_gradient_set_spread(gm6, SD_SPREAD_REFLECT);
+    sd_canvas_blit_paint(cvm, smm, gm6);
+    check(pt_lin_ref_mismatches(smm, cvm, gm6, SD_SPREAD_REFLECT, 1024, 1, 128, 0, 25728, 0, 0), 0);   #195
+    var gm7 = sd_gradient_linear(0, 0, 3 * SD_ONE, 0);
+    pt_zigzag(gm7);
+    sd_gradient_set_spread(gm7, SD_SPREAD_REPEAT);
+    sd_canvas_blit_paint(cvk, sk, gm7);
+    check(pt_lin_ref_mismatches(sk, cvk, gm7, SD_SPREAD_REPEAT, 4096, 1, 0, 0, 768, 0, 0), 0);         #196
+
+    # ── N) HARD STOPS AND BANDS NARROWER THAN A RAMP CELL: a 4096 px axis (one cell = 4 px) ──
+    # Pixel x has t16 = 16x + 8. A stop at 0.3 (19660) flips where 16x + 8 >= 19660: pixel 1229.
+    var gn1 = sd_gradient_linear(0, 0, 4096 * SD_ONE, 0);
+    sd_gradient_add_stop(gn1, 0, RED);
+    sd_gradient_add_stop(gn1, 19660, RED);
+    sd_gradient_add_stop(gn1, 19660, BLUE);
+    sd_gradient_add_stop(gn1, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvk, sk, gn1);
+    var nred = 0;
+    x = 0;
+    while (x < 4096) {
+        if (sd_surface_pixel_at(sk, x, 0) == RED) { nred = nred + 1; }
+        x = x + 1;
+    }
+    check(nred, 1229);                                                  #197
+    check(sd_surface_pixel_at(sk, 1229, 0), BLUE);                      #198
+    # A 3.5 px green band, 32770 .. 32826, wholly inside ramp cell 512 (32768 .. 32832): pixels
+    # 2048 .. 2051 (t16 32776 .. 32824) and no others.
+    var gn2 = sd_gradient_linear(0, 0, 4096 * SD_ONE, 0);
+    sd_gradient_add_stop(gn2, 0, RED);
+    sd_gradient_add_stop(gn2, 32770, RED);
+    sd_gradient_add_stop(gn2, 32770, GREEN);
+    sd_gradient_add_stop(gn2, 32826, GREEN);
+    sd_gradient_add_stop(gn2, 32826, BLUE);
+    sd_gradient_add_stop(gn2, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvk, sk, gn2);
+    var ngreen = 0;
+    x = 0;
+    while (x < 4096) {
+        if (sd_surface_pixel_at(sk, x, 0) == GREEN) { ngreen = ngreen + 1; }
+        x = x + 1;
+    }
+    check(ngreen, 4);                                                   #199
+    check(sd_surface_pixel_at(sk, 2048, 0), GREEN);                     #200
+    check(sd_surface_pixel_at(sk, 2051, 0), GREEN);                     #201
+    check(sd_surface_pixel_at(sk, 2047, 0), RED);                       #202
+    check(sd_surface_pixel_at(sk, 2052, 0), BLUE);                      #203
+    var nedge = 0;
+    if ((sd_gradient_color_at(gn2, 32769) & RGB_MASK) == RED) { nedge = nedge + 1; }
+    if ((sd_gradient_color_at(gn2, 32770) & RGB_MASK) == GREEN) { nedge = nedge + 1; }
+    if ((sd_gradient_color_at(gn2, 32825) & RGB_MASK) == GREEN) { nedge = nedge + 1; }
+    if ((sd_gradient_color_at(gn2, 32826) & RGB_MASK) == BLUE) { nedge = nedge + 1; }
+    check(nedge, 4);                                                    #204 — color_at: the same edges
+    # The same on radial paints, r = 4096 px, centre (0, 0.5) px: pixel (x, 0) is x + 0.5 px away.
+    var gn3 = sd_gradient_radial(0, HALF, 4096 * SD_ONE);
+    sd_gradient_add_stop(gn3, 0, RED);
+    sd_gradient_add_stop(gn3, 19660, RED);
+    sd_gradient_add_stop(gn3, 19660, BLUE);
+    sd_gradient_add_stop(gn3, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvk, sk, gn3);
+    nred = 0;
+    x = 0;
+    while (x < 4096) {
+        if (sd_surface_pixel_at(sk, x, 0) == RED) { nred = nred + 1; }
+        x = x + 1;
+    }
+    check(nred, 1229);                                                  #205
+    var gn4 = sd_gradient_radial(0, HALF, 4096 * SD_ONE);
+    sd_gradient_add_stop(gn4, 32826, GREEN);                            # out of order; each equal pair
+    sd_gradient_add_stop(gn4, 32826, BLUE);                             # keeps its insertion order
+    sd_gradient_add_stop(gn4, 32770, RED);
+    sd_gradient_add_stop(gn4, 32770, GREEN);
+    sd_gradient_add_stop(gn4, 0, RED);
+    sd_canvas_blit_paint(cvk, sk, gn4);
+    ngreen = 0;
+    x = 0;
+    while (x < 4096) {
+        if (sd_surface_pixel_at(sk, x, 0) == GREEN) { ngreen = ngreen + 1; }
+        x = x + 1;
+    }
+    check(ngreen, 4);                                                   #206 — out-of-order stops, too
+    check(sd_surface_pixel_at(sk, 2048, 0), GREEN);                     #207
+
+    # ── O) LINEAR vs THE EXACT REFERENCE: reversed axes, slanted axes whose p0.x != p0.y, every
+    # spread, checkerboard coverage (uncovered pixels must still step t, and stay untouched) ──
+    var so = sd_surface_new(256, 1);
+    var go1 = sd_gradient_linear(256 * SD_ONE, 0, 0, 0);
+    pt_zigzag(go1);
+    sd_canvas_blit_paint(row, so, go1);
+    # (256,0) -> (0,0) px, then (0,64) -> (0,0) px down a column.
+    check(pt_lin_ref_mismatches(so, row, go1, SD_SPREAD_PAD, 256, 1, 65536, 0, 0, 0, 0), 0);     #208
+    var cvo = pt_full(1, 64);
+    var so64 = sd_surface_new(1, 64);
+    var go2 = sd_gradient_linear(0, 64 * SD_ONE, 0, 0);
+    pt_zigzag(go2);
+    sd_canvas_blit_paint(cvo, so64, go2);
+    check(pt_lin_ref_mismatches(so64, cvo, go2, SD_SPREAD_PAD, 1, 64, 0, 16384, 0, 0, 0), 0);    #209
+    var cvc = sd_canvas_new(64, 24);
+    var covc = sd_canvas_coverage(cvc);
+    y = 0;
+    while (y < 24) {
+        x = 0;
+        while (x < 64) {
+            if (((x + y) & 1) == 0) { store8(covc + y * sd_canvas_stride(cvc) + x, 255); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    var ssl = sd_surface_new(64, 24);
+    # axis A (20.25, 3.75) -> (45.5, 13.125) px; axis B (50.125, 20.5) -> (21.75, 9.25) px — in 1/256 px.
+    var oax = 5184;
+    var oay = 960;
+    var obx = 11648;
+    var oby = 3360;
+    var oaxis = 0;
+    while (oaxis < 2) {
+        var ospread = 0;
+        while (ospread < 3) {
+            var gos = sd_gradient_linear(oax * 256, oay * 256, obx * 256, oby * 256);
+            pt_zigzag(gos);
+            sd_gradient_set_spread(gos, ospread);
+            sd_clear(ssl, BG);
+            sd_canvas_blit_paint(cvc, ssl, gos);
+            check(pt_lin_ref_mismatches(ssl, cvc, gos, ospread, 64, 24, oax, oay, obx, oby, BG), 0);   #210-#215
+            ospread = ospread + 1;
+        }
+        oax = 12832;
+        oay = 5248;
+        obx = 5568;
+        oby = 2368;
+        oaxis = oaxis + 1;
+    }
+
+    # ── P) EXACT t, PIXEL BY PIXEL: hard-stop brackets (pt_bracket) over random geometry ──
+    # Each case covers ONE canvas pixel of a 16x4 canvas, placed with a random clip, and pins its
+    # spread-mapped floor t16 from both sides, through the stop search and through the table.
+    var cvp = sd_canvas_new(16, 4);
+    var covp = sd_canvas_coverage(cvp);
+    var ssp = sd_surface_new(16, 4);
+    g_arena = arena_new_growable(1048576);
+    sd_alloc_set(&hook_alloc);
+    var pbad = 0;
+    var pcases = 0;
+    var pphase = 0;
+    while (pphase < 4) {
+        k = 0;
+        while (k < 300) {
+            var ppx = pt_rnd(16);
+            var ppy = pt_rnd(4);
+            var pdx = 0 - pt_rnd(ppx + 1);
+            var pdy = 0 - pt_rnd(ppy + 1);
+            memset(covp, 0, 16 * 4);
+            store8(covp + ppy * sd_canvas_stride(cvp) + ppx, 255);
+            g_gspread = k % 3;
+            var ptp = 0 - 1;
+            if (pphase == 0) {
+                # P1 linear, any raw coordinates within 32 px of the canvas, any direction.
+                g_glin = 1;
+                g_ga = pt_rnd(64 * SD_ONE) - 24 * SD_ONE;
+                g_gb = pt_rnd(64 * SD_ONE) - 30 * SD_ONE;
+                g_gc = pt_rnd(64 * SD_ONE) - 24 * SD_ONE;
+                g_gd = pt_rnd(64 * SD_ONE) - 30 * SD_ONE;
+                var ux1 = g_gc - g_ga;
+                var uy1 = g_gd - g_gb;
+                var l21 = ux1 * ux1 + uy1 * uy1;
+                if (l21 >= 65536) {
+                    var n1 = (((ppx << 16) + HALF - g_ga) * ux1 + ((ppy << 16) + HALF - g_gb) * uy1) * 65536;
+                    var t1 = pt_fdiv(n1, l21);
+                    var f1 = 0;
+                    if (n1 - t1 * l21 != 0) { f1 = 1; }
+                    ptp = pt_spread_ref(g_gspread, t1, f1);
+                }
+            }
+            if (pphase == 1) {
+                # P2 linear across the whole bound: coordinates anywhere in ±16,383 px, on a 1/256 px
+                # grid so the reference product fits (t is scale-free).
+                g_glin = 1;
+                g_ga = (pt_rnd(8388097) - 4194048) * 256;
+                g_gb = (pt_rnd(8388097) - 4194048) * 256;
+                g_gc = (pt_rnd(8388097) - 4194048) * 256;
+                g_gd = (pt_rnd(8388097) - 4194048) * 256;
+                var ux2 = (g_gc - g_ga) / 256;
+                var uy2 = (g_gd - g_gb) / 256;
+                var l22 = ux2 * ux2 + uy2 * uy2;
+                if (l22 >= 1) {
+                    var n2 = ((256 * ppx + 128 - g_ga / 256) * ux2 + (256 * ppy + 128 - g_gb / 256) * uy2) * 65536;
+                    var t2 = pt_fdiv(n2, l22);
+                    var f2 = 0;
+                    if (n2 - t2 * l22 != 0) { f2 = 1; }
+                    ptp = pt_spread_ref(g_gspread, t2, f2);
+                }
+            }
+            if (pphase >= 2) {
+                # P3 radial within 0.7 px of the pixel, r up to 4 px (the q + 1 correction is common);
+                # P4 radial with the centre anywhere in ±16,383 px and r up to 16,384 px.
+                g_glin = 0;
+                if (pphase == 2) {
+                    g_ga = (ppx << 16) + HALF + pt_rnd(64000) - 32000;
+                    g_gb = (ppy << 16) + HALF + pt_rnd(64000) - 32000;
+                    g_gc = pt_rnd(262144) + 1;
+                } else {
+                    g_ga = pt_rnd(2147352577) - 1073676288;
+                    g_gb = pt_rnd(2147352577) - 1073676288;
+                    g_gc = pt_rnd(65536) + 1;
+                    if ((k & 1) != 0) { g_gc = pt_rnd(1073741824) + 1; }
+                }
+                var exq = (ppx << 16) + HALF - g_ga;
+                var eyq = (ppy << 16) + HALF - g_gb;
+                var sq96 = pt_isqrt96(exq * exq + eyq * eyq);
+                var f3 = 0;
+                if (g_sqrt_rem != 0) { f3 = 1; }
+                if (sq96 % g_gc != 0) { f3 = 1; }
+                ptp = pt_spread_ref(g_gspread, sq96 / g_gc, f3);
+            }
+            if (ptp >= 0) {
+                pbad = pbad + pt_bracket(cvp, ssp, ptp, ppx, ppy, pdx, pdy);
+                pcases = pcases + 1;
+            }
+            k = k + 1;
+        }
+        pphase = pphase + 1;
+    }
+    check(pbad, 0);                                                     #216
+    check(pcases > 1180, 1);                                            #217 — nearly all 1,200 cases ran
+    check(sd_alloc_set(0), &hook_alloc);                                #218
+    arena_reset(g_arena);
+    # P5 _sd_paint_radial_t itself against the digit-by-digit root: t and its inexact flag, for d2 up
+    # to 2^63 and r from 1 raw to 2^31 — a quarter of the cases at d2 >= 2^60 with r <= 1 px, where
+    # the correction's 64-bit shortcut (lim >= 2^16) is the only thing between it and an overflow.
+    var rtbad = 0;
+    var rtcorr = 0;
+    var rtbig = 0;
+    k = 0;
+    while (k < 20000) {
+        var d2u = (pt_rnd(2147483647) << 32) | (pt_rnd(65536) << 16) | pt_rnd(65536);
+        var ru = pt_rnd(65536) + 1;
+        if ((k & 3) != 1) {
+            d2u = d2u >> pt_rnd(63);
+            if ((k & 2) != 0) { ru = (pt_rnd(2147483647) >> pt_rnd(31)) + 1; }
+        }
+        var tqu = _sd_paint_radial_t(d2u, ru);
+        var tfu = _sd_paint_rem;
+        var sref = pt_isqrt96(d2u);
+        var fref = 0;
+        if (g_sqrt_rem != 0) { fref = 1; }
+        if (sref % ru != 0) { fref = 1; }
+        if (tqu != sref / ru) { rtbad = rtbad + 1; }
+        if (tfu != fref) { rtbad = rtbad + 1; }
+        if (((sd_isqrt(d2u) << 16) / ru) != sref / ru) {
+            rtcorr = rtcorr + 1;
+            if (d2u >= 1152921504606846976) { rtbig = rtbig + 1; }
+        }
+        k = k + 1;
+    }
+    check(rtbad, 0);                                                    #219
+    check(rtcorr > 1000, 1);                                            #220 — the q + 1 answer is exercised ...
+    check(rtbig > 500, 1);                                              #221 — ... at d2 >= 2^60 too
+
+    # ── Q) DEGENERATE GEOMETRY WITH A HARD STOP AT 1: "the last stop" is entry 1024 — here blue —
+    # while entry 1023 is red ──
+    var cvq2 = pt_full(4, 4);
+    var sq2 = sd_surface_new(4, 4);
+    var gq1 = sd_gradient_linear(2 * SD_ONE, 2 * SD_ONE, 2 * SD_ONE, 2 * SD_ONE);
+    var gq2 = sd_gradient_radial(2 * SD_ONE, 2 * SD_ONE, 0);
+    var gq3 = sd_gradient_radial(2 * SD_ONE, 2 * SD_ONE, 0 - 3 * SD_ONE);
+    var qg = 0;
+    while (qg < 3) {
+        var gqq = gq1;
+        if (qg == 1) { gqq = gq2; }
+        if (qg == 2) { gqq = gq3; }
+        sd_gradient_add_stop(gqq, 0, RED);
+        sd_gradient_add_stop(gqq, SD_ONE, RED);
+        sd_gradient_add_stop(gqq, SD_ONE, BLUE);
+        sd_clear(sq2, BLACK);
+        sd_canvas_blit_paint(cvq2, sq2, gqq);
+        check(sd_surface_pixel_at(sq2, 2, 1), BLUE);                    #222-#224 — p0 == p1, r == 0, r < 0
+        qg = qg + 1;
+    }
+    check(sd_gradient_color_at(gq1, SD_ONE) & RGB_MASK, BLUE);          #225
+    check(sd_gradient_color_at(gq1, 7 * SD_ONE) & RGB_MASK, BLUE);      #226 — PAD past 1
+    check(sd_gradient_color_at(gq1, SD_ONE - 1) & RGB_MASK, RED);       #227 — and just below 1, red
+    sd_gradient_set_spread(gq1, SD_SPREAD_REPEAT);
+    sd_clear(sq2, BLACK);
+    sd_canvas_blit_paint(cvq2, sq2, gq1);
+    check(sd_surface_pixel_at(sq2, 0, 3), BLUE);                        #228 — whatever the spread
+
+    # ── R) THE BOUND ON ASYMMETRIC AXES (|ddy| ~ 2^31 raw, |ddx| ~ 2^30), exact at all 4096 px ──
+    # (0, -16383 px) -> (16383, 16383) px: pixel (x, 0) has e = (x + 0.5, 16383.5) px, d = (16383,
+    # 32766) px, so t = ((2x + 1) 16383 + 32767 * 32766) / (2 (16383^2 + 32766^2)).
+    var gr5 = sd_gradient_linear(0, 0 - 16383 * SD_ONE, 16383 * SD_ONE, 16383 * SD_ONE);
+    pt_zigzag(gr5);
+    sd_canvas_blit_paint(cvk, sk, gr5);
+    var rbad2 = 0;
+    x = 0;
+    while (x < 4096) {
+        var nh = (2 * x + 1) * 16383 + 32767 * 32766;
+        var tr5 = (nh * 32768) / (16383 * 16383 + 32766 * 32766);
+        if (sd_surface_pixel_at(sk, x, 0) != (sd_gradient_color_at(gr5, tr5) & RGB_MASK)) { rbad2 = rbad2 + 1; }
+        x = x + 1;
+    }
+    check(rbad2, 0);                                                    #229
+    # The widest axis the bound allows, (-16383, -16383) -> (16383, 16383) px: |d|^2 = 9.2223e18 raw,
+    # 0.01 % under 2^63. t(x, 0) = (x + 32767) / 65532.
+    var gr6 = sd_gradient_linear(0 - 16383 * SD_ONE, 0 - 16383 * SD_ONE, 16383 * SD_ONE, 16383 * SD_ONE);
+    pt_zigzag(gr6);
+    sd_canvas_blit_paint(cvk, sk, gr6);
+    rbad2 = 0;
+    x = 0;
+    while (x < 4096) {
+        var tr6 = ((x + 32767) * 65536) / 65532;
+        if (sd_surface_pixel_at(sk, x, 0) != (sd_gradient_color_at(gr6, tr6) & RGB_MASK)) { rbad2 = rbad2 + 1; }
+        x = x + 1;
+    }
+    check(rbad2, 0);                                                    #230
+
+    # ── S) COVERAGE != 0 IS WRITTEN even when coverage x alpha rounds to 0: dst alpha 255, colour
+    # bytes unchanged — exactly what sd_canvas_blit_at's blend does for any covered pixel ──
+    var cvs = sd_canvas_new(2, 1);
+    store8(sd_canvas_coverage(cvs), 128);
+    var sss = sd_surface_new(2, 1);
+    store32(sd_surface_pixels(sss), 305419896);                         # 0x12345678: alpha byte 0x12
+    store32(sd_surface_pixels(sss) + 4, 305419896);
+    var gs = sd_gradient_radial(0, 0, SD_ONE);
+    sd_gradient_add_stop(gs, 0, sd_rgba(200, 10, 10, 1));               # 128 * 1 / 255 = 0
+    sd_canvas_blit_paint(cvs, sss, gs);
+    check(load32(sd_surface_pixels(sss)), 4281620088);                  #231 — 0xFF345678
+    check(load32(sd_surface_pixels(sss) + 4), 305419896);               #232 — coverage 0: untouched
+
+    # ── T) THE LONG DIVISION NEAR 2^63: a remainder close to b must never be doubled ──
+    var bT = 9223372036854775000;
+    check(_sd_paint_divq(bT - 1, bT, 3), 7);                            #233 — floor(8 (b - 1) / b)
+    check(_sd_paint_rem, bT - 8);                                       #234
+    check(_sd_paint_divq(1 - bT, bT, 3), 0 - 8);                        #235 — floor, not truncation
+    check(_sd_paint_rem, 8);                                            #236
+
+    # ── U) THE SPREAD HELPER AT ITS BOUNDARIES (floor in, floor out; frac = a fraction was dropped) ──
+    # REFLECT mirrors through the ceiling: t in (1, 1 + 2^-16) reads 65535, t = 1 exactly 65536,
+    # t in (2 - 2^-16, 2) reads 0, and t just below 1 stays 65535. Random sweeps land here ~1 in 65536.
+    var ubad = 0;
+    if (_sd_gradient_spread(SD_SPREAD_REFLECT, 65536, 0, 65536) != 65536) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_REFLECT, 65536, 1, 65536) != 65535) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_REFLECT, 65535, 1, 65536) != 65535) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_REFLECT, 65537, 0, 65536) != 65535) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_REFLECT, 65537, 1, 65536) != 65534) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_REFLECT, 131071, 1, 65536) != 0) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_REFLECT, 131071, 0, 65536) != 1) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_REFLECT, 0 - 1, 1, 65536) != 0) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_REPEAT, 0 - 1, 1, 65536) != 65535) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_PAD, 65536, 1, 65536) != 65536) { ubad = ubad + 1; }
+    if (_sd_gradient_spread(SD_SPREAD_REFLECT, 4294967296, 1, 4294967296) != 4294967295) { ubad = ubad + 1; }
+    check(ubad, 0);                                                     #237
+    # ... and a blit pixel whose t is a hair above 1 under REFLECT reads the parameter just BELOW 1: a
+    # radial with r = 65535 raw centred on pixel (0, 0); pixel (1, 0) is 65536 raw away, so
+    # t * 2^16 = 65537.00002 — floor 65537 with a fraction, mirrored to floor(65534.99998) = 65534.
+    var cvu = pt_full(2, 1);
+    var su = sd_surface_new(2, 1);
+    var gu = sd_gradient_radial(HALF, HALF, 65535);
+    sd_gradient_add_stop(gu, 0, RED);
+    sd_gradient_add_stop(gu, 65534, RED);
+    sd_gradient_add_stop(gu, 65535, BLUE);
+    sd_gradient_add_stop(gu, SD_ONE, BLUE);
+    sd_gradient_set_spread(gu, SD_SPREAD_REFLECT);
+    sd_canvas_blit_paint(cvu, su, gu);
+    check(sd_surface_pixel_at(su, 1, 0), RED);                          #238 — 65534: before the 65535 stop
+    # The same for LINEAR, where the fraction hides below 2^-32: p0 = (0.5, 0) px, p1 131,073 raw
+    # further (2.0000153 px). Pixel 4 has t * 2^16 = 131071.0000076 (t * 2^32 = 8589869056 plus a
+    # fraction); REFLECT gives t' * 2^16 = 0.99999 -> 0, where mirroring the floor would say 1.
+    # Pixel 3 of a 135,421 raw axis: t' * 2^16 = 35924.99999 -> 35924, not 35925.
+    var gu2 = sd_gradient_linear(HALF, 0, HALF + 131073, 0);
+    sd_gradient_add_stop(gu2, 1, RED);
+    sd_gradient_add_stop(gu2, 1, BLUE);
+    sd_gradient_set_spread(gu2, SD_SPREAD_REFLECT);
+    var su2 = sd_surface_new(8, 1);
+    var cvu2 = pt_full(8, 1);
+    sd_canvas_blit_paint(cvu2, su2, gu2);
+    check(sd_surface_pixel_at(su2, 4, 0), RED);                         #239
+    var gu3 = sd_gradient_linear(HALF, 0, HALF + 135421, 0);
+    sd_gradient_add_stop(gu3, 35925, RED);
+    sd_gradient_add_stop(gu3, 35925, BLUE);
+    sd_gradient_set_spread(gu3, SD_SPREAD_REFLECT);
+    sd_canvas_blit_paint(cvu2, su2, gu3);
+    check(sd_surface_pixel_at(su2, 3, 0), RED);                         #240
+    # _sd_paint_radial_t where the fraction bits are hardest: m = 2s (the quotient is 65536) at the
+    # smallest large-path d2, both sides of 2^31, and d2 near s^2 + 2s just above 2^29 — where a large
+    # path started too early (s < 32,768) would be off by two. References from Python's math.isqrt.
+    var rtb = 0;
+    if (_sd_paint_radial_t(2147488280, 1) != 3037003775) { rtb = rtb + 1; }   # 46340^2 + 2 * 46340
+    if (_sd_paint_radial_t(2147483647, 1) != 3037000499) { rtb = rtb + 1; }   # 2^31 - 1: small path
+    if (_sd_paint_radial_t(2147483648, 1) != 3037000499) { rtb = rtb + 1; }   # 2^31: large path
+    if (_sd_paint_radial_t(2147488281, 1) != 3037003776) { rtb = rtb + 1; }   # 46341^2
+    if (_sd_paint_radial_t(536895240, 1) != 1518534654) { rtb = rtb + 1; }
+    if (_sd_paint_radial_t(536895202, 1) != pt_isqrt96(536895202)) { rtb = rtb + 1; }
+    check(rtb, 0);                                                      #241
+
+    # ── V) THE ROW STEP CARRIES TOO, AND THE TABLE IS STILL THE FAST PATH ──
+    # Down a 1x1024 column: (0, 0.5) -> (0, 1000.5) px puts row y at t = y / 1000 exactly, so a missed
+    # remainder carry between rows (each row is its own start value) reads the cell below.
+    var cvv = pt_full(1, 1024);
+    var sv2 = sd_surface_new(1, 1024);
+    var gv1 = sd_gradient_linear(0, HALF, 0, 1000 * SD_ONE + HALF);
+    sd_gradient_add_stop(gv1, HALF, RED);
+    sd_gradient_add_stop(gv1, HALF, BLUE);
+    sd_canvas_blit_paint(cvv, sv2, gv1);
+    check(sd_surface_pixel_at(sv2, 0, 500), BLUE);                      #242
+    check(sd_surface_pixel_at(sv2, 0, 499), RED);                       #243
+    var gv2 = sd_gradient_linear(0, HALF, 0, 1000 * SD_ONE + HALF);
+    sd_gradient_add_stop(gv2, 0, RED);
+    sd_gradient_add_stop(gv2, SD_ONE, RED);
+    sd_gradient_add_stop(gv2, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvv, sv2, gv2);
+    check(sd_surface_pixel_at(sv2, 0, 1000), BLUE);                     #244
+    var gv3 = sd_gradient_linear(0, HALF, 0, 100 * SD_ONE + HALF);
+    sd_gradient_add_stop(gv3, 0, RED);
+    sd_gradient_add_stop(gv3, SD_ONE, BLUE);
+    sd_gradient_set_spread(gv3, SD_SPREAD_REPEAT);
+    sd_canvas_blit_paint(cvv, sv2, gv3);
+    seams = 0;
+    y = 0;
+    while (y <= 1000) {
+        if (sd_surface_pixel_at(sv2, 0, y) == RED) { seams = seams + 1; }
+        y = y + 100;
+    }
+    check(seams, 11);                                                   #245
+    var gv4 = sd_gradient_linear(0, HALF, 0, 100 * SD_ONE + HALF);
+    pt_zigzag(gv4);
+    sd_gradient_set_spread(gv4, SD_SPREAD_REFLECT);
+    sd_canvas_blit_paint(cvv, sv2, gv4);
+    check(pt_lin_ref_mismatches(sv2, cvv, gv4, SD_SPREAD_REFLECT, 1, 1024, 0, 128, 0, 25728, 0), 0);   #246
+    # A cell with no stop strictly INSIDE reads its table entry — the colour at its left edge — even
+    # with a stop on its right edge: red@32640 -> blue@32768 spans cells 510 and 511, and t = 32767
+    # reads entry 511, the colour at 32704 = (128, 0, 128), not the exact (2, 0, 253).
+    var gv5 = sd_gradient_linear(0, 0, SD_ONE, 0);
+    sd_gradient_add_stop(gv5, 0, RED);
+    sd_gradient_add_stop(gv5, 32640, RED);
+    sd_gradient_add_stop(gv5, 32768, BLUE);
+    sd_gradient_add_stop(gv5, SD_ONE, BLUE);
+    check(sd_gradient_color_at(gv5, 32767) & RGB_MASK, sd_rgb(128, 0, 128));   #247
+    # ... while a LONE first stop inside a cell marks it: red@100 -> blue@164, and t = 127 is the exact
+    # (147, 0, 108), not the colour at the cell's left edge (red, before every stop).
+    var gv6 = sd_gradient_linear(0, 0, SD_ONE, 0);
+    sd_gradient_add_stop(gv6, 164, BLUE);
+    sd_gradient_add_stop(gv6, 100, RED);
+    check(sd_gradient_color_at(gv6, 127) & RGB_MASK, sd_rgb(147, 0, 108));     #248
+
+    if (g_fails == 0) {
+        var ok = "paint_test: PASS (linear/radial, stops, spread, alpha, clip + stride, 4096 px, 0 B blits)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "paint_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

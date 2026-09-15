@@ -15,20 +15,35 @@
 var SD_FILL_EVEN_ODD = 0;
 var SD_FILL_NONZERO  = 1;
 
+# ---- coverage engines -------------------------------------------
+# SD_AA_SUBSCANLINE — the 0.4.0 engine: analytic in x, 4 sub-scanlines in y. THE DEFAULT, and
+#   byte-identical forever: agnos's GPU rasteriser (tests/gpu/refagree.cyr) is gated on it.
+# SD_AA_AREA — exact in both axes (signed-area cell accumulation, src/coverage.cyr). Opt-in per
+#   canvas with sd_canvas_set_aa.
+var SD_AA_SUBSCANLINE = 0;
+var SD_AA_AREA        = 1;
+
 # ================================================================
-# SdCanvas (40 bytes):
+# SdCanvas (48 bytes):
 #   +0:  width      (i64 — pixels)
 #   +8:  height     (i64 — pixels)
 #   +16: coverage   (ptr — owned width*height bytes, one coverage per px)
 #   +24: stride     (i64 — bytes per row; == width for the packed buffer)
 #   +32: clip       (ptr — top SdClip node, or 0 = unclipped)
+#   +40: aa         (i64 — coverage engine, SD_AA_SUBSCANLINE | SD_AA_AREA)
+# ⚠ The canvas was 40 bytes through 0.5.5. Nothing in dhancha, rekha or agnos builds one by hand
+# (checked by grep) — sd_canvas_new is the only constructor. But every canvas — and the temp mask
+# canvas behind each sd_canvas_clip_push_path — now costs 8 B more on sd_alloc, which moves exact
+# figures consumers have MEASURED (dhancha's text_arena_test, same checks passing: a 12-label frame
+# 417,056 -> 417,144 B, its 64 KiB-arena spill 351,520 -> 351,608 B).
 # ================================================================
 var SD_CANVAS_WIDTH_OFFSET    = 0;
 var SD_CANVAS_HEIGHT_OFFSET   = 8;
 var SD_CANVAS_COVERAGE_OFFSET = 16;
 var SD_CANVAS_STRIDE_OFFSET   = 24;
 var SD_CANVAS_CLIP_OFFSET     = 32;
-var SD_CANVAS_SIZE            = 40;
+var SD_CANVAS_AA_OFFSET       = 40;
+var SD_CANVAS_SIZE            = 48;
 
 # @public — allocate a w*h canvas with a zeroed coverage buffer.
 # Returns the SdCanvas ptr, or 0 on OOM / bad dimensions.
@@ -51,6 +66,7 @@ fn sd_canvas_new(w, h): i64 {
     store64(cv + SD_CANVAS_COVERAGE_OFFSET, cov);
     store64(cv + SD_CANVAS_STRIDE_OFFSET, w);
     store64(cv + SD_CANVAS_CLIP_OFFSET, 0);
+    store64(cv + SD_CANVAS_AA_OFFSET, SD_AA_SUBSCANLINE);
     return cv;
 }
 
@@ -63,6 +79,22 @@ fn sd_canvas_height(cv): i64   { return load64(cv + SD_CANVAS_HEIGHT_OFFSET); }
 fn sd_canvas_coverage(cv): i64 { return load64(cv + SD_CANVAS_COVERAGE_OFFSET); }
 # @public
 fn sd_canvas_stride(cv): i64   { return load64(cv + SD_CANVAS_STRIDE_OFFSET); }
+# @public — the canvas's coverage engine (SD_AA_SUBSCANLINE unless sd_canvas_set_aa changed it).
+fn sd_canvas_aa(cv): i64       { return load64(cv + SD_CANVAS_AA_OFFSET); }
+
+# @public — choose the coverage engine every fill into `cv` uses: sd_canvas_fill_path,
+# sd_canvas_fill_union (and so sd_canvas_stroke_path), and the mask sd_canvas_clip_push_path
+# builds. SD_AA_SUBSCANLINE (the default) or SD_AA_AREA. Coverage already in the buffer is not
+# touched. Returns SADISH_OK, or SADISH_ERR_BOUNDS for a null canvas or an unknown mode (the
+# canvas is left unchanged).
+fn sd_canvas_set_aa(cv, mode): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (mode != SD_AA_SUBSCANLINE) {
+        if (mode != SD_AA_AREA) { return SADISH_ERR_BOUNDS; }
+    }
+    store64(cv + SD_CANVAS_AA_OFFSET, mode);
+    return SADISH_OK;
+}
 
 # Coverage of one pixel (0 if out of bounds).
 fn sd_canvas_coverage_at(cv, x, y): i64 {
@@ -134,6 +166,9 @@ var _sd_fill_accrow_cap = 0;   # pixels the current accrow block can hold
 var _sd_stroke_run = 0;        # SD_FLATTEN_CAP * 8 — the stroker's polyline run
 var _sd_stroke_fbuf = 0;       # SD_FLATTEN_CAP * 8 — the stroker's OWN flatten output
 var _sd_stroke_fctx = 0;       # the stroker's OWN flatten ctx (24 B)
+# ⚠ The SD_AA_AREA engine's accumulator (_sd_area_acc, (w+1)*8) is the same kind of scratch but
+# lives with its engine in src/coverage.cyr, allocated on the first AREA fill — NOT here, so a
+# process that never opts in pays nothing and the first-fill figures below stay exact.
 
 # Allocate the fixed-capacity scratch once (idempotent). Called at the top of sd_fill_impl and
 # sd_canvas_stroke_path; a second call is one load + compare. MEASURED one-time cost: 589,896 B
@@ -168,8 +203,8 @@ fn _sd_fill_accrow_for(w): i64 {
 # Vertical sub-scanlines per pixel row. Coverage is ANALYTIC in x (exact
 # horizontal span overlap per sub-scanline) and sampled in y at SD_FILL_SS
 # sub-scanlines — smoother AND far cheaper than the old SS*SS point sampling
-# (edge crossings are computed per row, not per pixel).
-# TODO(v0.5): full 2-axis analytic signed-area cell accumulation.
+# (edge crossings are computed per row, not per pixel). This is the SD_AA_SUBSCANLINE engine and
+# stays the default; full 2-axis signed-area accumulation is SD_AA_AREA (src/coverage.cyr).
 var SD_FILL_SS = 4;
 
 # Edge builder ctx: +0 edges(ptr, 4 i64/edge: ax,ay,bx,by)  +8 count  +16 cap.
@@ -382,6 +417,29 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     var edges = load64(ectx + 0);
     if (n_edges == 0) { return SADISH_OK; }
 
+    # ---- SD_AA_AREA: exact 2-axis coverage (src/coverage.cyr), opt-in per canvas ----
+    # ⛔ Only a canvas holding exactly SD_AA_AREA branches here; every other value runs the 0.4.0
+    # loop below, untouched — the bytes agnos's refagree oracle is gated on.
+    # ⛔ AND ONLY WHEN THE EDGE LIST CAN BE WHOLE. sd_edge_add drops edges silently once the list
+    # holds ecap, leaving a contour OPEN. The loop below paints nothing right of a row's last
+    # crossing, so an open contour costs it the shape and no more; the area engine's running sum
+    # would stay non-zero to the canvas's right edge — a streak (MEASURED, 80x40, a triangle losing
+    # its closing edge: 28 of 40 rows lit at x = 79, 255 at (60, 20)). A full list cannot tell
+    # "exactly ecap" from "truncated", so an AREA fill that reaches ecap edges runs the loop below
+    # instead (programs/area_test.cyr group N pins both sides of the bound) — ⚠ at that loop's
+    # cost, which near the cap is steep (MEASURED 256x256, 8,000 edges: 10.9 s a fill, against the
+    # area engine's 41 ms).
+    if (load64(cv + SD_CANVAS_AA_OFFSET) == SD_AA_AREA) {
+        if (n_edges < ecap) {
+            var nonzero = 0;
+            if (rule == SD_FILL_NONZERO) { nonzero = 1; }
+            var mask = 0;
+            var clipn = load64(cv + SD_CANVAS_CLIP_OFFSET);
+            if (clipn != 0) { mask = load64(clipn + 0); }
+            return _sd_area_fill(edges, n_edges, w, h, cov, stride, mask, nonzero, combine);
+        }
+    }
+
     # ---- analytic-horizontal coverage, SD_FILL_SS vertical sub-scanlines ----
     var want_signed = 0;
     if (rule == SD_FILL_NONZERO) { want_signed = 1; }
@@ -507,8 +565,8 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
 # and one row's worth of shear per row on a wrapped one. Same src-over math
 # as before, verbatim; only the addressing changed.
 #
-# TODO(v0.4): a gradient paint (linear / radial) variant alongside the solid
-# path, and a whole-canvas fast path routed through the AGNOS blit#39.
+# Gradient paint (linear / radial, multi-stop) is sd_canvas_blit_paint_at in src/paint.cyr (0.6.0).
+# TODO: a whole-canvas fast path routed through the AGNOS blit#39.
 # ================================================================
 # @public
 fn sd_canvas_blit_at(cv, surface, color, dx, dy): i64 {
@@ -581,7 +639,8 @@ fn sd_canvas_blit(cv, surface, color): i64 {
 # pixel's color is c0..c1 lerped by its projection onto the axis (clamped to
 # the endpoints), then src-over with coverage. Colors 0x00RRGGBB; endpoints in
 # whole pixels. A degenerate axis (x0,y0 == x1,y1) paints solid c0.
-# TODO(v0.4+): radial gradient + multi-stop.
+# ⚠ Kept byte-identical for existing callers. Radial + multi-stop + spread, sampled at pixel
+# CENTRES with 16.16 endpoints, is the SdGradient paint in src/paint.cyr (0.6.0).
 # ================================================================
 # @public
 fn sd_canvas_blit_gradient(cv, surface, x0, y0, c0, x1, y1, c1): i64 {
@@ -594,6 +653,7 @@ fn sd_canvas_blit_gradient(cv, surface, x0, y0, c0, x1, y1, c1): i64 {
     var sw = sd_surface_width(surface);
     var sh = sd_surface_height(surface);
     var spx = sd_surface_pixels(surface);
+    var pitch = sd_surface_stride(surface);   # ⚠ row pitch in bytes, not sw*4 (see sd_canvas_blit_at)
 
     var dx = x1 - x0;
     var dy = y1 - y0;
@@ -627,7 +687,7 @@ fn sd_canvas_blit_gradient(cv, surface, x0, y0, c0, x1, y1, c1): i64 {
                     sg = g0 + ((g1 - g0) * tn) / td;
                     sb = b0 + ((b1 - b0) * tn) / td;
                 }
-                var off = (y * sw + x) * 4;
+                var off = y * pitch + x * 4;
                 if (a == 255) {
                     store8(spx + off, sb);
                     store8(spx + off + 1, sg);
@@ -648,172 +708,6 @@ fn sd_canvas_blit_gradient(cv, surface, x0, y0, c0, x1, y1, c1): i64 {
         }
         y = y + 1;
     }
-    return SADISH_OK;
-}
-
-# ---- stroking (v0.4.0) -----------------------------------------
-# A segment's rectangle: offset both endpoints by `hw` along the segment's
-# perpendicular (magnitude via sd_isqrt), fill-union it. Round caps + round
-# joins come from a disc at every vertex, so no bevel/miter math is needed.
-# Each piece is MAX-unioned so overlaps combine regardless of winding.
-fn sd_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
-    var dx = bx - ax;
-    var dy = by - ay;
-    var len2 = dx * dx + dy * dy;
-    if (len2 == 0) { return 0; }     # zero-length -> the vertex disc covers it
-    var l = sd_isqrt(len2);          # length in 16.16
-    if (l == 0) { return 0; }
-    var ox = ((0 - dy) * hw) / l;    # perpendicular offset, magnitude hw
-    var oy = (dx * hw) / l;
-    var rp = sd_path_new();
-    sd_path_moveto(rp, ax + ox, ay + oy);
-    sd_path_lineto(rp, bx + ox, by + oy);
-    sd_path_lineto(rp, bx - ox, by - oy);
-    sd_path_lineto(rp, ax - ox, ay - oy);
-    sd_path_close(rp);
-    sd_canvas_fill_union(cv, rp, SD_FILL_NONZERO);
-    return 0;
-}
-
-# A radius-hw disc (16-gon) at (cx, cy) — round cap / round join filler.
-fn sd_stroke_disc(cv, cx, cy, hw): i64 {
-    var dp = sd_path_new();
-    var step = 411775 / 16;          # 2*pi / 16 in 16.16
-    var k = 0;
-    while (k < 16) {
-        var ang = k * step;
-        var px = cx + sd_fixed_mul(hw, sd_cos(ang));
-        var py = cy + sd_fixed_mul(hw, sd_sin(ang));
-        if (k == 0) { sd_path_moveto(dp, px, py); } else { sd_path_lineto(dp, px, py); }
-        k = k + 1;
-    }
-    sd_path_close(dp);
-    sd_canvas_fill_union(cv, dp, SD_FILL_NONZERO);
-    return 0;
-}
-
-# Append a flatten ctx's points to the run buffer (bounded by SD_FLATTEN_CAP).
-fn sd_stroke_append(run, run_n, fctx): i64 {
-    var pts = load64(fctx + 0);
-    var n = load64(fctx + 8);
-    var i = 0;
-    while (i < n) {
-        if (run_n < SD_FLATTEN_CAP) {
-            store64(run + run_n * 8, load64(pts + i * 8));
-            run_n = run_n + 1;
-        }
-        i = i + 1;
-    }
-    return run_n;
-}
-
-# Stroke one flattened subpath run: a rect per segment + a disc per vertex.
-fn sd_stroke_run(cv, run, n, closed, hw): i64 {
-    var i = 0;
-    while (i < n - 1) {
-        var a = load64(run + i * 8);
-        var b = load64(run + (i + 1) * 8);
-        sd_stroke_seg(cv, sd_point_x(a), sd_point_y(a), sd_point_x(b), sd_point_y(b), hw);
-        i = i + 1;
-    }
-    if (closed != 0) {
-        if (n > 1) {
-            var a2 = load64(run + (n - 1) * 8);
-            var b2 = load64(run + 0);
-            sd_stroke_seg(cv, sd_point_x(a2), sd_point_y(a2), sd_point_x(b2), sd_point_y(b2), hw);
-        }
-    }
-    var k = 0;
-    while (k < n) {
-        var v = load64(run + k * 8);
-        sd_stroke_disc(cv, sd_point_x(v), sd_point_y(v), hw);
-        k = k + 1;
-    }
-    return 0;
-}
-
-# ================================================================
-# sd_canvas_stroke_path — stroke `path` with the given `width` (16.16) onto
-# `cv`'s coverage, with round caps + round joins. Flattens curves, then per
-# subpath draws a rectangle per segment and a disc per vertex, MAX-combined
-# into the coverage buffer.
-#
-# TODO(v0.5): miter/bevel joins + butt/square caps; batch the pieces — this
-# still allocs a PATH (on the seam) + runs a fill pass per segment/vertex
-# (correctness-first); the fixed scratch underneath is process-lifetime (0.5.5).
-# ================================================================
-# @public
-fn sd_canvas_stroke_path(cv, path, width): i64 {
-    if (cv == 0) { return SADISH_ERR_BOUNDS; }
-    if (path == 0) { return SADISH_ERR_EMPTY_PATH; }
-    var n_verbs = sd_path_verb_count(path);
-    if (n_verbs == 0) { return SADISH_ERR_EMPTY_PATH; }
-    var hw = sd_asr(width, 1);
-    if (hw <= 0) { return SADISH_OK; }
-    var tol = SD_ONE >> 2;
-
-    # The stroker's OWN scratch set — `run` stays live across the fill_union passes below, which
-    # use the fill set (see the scratch block above).
-    _sd_scratch_init();
-    var run = _sd_stroke_run;
-    var run_n = 0;
-    var fbuf = _sd_stroke_fbuf;
-    var fctx = _sd_stroke_fctx;
-
-    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
-    var points = load64(path + SD_PATH_POINTS_OFFSET);
-    var cur = 0;
-    var closed = 0;
-    var vi = 0;
-    var pi = 0;
-    while (vi < n_verbs) {
-        var verb = load64(verbs + vi * 8);
-        if (verb == SD_VERB_MOVETO) {
-            if (run_n > 0) { sd_stroke_run(cv, run, run_n, closed, hw); }
-            run_n = 0;
-            closed = 0;
-            cur = load64(points + pi * 8);
-            store64(run + run_n * 8, cur);
-            run_n = run_n + 1;
-            pi = pi + 1;
-        }
-        if (verb == SD_VERB_LINETO) {
-            cur = load64(points + pi * 8);
-            if (run_n < SD_FLATTEN_CAP) {
-                store64(run + run_n * 8, cur);
-                run_n = run_n + 1;
-            }
-            pi = pi + 1;
-        }
-        if (verb == SD_VERB_QUADTO) {
-            var qc = load64(points + pi * 8);
-            var qe = load64(points + (pi + 1) * 8);
-            store64(fctx + 0, fbuf);
-            store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
-            run_n = sd_stroke_append(run, run_n, fctx);
-            cur = qe;
-            pi = pi + 2;
-        }
-        if (verb == SD_VERB_CUBICTO) {
-            var k1 = load64(points + pi * 8);
-            var k2 = load64(points + (pi + 1) * 8);
-            var ke = load64(points + (pi + 2) * 8);
-            store64(fctx + 0, fbuf);
-            store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
-            run_n = sd_stroke_append(run, run_n, fctx);
-            cur = ke;
-            pi = pi + 3;
-        }
-        if (verb == SD_VERB_CLOSE) {
-            closed = 1;
-        }
-        vi = vi + 1;
-    }
-    if (run_n > 0) { sd_stroke_run(cv, run, run_n, closed, hw); }
     return SADISH_OK;
 }
 
@@ -880,6 +774,7 @@ fn sd_canvas_clip_push_path(cv, path, rule): i64 {
     var w = sd_canvas_width(cv);
     var h = sd_canvas_height(cv);
     var tmp = sd_canvas_new(w, h);        # fresh (unclipped) -> raw shape coverage
+    sd_canvas_set_aa(tmp, sd_canvas_aa(cv));   # the mask uses the parent's coverage engine
     sd_canvas_fill_path(tmp, path, rule);
     return sd_clip_push_mask(cv, sd_canvas_coverage(tmp));
 }
@@ -896,9 +791,9 @@ fn sd_canvas_clip_pop(cv): i64 {
 
 # ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
-# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505.
+# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600.
 # ================================================================
 # @public
 fn sadish_version(): i64 {
-    return 505;
+    return 600;
 }

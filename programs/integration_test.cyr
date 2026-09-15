@@ -1,0 +1,183 @@
+# programs/integration_test.cyr — RUN test for the SEAMS between the 0.6.0 items.
+#
+# Each 0.6.0 item (stride, styled stroking, gradient paint, SD_AA_AREA) carries its own suite, and
+# each was built and reviewed in isolation. This suite pins what only exists once they are merged:
+#   A. the process's FIRST-EVER coverage work is an AREA styled stroke under an arena hook — every
+#      lazily-allocated scratch (raster's fill set, the stroke batch, the area accumulator) lands on
+#      the GLOBAL heap, not one byte on the arena, and the next stroke costs 0 / 0;
+#   B. sd_canvas_stroke_path_ex on an SD_AA_AREA canvas goes through the area engine (_sd_sb_flush's
+#      dispatch), not the 4-sub-scanline walk: a band edge at y = 4.8 reads 0.2 * 255 = 51, where
+#      the walk quantizes it to 63; the miter's outer corner pixel reads 0.1 px^2 = 25;
+#   C. that dispatch honours the clip mask and MAX-combines with existing coverage;
+#   D. gradient paint through AREA coverage onto a WRAPPED surface equals sd_canvas_blit_at;
+#   E. sadish_version() == 600.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "integration_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+var g_arena = 0;
+
+fn hook_alloc(n): i64 {
+    return arena_alloc(g_arena, n);
+}
+
+# An open L: (4, 6.3) -> (18, 6.3) -> (18, 12). Width 3 (hw 1.5): the horizontal band spans
+# y in [4.8, 7.8], the vertical one x in [16.5, 19.5]; the MITER corner is at (19.5, 4.8).
+fn it_ell(): i64 {
+    var p = sd_path_new();
+    var y = 6 * SD_ONE + 19660;   # 6.3 (19660 = 0.3 * 65536, truncated)
+    sd_path_moveto(p, 4 * SD_ONE, y);
+    sd_path_lineto(p, 18 * SD_ONE, y);
+    sd_path_lineto(p, 18 * SD_ONE, 12 * SD_ONE);
+    return p;
+}
+
+fn it_stroke(cv, p): i64 {
+    return sd_canvas_stroke_path_ex(cv, p, 3 * SD_ONE, SD_CAP_BUTT, SD_JOIN_MITER, 4 * SD_ONE);
+}
+
+# Sum of coverage over columns [x0, w) of every row — 0 means nothing streaked to the right.
+fn it_right_sum(cv, x0): i64 {
+    var sum = 0;
+    var y = 0;
+    while (y < sd_canvas_height(cv)) {
+        var x = x0;
+        while (x < sd_canvas_width(cv)) {
+            sum = sum + sd_canvas_coverage_at(cv, x, y);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return sum;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # ---- A. first-ever coverage work: an AREA styled stroke under an arena hook ----------------
+    var cv = sd_canvas_new(24, 16);
+    check(sd_canvas_set_aa(cv, SD_AA_AREA), SADISH_OK);                 # 1
+    var ell = it_ell();
+    g_arena = arena_new_growable(1048576);
+    check(sd_alloc_set(&hook_alloc), 0);                               # 2
+    var g0 = alloc_used();
+    var a0 = arena_used(g_arena);
+    check(it_stroke(cv, ell), SADISH_OK);                              # 3
+    var first_cost = alloc_used() - g0;
+    # fill scratch 589,896 + stroke batch 270,592 + area accumulator (24 + 1) * 8 = 200
+    check(first_cost, 589896 + 270592 + 200);                          # 4
+    check(arena_used(g_arena) - a0, 0);                                # 5 — not one byte on the hook
+    var cv2 = sd_canvas_new(24, 16);                                    # (on the arena — fine)
+    sd_canvas_set_aa(cv2, SD_AA_AREA);
+    g0 = alloc_used();
+    a0 = arena_used(g_arena);
+    check(it_stroke(cv2, ell), SADISH_OK);                             # 6
+    check(alloc_used() - g0, 0);                                       # 7 — warm: 0 on the heap
+    check(arena_used(g_arena) - a0, 0);                                # 8 — and 0 on the arena
+    check(sd_alloc_set(0), &hook_alloc);                               # 9
+
+    # ---- B. the stroke went through the AREA engine ------------------------------------------
+    check(sd_canvas_coverage_at(cv, 8, 4), 51);                        # 10 — 0.2 covered (walk: 63)
+    check(sd_canvas_coverage_at(cv, 8, 5), 255);                       # 11
+    check(sd_canvas_coverage_at(cv, 8, 6), 255);                       # 12
+    check(sd_canvas_coverage_at(cv, 8, 7), 203);                       # 13 — 0.8 covered (walk: 191)
+    check(sd_canvas_coverage_at(cv, 16, 7), 255);                      # 14 — inner corner (walk: 223)
+    check(sd_canvas_coverage_at(cv, 19, 4), 25);                       # 15 — miter tip: 0.5 x 0.2 px
+    check(sd_canvas_coverage_at(cv, 19, 9), 127);                      # 16 — right band edge at x = 19.5
+    check(sd_canvas_coverage_at(cv, 3, 6), 0);                         # 17 — BUTT: nothing before x = 4
+    check(it_right_sum(cv, 20), 0);                                    # 18 — no streak right of the stroke
+    check(sd_canvas_coverage_at(cv2, 8, 4), 51);                       # 19 — the warm stroke agrees
+    # The same stroke on a default canvas still takes the walk (the dispatch is opt-in).
+    var sub = sd_canvas_new(24, 16);
+    it_stroke(sub, ell);
+    check(sd_canvas_coverage_at(sub, 8, 4), 63);                       # 20
+    check(sd_canvas_coverage_at(sub, 16, 7), 223);                     # 21
+
+    # ---- C. clip + MAX-combine through the AREA dispatch --------------------------------------
+    var cc = sd_canvas_new(24, 16);
+    sd_canvas_set_aa(cc, SD_AA_AREA);
+    check(sd_canvas_clip_push_rect(cc, 0, 0, 12, 16), SADISH_OK);      # 22
+    it_stroke(cc, ell);
+    check(sd_canvas_coverage_at(cc, 8, 4), 51);                        # 23 — inside the clip
+    check(sd_canvas_coverage_at(cc, 12, 5), 0);                        # 24 — outside it
+    check(sd_canvas_coverage_at(cc, 17, 9), 0);                        # 25
+    sd_canvas_clip_pop(cc);
+    # MAX: pre-existing coverage above what the stroke brings survives; below it is raised.
+    var cm = sd_canvas_new(24, 16);
+    sd_canvas_set_aa(cm, SD_AA_AREA);
+    store8(sd_canvas_coverage(cm) + 4 * 24 + 8, 200);                  # (8,4) above the stroke's 51
+    store8(sd_canvas_coverage(cm) + 7 * 24 + 8, 10);                   # (8,7) below the stroke's 203
+    it_stroke(cm, ell);
+    check(sd_canvas_coverage_at(cm, 8, 4), 200);                       # 26
+    check(sd_canvas_coverage_at(cm, 8, 7), 203);                       # 27
+
+    # ---- D. paint through AREA coverage onto a WRAPPED surface == sd_canvas_blit_at ------------
+    # Hand-built 24x16 surface over a 30-px-pitch buffer (stride 120 != 96), sentinel-filled.
+    var buf = alloc(30 * 16 * 4);
+    memset(buf, 90, 30 * 16 * 4);
+    var ws = alloc(SD_SURFACE_SIZE);
+    store64(ws + SD_SURFACE_WIDTH_OFFSET, 24);
+    store64(ws + SD_SURFACE_HEIGHT_OFFSET, 16);
+    store64(ws + SD_SURFACE_PIXELS_OFFSET, buf);
+    store64(ws + SD_SURFACE_STRIDE_OFFSET, 120);
+    var ref = sd_surface_new(24, 16);
+    memset(sd_surface_pixels(ref), 90, 24 * 16 * 4);
+    var g = sd_gradient_linear(0, 0, 24 * SD_ONE, 0);
+    sd_gradient_add_stop(g, 0, sd_rgb(20, 140, 230));                  # one stop: solid
+    check(sd_canvas_blit_paint_at(cv, ws, g, 0, 0), SADISH_OK);        # 28
+    check(sd_canvas_blit_at(cv, ref, sd_rgb(20, 140, 230), 0, 0), SADISH_OK);   # 29
+    var diff = 0;
+    var pad_bad = 0;
+    var y = 0;
+    while (y < 16) {
+        var x = 0;
+        while (x < 24) {
+            if (load32(buf + y * 120 + x * 4) != load32(sd_surface_pixels(ref) + (y * 24 + x) * 4)) {
+                diff = diff + 1;
+            }
+            x = x + 1;
+        }
+        var k = 96;
+        while (k < 120) {
+            if (load8(buf + y * 120 + k) != 90) { pad_bad = pad_bad + 1; }
+            k = k + 1;
+        }
+        y = y + 1;
+    }
+    check(diff, 0);                                                    # 30
+    check(pad_bad, 0);                                                 # 31
+    check(sd_surface_pixel_at(ws, 8, 5), sd_rgb(20, 140, 230));        # 32 — the band, at the stride
+
+    # ---- E. version probe -----------------------------------------------------------------------
+    check(sadish_version(), 600);                                      # 33
+
+    if (g_fails == 0) {
+        var ok = "integration_test: PASS (AREA styled strokes, clip/MAX, paint on wrapped, first-use alloc)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "integration_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

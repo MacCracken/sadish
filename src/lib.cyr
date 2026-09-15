@@ -50,4 +50,14 @@ include "src/draw.cyr"
 include "src/present.cyr"
 include "src/geom.cyr"
 include "src/path.cyr"
+# coverage.cyr — the opt-in SD_AA_AREA engine (exact 2-axis signed-area accumulation). Depends on
+# geom (16.16) + error only; raster.cyr's sd_fill_impl dispatches into it.
+include "src/coverage.cyr"
 include "src/raster.cyr"
+# stroke.cyr — round + styled (cap/join/miter-limit) stroking; flattens into
+# raster.cyr's stroker scratch; fills through sd_canvas_fill_union (round) or
+# its own span walk over raster's fill scratch (styled).
+include "src/stroke.cyr"
+# paint.cyr — gradient paint (linear + radial, multi-stop, pad/repeat/reflect) composited through a
+# canvas's coverage; builds on raster (SdCanvas), surface (colour helpers), error and alloc.
+include "src/paint.cyr"

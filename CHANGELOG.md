@@ -5,6 +5,142 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-09-15 — the roadmap's three: styled strokes, gradient paint, exact coverage
+
+The three items the README has listed as **next** since 0.4.0 — miter/bevel joins + butt/square
+caps, radial + multi-stop gradients, full 2-axis signed-area coverage — plus the open 0.5.5 stride
+issue. ⛔ **Everything a 0.5.5 caller already does is byte-identical**: the 14 pre-existing suites
+pass with their assertions unedited, agnos's `tests/gpu/refagree.cyr` still prints **BYTE-IDENTICAL on
+all 200 paths** against this `dist/`, and rekha (19 suites) and dhancha (18 suites) pass against it.
+
+### Added — `sd_canvas_stroke_path_ex(cv, path, width, cap, join, miter_limit)` (new module `src/stroke.cyr`)
+
+`SD_CAP_BUTT | SD_CAP_ROUND | SD_CAP_SQUARE` × `SD_JOIN_MITER | SD_JOIN_ROUND | SD_JOIN_BEVEL`, and
+`miter_limit` as a 16.16 SVG `stroke-miterlimit` ratio (past it a join bevels; AT it, still a miter;
+clamped to [1.0, `SD_MITER_LIMIT_MAX` = 1024.0]). An unknown cap or join returns `SADISH_ERR_BOUNDS`
+and draws nothing. Open subpaths get caps, closed ones a join at every vertex and no caps; coincident
+points are dropped; a lone point draws a disc (ROUND), a 2·hw square (SQUARE) or nothing (BUTT); a
+180° reversal is a flat end; a drawing verb after CLOSE restarts at the moveto point, as the fill
+reads it.
+
+⛔ **ROUND/ROUND IS `sd_canvas_stroke_path`, UNCHANGED.** The 0.4.0 stroker moved from `raster.cyr`
+to `stroke.cyr` verbatim (raster's diff there is a pure deletion) and `_ex(…, ROUND, ROUND, any)`
+returns it — asserted against a verbatim 0.5.5 copy across 45 canvases. ⚠ So ROUND/ROUND alone keeps
+its 0.4.0 after-CLOSE geometry, per-pass MAX seams, and 34,432 B of paths per closed rect on the seam.
+
+⭐ **Styled pieces are ONE fill, not a MAX union of passes.** A per-piece MAX union is not a union:
+two rects meeting at x = 4.5 leave the seam pixel at 127 (MEASURED); as one nonzero fill, 255. Rects,
+join triangles, discs and square caps go into a process-lifetime edge batch, all wound the same way,
+filled by a stroke-private walk with the default fill's sampling that merges overlapping spans and
+bridges 1-LSB touches. Solid pixels reading 254 inside a stroke, fill_union vs the walk: width-8
+cubic MITER 120 → 2, ROUND joins 282 → 2, a 10-vertex fractional polyline 36 → 0.
+⚠ **Inside one curve's flattening the join style does not apply**: a flattened vertex mitres only
+while its tip stays within 0.25 px of the disc, then rounds. At SVG's default limit 4 the cusp of
+`M 10,30 C 50,5 10,5 50,30` drew a 6 px spike on a 4 px stroke (MEASURED); now it is round.
+⚠ **The limit test is exact integer math** (directions rescaled to [2^13, 2^14), every intermediate
+< 2^62); the suite asserts both sides of a ratio of exactly 1.25 and of √298/3.
+⚠ **Batches hold 8,192 edges** (~800 miter segments). A longer subpath flushes mid-way and re-emits
+the stretch around the seam, so seams ALONG a path stay within 1 level; ⚠ but where a subpath longer
+than a batch CROSSES itself, pieces from different batches meet by MAX — MEASURED on 60 random
+700–1,100-segment self-crossing walks: 22 split, worst 101 levels.
+**Allocation:** 270,592 B once, from the GLOBAL `alloc`, at the first styled stroke (never the hook);
+then **0 B** per straight-line styled stroke, hooked or not.
+
+### Added — gradient paint: `SdGradient` + `sd_canvas_blit_paint_at` (new module `src/paint.cyr`)
+
+```
+var g = sd_gradient_linear(x0, y0, x1, y1);       # or sd_gradient_radial(cx, cy, r) — 16.16, canvas space
+sd_gradient_add_stop(g, 0, sd_rgb(255, 0, 0));     # any order; equal offsets keep insertion order
+sd_gradient_add_stop(g, SD_ONE, sd_rgba(0, 0, 255, 128));
+sd_gradient_set_spread(g, SD_SPREAD_REFLECT);      # SD_SPREAD_PAD (default) | _REPEAT | _REFLECT
+sd_canvas_blit_paint_at(cv, surface, g, dx, dy);   # clips every side, rows by sd_surface_stride
+```
+
+⚠ **Sampled at pixel CENTRES** with 16.16 geometry — the legacy `sd_canvas_blit_gradient` samples the
+top-left corner with whole-pixel endpoints and is kept byte-identical; they are not interchangeable.
+⭐ **t is exact per pixel, not accumulated**: linear t is stepped DDA-style with its remainder, radial
+t takes its root to 16 fraction bits. Stops resolve into a 1025-entry ramp, and any ramp cell with a
+stop strictly inside it is evaluated from the exact t — so a hard stop lands on the right pixel at any
+axis length (a 0.3 stop on a 4,096 px axis flips at pixel 1229) and a 3.5 px band keeps its 4 pixels.
+⚠ Stops use the legacy alpha rule (byte 0 = opaque) and interpolate straight alpha; source alpha =
+coverage × paint alpha / 255, then `sd_canvas_blit_at`'s src-over. A one-stop opaque gradient paints
+exactly `sd_canvas_blit_at`'s bytes. Following SVG: zero stops paint nothing; a zero-length axis or
+r <= 0 paints the last stop.
+⚠ **Precision bound**: gradient coordinates within ±16,383 px, verified exactly on 4,096 px rows at
+the extremes. Outside it colours may be wrong; the ramp index is always clamped.
+⭐ **A blit allocates nothing, first call included.** A gradient costs 4,256 B through `sd_alloc`
+(object 88 + stops 64 + ramp 4,104); a stop-block doubling adds its new size.
+MEASURED, 256×256, ns/px: linear 14.2, radial 44.3 (legacy 2-stop 13.7, solid blit 7.0).
+
+### Added — `SD_AA_AREA`: exact 2-axis coverage (`sd_canvas_set_aa` / `sd_canvas_aa`, new module `src/coverage.cyr`)
+
+The fill has been exact in x since 0.4.0 but SAMPLES y at 4 sub-scanlines: an edge at y = 4.3 reads
+**63** (true value 76), at 4.7 **191** (178). `SD_AA_AREA` is signed-area cell accumulation (the
+font-rs / stb_truetype v2 / FreeType "smooth" family) and reads 76 and 178.
+
+⛔⛔ **OPT-IN, PER CANVAS; THE DEFAULT IS THE 0.4.0 LOOP, UNTOUCHED** — agnos's GPU rasteriser is gated
+byte for byte on it. `sd_canvas_set_aa(cv, SD_AA_AREA)` applies to every fill into that canvas:
+`fill_path`, `fill_union` (so the round stroker), the mask `clip_push_path` builds (it inherits the
+parent's mode), and — through `_sd_sb_flush`'s dispatch — styled strokes.
+⛔ **No streaks.** Every piece deposits exactly its height (`dy - a` into its cell, `a` into the next)
+and heights come from exact endpoints, so right of a closed contour the running sum is exactly 0 —
+asserted to the raw unit (8,004 edges in one pixel row). ⛔ An AREA fill whose edge list reaches
+`SD_FLATTEN_CAP` may have been truncated (an open contour would streak), so it runs the default loop.
+⚠ Both rules fold the INTEGRAL of the winding over a pixel: exact where a pixel's winding is {0, ±1},
+the standard cell approximation elsewhere (a pixel-sized bow-tie reads 0).
+⚠ **`SdCanvas` grew 40 → 48 B** (`SD_CANVAS_AA_OFFSET = 40`); `sd_canvas_new` stores the default
+explicitly. Nothing in dhancha, rekha or agnos builds a canvas by hand. ⚠ **Every canvas costs 8 B
+more on `sd_alloc`** — dhancha's `text_arena_test` passes unchanged but its printed figures move:
+MEASURED against dhancha's current tree, a 12-label frame 415,280 → **415,368 B**, a 10-char label
+38,016 → 38,024 B, the 64 KiB-arena spill 349,752 → 349,840 B. Its README/CHANGELOG figures want
+re-measuring when it bumps its sadish pin.
+MEASURED, 256×256 incl. flattening: curved blob **0.48 ms** per fill (SUBSCANLINE 2.6 ms); 400-edge
+self-intersecting polygon 2.2 ms (35 ms); 8,000 edges 41 ms (10.9 s). **Memory:** one (w+1)-slot
+accumulator from the global `alloc` on the first AREA fill (264 B at 32 px); **0 B** after.
+
+### Fixed — every surface reader and writer addresses rows by `sd_surface_stride`
+
+Closes `docs/development/issues/2026-09-14-direct-primitives-address-rows-by-width-not-stride.md`.
+`sd_plot`, `sd_line`, `sd_hline`, `sd_vline` (and so `sd_rect` / `sd_fill_rect` / `sd_clear`),
+`sd_blend_hline` / `sd_fill_rect_blend`, `sd_surface_pixel_at`, `sd_canvas_blit_gradient`, the
+presenter's row copy, and `sd_surface_write_ppm` (which the issue missed — it read `w*h` pixels as one
+flat run) now load the stride once per call. Packed surfaces are byte-identical (a 66,558 B dump of
+every primitive, a PPM and four presenter frames diffs empty against 0.5.5).
+⚠ `sd_put(px, w, h, x, y, color)` keeps its signature and stays the PACKED form — a raw pointer
+carries no stride; nothing in sadish or its consumers calls it any more. `sd_plot` / `sd_line` use a
+private row-pointer store; `sd_line` steps the row pointer rather than re-multiplying (a per-pixel
+`px + y*stride` MEASURED ~3.8 % slower; stepped, within noise of 0.5.5).
+
+### Filed
+
+`docs/development/issues/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md` — the
+clip mask is written `y*w + x` and read `py*stride + px` by the fill, the area engine and the styled
+flush. Unobservable today (every canvas has `stride == w`).
+
+### Changed
+
+- `sadish_version()` → **600**. `dist/sadish.cyr` 85,815 → 170,626 B; DCE smoke binary 16,000 → 16,328 B.
+- Module order: `coverage.cyr` before `raster.cyr`; `stroke.cyr`, then `paint.cyr`, after it.
+
+### Verified
+
+All **19** `programs/*_test.cyr` pass — the 14 pre-existing suites with assertions unedited, plus
+`stride_test` (103 checks; 58 fail against the 0.5.5 sources), `stroke_style_test` (193),
+`paint_test` (248), `area_test` (163) and `integration_test` (33: the process's first-ever coverage
+work is an AREA styled stroke under an arena hook — exactly 860,688 B on the global heap, **0** on
+the arena, 0 / 0 warm; styled strokes on an AREA canvas read 51 / 25 where the walk reads 63 / 31;
+clip + MAX through that dispatch; paint through AREA coverage onto a wrapped surface equals
+`sd_canvas_blit_at`; the version probe). `fmt --check` clean, `lint` 0 warnings, `vet` clean,
+`distlib` in sync. No new top-level name collides with anything in dhancha, rekha, crab or
+agnos/tests/gpu.
+⭐ **Every item was built, adversarially reviewed, fixed and independently re-verified, and each
+proves its tests by mutation**: stride 22 mutations, all caught; stroke 103 (89 caught, 3 kill the
+suite, 11 equivalent); paint 114 (110 caught, 4 equivalent); area 75 (68 caught, 7 equivalent or
+speed-only); integration 3, all caught (no AREA dispatch: 8 checks; its guard inverted: 2; the
+accumulator on the hook: 2).
+⚠ **One pre-release rename**: the stroke item defined both `var _sd_sb_cap` (batch capacity) and
+`fn _sd_sb_cap` (draw a cap) — the fn is now `_sd_sb_endcap`. Duplicate names shadow silently here.
+
 ## [0.5.5] - 2026-09-14 — a rasterizer that can be told where its memory comes from
 
 ### Added — `sd_alloc` / `sd_alloc_set` / `sd_alloc_get` (new first module `src/alloc.cyr`)

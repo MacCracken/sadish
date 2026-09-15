@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.5.5
+Version: 0.6.0
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -50,8 +50,22 @@ toolkit are all **consumers**, not re-implementations.
   process-lifetime (a straight-line fill costs the heap 0 B after the first
   call; was 327,824 B per call), and `sd_canvas_blit_at(cv, s, color, dx, dy)`
   places + clips a canvas on a surface, honouring `sd_surface_stride`.
-- **next:** miter/bevel joins + butt/square caps, radial + multi-stop
-  gradients, full 2-axis signed-area coverage.
+- **v0.6.0 — the roadmap's three (shipped).** Everything a 0.5.5 caller does is
+  byte-identical (agnos's refagree oracle: 200/200):
+  - **Styled strokes** — `sd_canvas_stroke_path_ex(cv, path, width, cap, join,
+    miter_limit)`: butt/round/square caps, miter/round/bevel joins, SVG
+    `stroke-miterlimit` (`src/stroke.cyr`). Round/round is the 0.4.0 stroker.
+  - **Gradient paint** — `sd_gradient_linear` / `sd_gradient_radial`, multi-stop,
+    pad/repeat/reflect, `sd_canvas_blit_paint_at` (`src/paint.cyr`).
+  - **Exact 2-axis coverage** — opt-in per canvas with
+    `sd_canvas_set_aa(cv, SD_AA_AREA)` (`src/coverage.cyr`); the default
+    4-sub-scanline engine is unchanged.
+  - **Stride-correct surfaces** — every primitive, blit, the PPM writer and the
+    presenter address rows by `sd_surface_stride`.
+- **next (candidates):** stroke dashes; two-point/focal radial gradients and
+  gradient transforms; a growable edge list (lift `SD_FLATTEN_CAP`); a
+  premultiplied coverage blit for agnos `gpu_shader_op` #92; the clip-mask pitch
+  (`docs/development/issues/2026-09-15-…`).
 
 ## Place in the stack
 
@@ -85,7 +99,8 @@ as the hook around a text draw and blits through `sd_canvas_blit_at`), crab
 — pull `dist/sadish.cyr` via a `[deps.sadish]` git-tag entry (rekha and
 dhancha also carry a `path = "../sadish"` dev override). The complete 2D vector
 core — fill, stroke, gradient, affine transforms, clip, and analytic AA — is
-live as of **v0.4.0**.
+live as of **v0.4.0**; styled strokes, gradient paint and exact 2-axis coverage
+as of **v0.6.0**.
 
 ## Dependencies
 
@@ -104,7 +119,8 @@ cyrius build programs/smoke.cyr build/sadish-smoke    # link-check
 ./build/sadish-smoke                                  # prints the banner
 
 # RUN tests (each self-checks and exits non-zero on failure)
-for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present blend alloc; do
+for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present blend alloc \
+         stride stroke_style paint area integration; do
   cyrius build "programs/${t}_test.cyr" "build/${t}_test" && "./build/${t}_test"
 done
 ```

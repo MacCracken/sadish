@@ -10,6 +10,14 @@
 # the coordinate system (origin top-left, y-down, off = (y*w + x)*4) are the
 # shared idiom proven across the ecosystem's framebuffer apps (encom-hits,
 # cyrius-bb/-polyomino, cyrius-doom). See docs/development/prior-art.md.
+#
+# ⚠ That offset assumes the packed buffer. ROWS ARE `stride` BYTES APART, NOT
+# `w*4`: off = y*stride + x*4. The two are the same number for every surface
+# sd_surface_new makes, and differ on a WRAPPED one — a header over a wider buffer
+# (dhancha's dh_surface_wrap over a framebuffer or a pane sub-rect). Every reader
+# and writer of an SdSurface in sadish (this file, draw.cyr, the blits in
+# raster.cyr, present.cyr) loads the stride once per call and addresses by it;
+# programs/stride_test.cyr holds each of them to it on a hand-built wrapped header.
 
 # ================================================================
 # Color — a packed 0x00RRGGBB integer. Stored to the surface as BGRA with the
@@ -71,7 +79,8 @@ fn sd_premul(c): i64 {
 #   +0:  width   (i64 — pixels)
 #   +8:  height  (i64 — pixels)
 #   +16: pixels  (ptr — owned width*height*4 bytes, BGRA, packed)
-#   +24: stride  (i64 — bytes per row; width*4 for the packed buffer)
+#   +24: stride  (i64 — bytes per row; width*4 for the packed buffer, wider for a
+#                 wrapped one — the row pitch every reader/writer addresses by)
 # ================================================================
 var SD_SURFACE_WIDTH_OFFSET  = 0;
 var SD_SURFACE_HEIGHT_OFFSET = 8;
@@ -107,19 +116,33 @@ fn sd_surface_pixels(s): i64 { return load64(s + SD_SURFACE_PIXELS_OFFSET); }
 # @public
 fn sd_surface_stride(s): i64 { return load64(s + SD_SURFACE_STRIDE_OFFSET); }
 
-# Bounds-checked BGRA store into a raw pixel buffer (w,h in pixels). Private
-# helper shared by every primitive so the write convention lives in one place.
-fn sd_put(px, w, h, x, y, color): i64 {
+# Bounds-checked BGRA store of pixel (x, y) of a w*h buffer, given `row` = the
+# address of row y's first pixel (`px + y * stride`, computed by the caller). The
+# private helper every per-pixel primitive (sd_plot, sd_line, sd_put) shares so the
+# write convention lives in one place. ⚠ Row pointer, not (px, stride): the stride
+# form needs a 7th argument, which goes on the stack (MEASURED ~4% slower on an
+# sd_line-only workload); sd_line also steps the row pointer rather than multiplying.
+# `row` may point anywhere when y is out of range; it is only dereferenced after
+# the bounds checks pass.
+fn _sd_put_row(row, w, h, x, y, color): i64 {
     if (x < 0) { return 0; }
     if (x >= w) { return 0; }
     if (y < 0) { return 0; }
     if (y >= h) { return 0; }
-    var off = ((y * w) + x) * 4;
-    store8(px + off, color & 255);
-    store8(px + off + 1, (color >> 8) & 255);
-    store8(px + off + 2, (color >> 16) & 255);
-    store8(px + off + 3, sd_alpha_of(color));   # v0.5.0: honour the colour's alpha (0 == opaque, legacy)
+    var off = x * 4;
+    store8(row + off, color & 255);
+    store8(row + off + 1, (color >> 8) & 255);
+    store8(row + off + 2, (color >> 16) & 255);
+    store8(row + off + 3, sd_alpha_of(color));   # v0.5.0: honour the colour's alpha (0 == opaque, legacy)
     return 0;
+}
+
+# The same store into a PACKED buffer (rows w*4 bytes apart) — the pre-stride
+# signature, kept working (no consumer calls it; nothing in sadish does any more).
+# A raw pointer carries no stride, so this form cannot address a wrapped surface;
+# sd_plot / sd_line pass the surface's own stride to _sd_put_row instead.
+fn sd_put(px, w, h, x, y, color): i64 {
+    return _sd_put_row(px + y * (w * 4), w, h, x, y, color);
 }
 
 # @public — read a pixel back as a packed 0x00RRGGBB color (alpha dropped).
@@ -132,7 +155,7 @@ fn sd_surface_pixel_at(s, x, y): i64 {
     if (x >= w) { return 0; }
     if (y >= h) { return 0; }
     var px = load64(s + SD_SURFACE_PIXELS_OFFSET);
-    var off = ((y * w) + x) * 4;
+    var off = y * load64(s + SD_SURFACE_STRIDE_OFFSET) + x * 4;
     var b = load8(px + off);
     var g = load8(px + off + 1);
     var r = load8(px + off + 2);

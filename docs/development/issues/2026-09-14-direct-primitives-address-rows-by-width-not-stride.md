@@ -1,6 +1,13 @@
 # Every direct primitive addresses rows by `width * 4`, so a WRAPPED surface (stride != width*4) shears
 
-**Status:** 🟡 **OPEN — pre-existing, made visible by 0.5.5. MEASURED**, not read.
+**Status:** 🟢 **CLOSED in 0.6.0** — every site in the table below (and `sd_surface_write_ppm`, which the
+table missed: it read `w*h` pixels as one flat run) now loads `sd_surface_stride` once per call.
+Gate: `programs/stride_test.cyr`, a hand-built wrapped header with sentinel padding and guard rows
+driven through every primitive, blit, the gradient, the PPM writer and the presenter copy — 58 of its
+103 checks fail against the 0.5.5 sources. Packed surfaces are byte-identical (all 14 pre-existing
+suites unchanged). ⚠ `sd_put(px, w, h, x, y, color)` keeps its signature and stays the PACKED form
+(a raw pointer carries no stride); nothing in sadish or its consumers calls it any more.
+**Was:** 🟡 OPEN — pre-existing, made visible by 0.5.5. MEASURED, not read.
 **Filed:** 2026-09-14, from the 0.5.5 review (the `sd_canvas_blit_at` work).
 **Affects:** sadish **0.5.5** and every version since `SD_SURFACE_STRIDE_OFFSET` was added (the field
 has been declared and written by `sd_surface_new` since v0.2, and READ by nothing in this repo until

@@ -1,0 +1,329 @@
+# coverage.cyr — the SD_AA_AREA coverage engine: exact 2-axis signed-area cell accumulation.
+#
+# The font-rs / stb_truetype v2 / FreeType "smooth" family. sd_fill_impl (raster.cyr) builds the
+# closed edge list exactly as it always has, then — ONLY on a canvas switched to SD_AA_AREA with
+# sd_canvas_set_aa — hands that list here instead of to the 4-sub-scanline loop.
+#
+# ⛔⛔ OPT-IN, AND IT STAYS OPT-IN. The default engine (SD_AA_SUBSCANLINE) is analytic in x but
+# SAMPLES y at 4 sub-scanlines, so a near-horizontal edge quantizes to 1/4 steps (an edge at
+# y = 4.3 reads 63, not 76). agnos's GPU rasteriser (tests/gpu/refagree.cyr) uses sadish's
+# DEFAULT fill as a byte-identical oracle, so that engine is never replaced — this one sits beside
+# it and nothing reaches it unless a caller asks.
+#
+# THE ALGORITHM. One accumulator row acc[0..w] (w+1 i64 slots). For every edge overlapping pixel
+# row py, clip the edge to the row, split it at pixel-column boundaries, and for each piece of
+# height pdy lying in column c at mean fractional x fx:
+#     a = pdy * fx                     (the part of the piece's cover NOT inside pixel c)
+#     acc[c]   += sgn * (pdy - a)
+#     acc[c+1] += sgn * a
+# A running sum along the row then yields, per pixel, the signed integral of the winding number
+# over that pixel's area, in 16.16 (ONE = fully covered).
+#
+# ⛔ THE STREAK INVARIANT. Every piece deposits exactly `pdy` into the row (pdy - a + a), and the
+# pieces of an edge telescope: each piece's pdy is the DIFFERENCE of two y offsets computed from the
+# row-clipped segment's exact endpoints (never a sum of rounded steps), so they add to exactly
+# ye - ys. Across rows the same holds — row clipping is at exact integer row boundaries. ⇒ Right of
+# a closed contour the running sum is EXACTLY 0 in integer arithmetic; one leaked unit would paint a
+# streak to the canvas's right edge. Portions LEFT of x = 0 deposit their whole pdy into column 0
+# (their cover still reaches every visible pixel); portions right of x = w deposit nothing, since
+# no visible prefix sum reads past column w-1.
+#
+# RULES, from s = |running sum|:
+#   NONZERO   -> min(s, ONE)
+#   EVEN_ODD  -> s mod 2*ONE folded into a triangle wave (FreeType's approach)
+# Both fold the INTEGRAL of the winding over the pixel, not the area of the region, so both are
+# EXACT when the winding inside the pixel takes only the values {0, +1} or only {0, -1} — a simple
+# contour, or disjoint ones. Anywhere else it is the standard cell-coverage approximation (FreeType's
+# too): opposite windings inside one pixel cancel — and ONE self-intersecting contour can do that,
+# a pixel-sized bow-tie reads 0 — and overlapping same-way contours over part of a pixel count twice
+# (two coincident edges at x = 4.3 read 152 nonzero, not 76).
+#
+# ⚠ PRECISION. Coordinates are 16.16 and must satisfy |x|, |y| <= 2^30 raw (±16,384 px) — the same
+# bound the default engine's (bx-ax)*(sy-ay) product already carries. Under it every intermediate
+# fits an i64: x at a row boundary (dx * dy_part) < 2^62; a column crossing's y offset
+# (pdy_row <= 2^16) * (x - x0 < 2^31) < 2^47; the split (pdy <= 2^16) * (fx_sum <= 2^17) <= 2^33;
+# the running sum <= SD_FLATTEN_CAP * ONE = 2^29. All divisions and shifts in the accumulation act
+# on non-negative values (the sign is applied after the split), so truncation is the same for a
+# contour and its mirror: CW and CCW input give byte-identical coverage.
+# ⚠ Truncation is under a raw unit per step per piece (x at a row boundary, y at a column crossing,
+# the split), so a pixel's error grows with the pieces IN it — not along the row, where the pieces
+# telescope. MEASURED, even-odd, coincident triangles inside one pixel vs the exact fold: 810 of
+# them (2,430 edges) exact to the byte, 2,430 (7,290 edges) 2 bytes off.
+#
+# ⚠ SINGLE-THREADED, like the rest of the fill: the accumulator is one process-wide block.
+
+# ---- process-lifetime scratch (lazily, on the FIRST AREA fill) -------------------------------
+# ⛔ FROM THE GLOBAL `alloc`, NEVER `sd_alloc` — the same rule, for the same reason, as raster.cyr's
+# _sd_scratch_init: a consumer hook is typically an arena that gets reset, and a scratch drawn from
+# it dangles on the next frame. ⚠ And NOT in _sd_scratch_init: a process that never asks for AREA
+# pays nothing for it, and the default fill's first-call figures (590,152 B at 32 px, asserted in
+# programs/alloc_test.cyr) stay exact.
+# The edge list needs no scratch of its own: it is sorted IN PLACE in _sd_fill_edges, which is
+# per-call working storage nothing reads after sd_fill_impl returns.
+var _sd_area_acc = 0;          # (w + 1) * 8 — one row of signed 16.16 cell accumulators
+var _sd_area_acc_cap = 0;      # slots the current block holds
+
+# The accumulator for a canvas `w` pixels wide: w + 1 slots (a piece in the last column deposits
+# its `a` into slot w, which nothing reads). Re-allocates from the GLOBAL alloc only when a wider
+# canvas than ever seen arrives; ⚠ the old block is abandoned (no free()), exactly like
+# _sd_fill_accrow_for. MEASURED (programs/area_test.cyr): the first AREA fill costs the global heap
+# exactly (w+1)*8 — 264 B at 32 px, a regrow to 64 px 520 B — and the arena 0; every fill after, 0.
+# Returns 0 if the allocation fails.
+fn _sd_area_acc_for(w): i64 {
+    if (w + 1 <= _sd_area_acc_cap) { return _sd_area_acc; }
+    var blk = alloc((w + 1) * 8);
+    if (blk == 0) { return 0; }
+    _sd_area_acc = blk;
+    _sd_area_acc_cap = w + 1;
+    return blk;
+}
+
+# min / max y of an edge record (4 i64: ax, ay, bx, by).
+fn _sd_area_ymin(e): i64 {
+    var ay = load64(e + 8);
+    var by = load64(e + 24);
+    if (by < ay) { return by; }
+    return ay;
+}
+
+fn _sd_area_ymax(e): i64 {
+    var ay = load64(e + 8);
+    var by = load64(e + 24);
+    if (by > ay) { return by; }
+    return ay;
+}
+
+# Swap two 32-byte edge records.
+fn _sd_area_swap(ea, eb): i64 {
+    var k = 0;
+    while (k < 32) {
+        var t = load64(ea + k);
+        store64(ea + k, load64(eb + k));
+        store64(eb + k, t);
+        k = k + 8;
+    }
+    return 0;
+}
+
+# Sort the edge records by ymin, in place (Shell sort, Knuth 3h+1 gaps: no scratch, and no O(n^2)
+# on the 8,192-edge worst case a long flattened path can produce).
+fn _sd_area_sort(edges, n): i64 {
+    var gap = 1;
+    while (gap < n / 3) { gap = gap * 3 + 1; }
+    while (gap >= 1) {
+        var i = gap;
+        while (i < n) {
+            var src = edges + i * 32;
+            var t0 = load64(src + 0);
+            var t1 = load64(src + 8);
+            var t2 = load64(src + 16);
+            var t3 = load64(src + 24);
+            var key = t1;
+            if (t3 < key) { key = t3; }
+            var j = i;
+            var stop = 0;
+            while (stop == 0) {
+                if (j < gap) {
+                    stop = 1;
+                } else {
+                    var prev = edges + (j - gap) * 32;
+                    if (_sd_area_ymin(prev) > key) {
+                        var dst = edges + j * 32;
+                        store64(dst + 0, load64(prev + 0));
+                        store64(dst + 8, load64(prev + 8));
+                        store64(dst + 16, load64(prev + 16));
+                        store64(dst + 24, load64(prev + 24));
+                        j = j - gap;
+                    } else {
+                        stop = 1;
+                    }
+                }
+            }
+            var at = edges + j * 32;
+            store64(at + 0, t0);
+            store64(at + 8, t1);
+            store64(at + 16, t2);
+            store64(at + 24, t3);
+            i = i + 1;
+        }
+        gap = gap / 3;
+    }
+    return 0;
+}
+
+# Deposit one row-clipped segment into the accumulator. `xa`, `xb` are its x at the two row-clipped
+# ends (either order — cover is spread linearly in x, so direction does not matter), `dy` > 0 its
+# height inside the row, `sgn` +1 / -1 its winding direction.
+fn _sd_area_cells(acc, w, xa, xb, dy, sgn): i64 {
+    var wmax = w << SD_SHIFT;
+    if (xa == xb) {
+        # vertical piece: one column, fx is its x fraction
+        if (xa >= wmax) { return 0; }
+        if (xa <= 0) {
+            store64(acc, load64(acc) + sgn * dy);
+            return 0;
+        }
+        var vc = xa >> SD_SHIFT;
+        var va = (dy * (xa - (vc << SD_SHIFT))) >> SD_SHIFT;
+        store64(acc + vc * 8, load64(acc + vc * 8) + sgn * (dy - va));
+        store64(acc + (vc + 1) * 8, load64(acc + (vc + 1) * 8) + sgn * va);
+        return 0;
+    }
+    var x0 = xa;
+    var x1 = xb;
+    if (x0 > x1) { x0 = xb; x1 = xa; }
+    if (x0 >= wmax) { return 0; }                     # wholly right of the canvas
+    if (x1 <= 0) {                                    # wholly left: full cover into column 0
+        store64(acc, load64(acc) + sgn * dy);
+        return 0;
+    }
+    var span = x1 - x0;
+    # the visible x range [lo, hi); lo < hi here because x0 < wmax and x1 > 0
+    var lo = x0;
+    if (lo < 0) { lo = 0; }
+    var hi = x1;
+    if (hi > wmax) { hi = wmax; }
+    # y offset (from the x0 end) at x = lo; the part left of x = 0 lands whole in column 0
+    var py = 0;
+    if (lo > x0) {
+        py = (dy * (lo - x0)) / span;
+        store64(acc, load64(acc) + sgn * py);
+    }
+    var px = lo;
+    var c = lo >> SD_SHIFT;
+    while (px < hi) {
+        var cl = c << SD_SHIFT;
+        var nx = cl + SD_ONE;
+        if (nx > hi) { nx = hi; }
+        var ny = dy;
+        if (nx < x1) { ny = (dy * (nx - x0)) / span; }
+        var pdy = ny - py;
+        var a = (pdy * ((px - cl) + (nx - cl))) >> 17;    # pdy * mean(fx), fx sum has 17 bits
+        store64(acc + c * 8, load64(acc + c * 8) + sgn * (pdy - a));
+        store64(acc + (c + 1) * 8, load64(acc + (c + 1) * 8) + sgn * a);
+        px = nx;
+        py = ny;
+        c = c + 1;
+    }
+    return 0;
+}
+
+# Deposit the part of edge record `e` that lies in the pixel row starting at `rt` (16.16).
+fn _sd_area_edge_row(acc, w, e, rt): i64 {
+    var xa = load64(e + 0);
+    var ya = load64(e + 8);
+    var xb = load64(e + 16);
+    var yb = load64(e + 24);
+    var sgn = 1;
+    if (ya > yb) {
+        # orient top -> bottom; the x at a row boundary is then computed from the same
+        # endpoints in the same order for both windings (mirror-exact)
+        xa = load64(e + 16);
+        ya = load64(e + 24);
+        xb = load64(e + 0);
+        yb = load64(e + 8);
+        sgn = 0 - 1;
+    }
+    var ys = ya;
+    if (ys < rt) { ys = rt; }
+    var ye = yb;
+    if (ye > rt + SD_ONE) { ye = rt + SD_ONE; }
+    if (ye <= ys) { return 0; }
+    var xs = xa + ((xb - xa) * (ys - ya)) / (yb - ya);
+    var xe = xa + ((xb - xa) * (ye - ya)) / (yb - ya);
+    return _sd_area_cells(acc, w, xs, xe, ye - ys, sgn);
+}
+
+# ================================================================
+# _sd_area_fill — the SD_AA_AREA engine behind sd_fill_impl. `edges`/`n_edges` is the closed edge
+# list sd_fill_impl built (REORDERED here); `cov`/`stride` the canvas's coverage buffer; `mask` the
+# active clip mask (0 = unclipped); `nonzero` 1 for SD_FILL_NONZERO, 0 for even-odd; `combine`
+# 0 = overwrite, 1 = MAX into the existing coverage. The byte mapping, clip multiply and union MAX
+# are the default engine's, verbatim.
+# ⛔ The list must be WHOLE — every contour closed — or the running sum never returns to 0 and the
+# row streaks to the right edge. sd_fill_impl guarantees it by calling here only with n_edges <
+# SD_FLATTEN_CAP (sd_edge_add drops edges silently once the list is full).
+#
+# Rows are swept top to bottom over an ACTIVE WINDOW [lo, nxt) of the ymin-sorted edge list:
+# edges whose ymin is above the row's bottom join at nxt; an edge that ends at or before the
+# row's bottom is swapped down to lo after that row. O(rows * active + sort), against the default
+# engine's O(rows * 4 * n_edges) plus an insertion sort of crossings per sub-scanline. MEASURED,
+# 256x256, including flattening: a two-contour quad/cubic blob 0.52 ms per fill (SUBSCANLINE
+# 2.77 ms); a 400-edge self-intersecting polygon 2.4 ms (37.9 ms); 8,000 edges 42 ms (11.7 s).
+# Returns SADISH_OK, or SADISH_ERR_OOM if the one-time accumulator allocation fails.
+# ================================================================
+fn _sd_area_fill(edges, n_edges, w, h, cov, stride, mask, nonzero, combine): i64 {
+    var acc = _sd_area_acc_for(w);
+    if (acc == 0) { return SADISH_ERR_OOM; }
+    # Slots [0, w) start at 0: a fresh block is not guaranteed zeroed, and a NARROWER previous
+    # fill leaves its sink slot (its own index w) holding a residue this canvas would read. Slot w
+    # itself is a write-only sink — no running sum reads past column w-1 — so it is never cleared.
+    var zi = 0;
+    while (zi < w) {
+        store64(acc + zi * 8, 0);
+        zi = zi + 1;
+    }
+    _sd_area_sort(edges, n_edges);
+
+    var two = SD_ONE * 2;
+    var lo = 0;
+    var nxt = 0;
+    var py = 0;
+    while (py < h) {
+        var rt = py << SD_SHIFT;
+        var rb = rt + SD_ONE;
+        var joining = 1;
+        while (joining != 0) {
+            if (nxt >= n_edges) {
+                joining = 0;
+            } else {
+                if (_sd_area_ymin(edges + nxt * 32) < rb) {
+                    nxt = nxt + 1;
+                } else {
+                    joining = 0;
+                }
+            }
+        }
+        var i = lo;
+        while (i < nxt) {
+            var e = edges + i * 32;
+            _sd_area_edge_row(acc, w, e, rt);
+            if (_sd_area_ymax(e) <= rb) {
+                # done after this row: retire it below the window (the record swapped up into
+                # slot i came from lo, which this row has already processed)
+                _sd_area_swap(e, edges + lo * 32);
+                lo = lo + 1;
+            }
+            i = i + 1;
+        }
+
+        # accumulator row -> coverage bytes (running sum; each slot is zeroed as it is consumed)
+        var run = 0;
+        var px = 0;
+        while (px < w) {
+            run = run + load64(acc + px * 8);
+            store64(acc + px * 8, 0);
+            var s = run;
+            if (s < 0) { s = 0 - s; }
+            if (nonzero != 0) {
+                if (s > SD_ONE) { s = SD_ONE; }
+            } else {
+                s = s % two;
+                if (s > SD_ONE) { s = two - s; }
+            }
+            # s <= ONE, so c <= 255: the default engine's clamp cannot fire here
+            var c = (s * 255) >> SD_SHIFT;
+            if (mask != 0) {
+                c = (c * load8(mask + py * stride + px)) / 255;
+            }
+            if (combine != 0) {
+                var oldc = load8(cov + py * stride + px);
+                if (c < oldc) { c = oldc; }
+            }
+            store8(cov + py * stride + px, c);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return SADISH_OK;
+}

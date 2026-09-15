@@ -1,0 +1,566 @@
+# @public — sadish gradient paint: linear + radial, multi-stop, pad / repeat / reflect.
+#
+# paint.cyr — an SdGradient is a PAINT: a colour for every point of canvas space. It is built once
+# (constructor + stops + spread) and composited through a canvas's coverage with
+# sd_canvas_blit_paint_at, which is sd_canvas_blit_at with the solid colour replaced by the paint.
+#
+#   var g = sd_gradient_linear(x0, y0, x1, y1);    # or sd_gradient_radial(cx, cy, r) — all 16.16
+#   sd_gradient_add_stop(g, 0, sd_rgb(255, 0, 0));
+#   sd_gradient_add_stop(g, SD_ONE, sd_rgb(0, 0, 255));
+#   sd_gradient_set_spread(g, SD_SPREAD_REFLECT);  # default SD_SPREAD_PAD
+#   sd_canvas_blit_paint_at(cv, surface, g, dx, dy);
+#
+# THE CONTRACT.
+#   · Geometry is in CANVAS pixel space: moving the canvas with (dx, dy) moves the paint with it.
+#   · Each pixel is sampled at its CENTRE (x + 0.5, y + 0.5). ⚠ The legacy
+#     sd_canvas_blit_gradient samples the top-left CORNER (x, y) with whole-pixel endpoints; the two
+#     are deliberately not interchangeable, and the legacy fn is untouched.
+#   · Linear: t = ((p - p0) · (p1 - p0)) / |p1 - p0|^2.  Radial: t = |p - c| / r.
+#   · t is EXACT at every pixel: a pixel reads floor(t * 2^16) — linear steps floor(t * 2^32) WITH
+#     its remainder, radial takes its root to 16 fraction bits — so a pixel centre that lies
+#     exactly on a stop takes that stop, on any axis length, and every pixel paints
+#     sd_gradient_color_at of its spread-mapped floor(t * 2^16).
+#   · Spread maps t into [0, 1]: PAD clamps, REPEAT takes fract(t) (floor-based, so t = -0.25 reads
+#     0.75), REFLECT is the period-2 triangle wave (t = -0.25 and t = 1.75 both read 0.25). REFLECT
+#     mirrors the exact t, so floor(2 - t) is taken as 2 - ceil(t), not 2 - floor(t).
+#   · Stops: offset 16.16, clamped to [0, SD_ONE]; kept sorted by a STABLE insert, so stops may be
+#     added in any order and equal offsets keep insertion order — two stops at one offset are a
+#     hard transition, and t >= offset takes the LATER one. ⚠ SVG instead raises an out-of-order
+#     offset to its predecessor's (document order); a consumer that wants that clamps before adding.
+#   · Colours are 0xAARRGGBB under the LEGACY alpha rule (sd_alpha_of: an alpha byte of 0 is
+#     OPAQUE). Interpolation is per channel, alpha included, in STRAIGHT (non-premultiplied) values —
+#     SVG's default. The source alpha of a pixel is coverage * interpolated_alpha / 255, then exactly
+#     sd_canvas_blit_at's src-over: every pixel with coverage != 0 is written and gets dst alpha 255,
+#     even when that product rounds to 0 (its colour bytes then come back unchanged). ⇒ An opaque
+#     one-stop gradient paints the same bytes as sd_canvas_blit_at with that colour.
+#   · Zero stops paint NOTHING and return SADISH_OK (SVG: as if the paint were 'none'); one stop is
+#     solid. A zero-length linear axis — |p1 - p0| < 2^-8 px — and a radius r <= 0 paint the colour
+#     at t = 1 everywhere, which is the LAST stop (SVG). ⚠ The 2^-8 px floor is sadish's, not SVG's:
+#     below it t * 2^32 would leave i64 inside the precision bound.
+#
+# ⭐ THE RAMP. Stops are resolved into a 1025-entry lookup table (4 B each, 0xAARRGGBB with the
+# ACTUAL alpha) inside the gradient, rebuilt lazily when a stop is added. Entry i is the colour at
+# EXACTLY t = i/1024, and a pixel reads the entry at floor(t * 1024) — no stop search. What that
+# buys and what it costs:
+#   · A cell (i/1024, (i+1)/1024) with a stop strictly INSIDE it is marked (its entry is 0 — alpha
+#     byte 0, which no real colour has) and a pixel landing there evaluates the stops from its 16.16 t.
+#     ⇒ Hard stops and bands narrower than a cell land on EXACTLY the pixels whose t >= offset, at
+#     any axis length (a 0.3 stop on a 4096 px axis flips at pixel 1229; a 3.5 px band keeps its 4
+#     pixels) — asserted in programs/paint_test.cyr. At most one cell per stop pays the search; a
+#     stop exactly ON a cell edge marks nothing (the entry past it already starts there).
+#   · The endpoints are exact: t <= 0 reads the colour at 0, t >= 1 (PAD) the colour at 1.
+#   · A SMOOTH stretch (a cell holding no stop) reads the colour at the cell's left edge: it lags
+#     the analytic colour by less than one cell (gradient length / 1024), i.e. by less than the
+#     colour change across one cell — under 1/4 level for a full-range 2-stop ramp. On a 256 px
+#     axis from a pixel boundary every centre lands ON an entry, so the paint there is exact.
+#   · Spread is applied to t BEFORE the lookup, so set_spread never rebuilds anything.
+#   · MEASURED (256x256 full coverage, 50 blits, this host): linear PAD 14.2 ns/px — the legacy
+#     2-stop sd_canvas_blit_gradient is 13.7, the solid sd_canvas_blit_at 7.0; radial 44.3 ns/px,
+#     most of it the per-pixel root (16 ns per _sd_paint_isqrt; sd_isqrt 82) and the exact 16-bit
+#     fraction (an accumulated-t / floor-root version measured 13.8 and 35.1 in the same run).
+#
+# ⚠ PRECISION BOUND. Every gradient coordinate must lie within ±16,383 px and every canvas pixel
+# centre below 16,383 px (16.16 magnitude < 2^30), so any difference between them is < 2^31 raw and
+# any product of two, or sum of two such products, is < 2^63. Within it:
+#   · Linear works in t * 2^32. N = (centre - p0) · d is long-divided ONCE per blit into
+#     floor(N * 2^32 / |d|^2) and its remainder; the per-pixel and per-row steps
+#     floor(2^48 * d / |d|^2) carry their remainders like a line DDA, so t * 2^32 is floor-exact at
+#     every pixel. The division never doubles a remainder past |d|^2 (< 2^63): it compares
+#     rem >= b - rem. With |d| >= 2^-8 px, |t| < 2^23 and |t * 2^32| < 2^55. (A 16.16 dot product
+#     scaled by 2^16 overflows once |p - p0| * |d| passes 2^15 px^2 — 182 px by 182 px — which is
+#     why t is never formed that way.)
+#   · Radial squares a < 2^31 raw difference per axis (sum < 2^63) and takes floor(sqrt(d^2) * 2^16)
+#     exactly with i64 products (_sd_paint_radial_t); t = that / r, < 2^48.
+#   · Outside the bound the COLOURS may be wrong, but the ramp index is always clamped (PAD) or
+#     masked (REPEAT/REFLECT) into the table: no input reads or writes out of bounds.
+#
+# ⚠ ALLOCATION. The gradient object (88 B), its stops (16 B each, doubling from 4, like
+# sd_path_grow) and the ramp (4,100 B) come from sd_alloc — MEASURED 4,256 B for a constructed
+# gradient, all of it on the consumer's hook when one is set. A blit allocates NOTHING, not even on
+# its first call (the ramp is rebuilt in place): MEASURED 0 B on the heap and 0 B on an arena hook,
+# asserted exactly in programs/paint_test.cyr. ⛔ A gradient made under an arena hook dies with that
+# arena's reset, exactly like a path.
+# ⚠ SINGLE-THREADED, as the rest of the rasterizer: the lazy ramp rebuild writes into the gradient
+# from inside a blit or sd_gradient_color_at, and the division helpers hand back their second result
+# through a module global.
+
+# ---- kinds + spread modes ----------------------------------------
+var SD_GRADIENT_LINEAR = 0;
+var SD_GRADIENT_RADIAL = 1;
+var SD_SPREAD_PAD     = 0;
+var SD_SPREAD_REPEAT  = 1;
+var SD_SPREAD_REFLECT = 2;
+
+# The ramp: 2^10 cells over t in [0, 1], stored as N + 1 entries so t = 1 has its own.
+var SD_GRADIENT_RAMP_BITS = 10;
+var SD_GRADIENT_RAMP_N    = 1024;
+# Initial stop capacity; sd_gradient_add_stop doubles it on overflow.
+var SD_GRADIENT_STOP_CAP  = 4;
+
+# ================================================================
+# SdGradient (88 bytes):
+#   +0:  kind      (SD_GRADIENT_LINEAR | SD_GRADIENT_RADIAL)
+#   +8:  spread    (SD_SPREAD_*)
+#   +16: x0 | cx   (16.16)
+#   +24: y0 | cy   (16.16)
+#   +32: x1 | r    (16.16)
+#   +40: y1 | 0    (16.16)
+#   +48: stops     (ptr — cap * 16 B, sorted: +0 offset 16.16, +8 colour as given)
+#   +56: n_stops   (i64)
+#   +64: cap       (i64 — stops the block holds)
+#   +72: ramp      (ptr — (SD_GRADIENT_RAMP_N + 1) * 4 B, 0xAARRGGBB, actual alpha; 0 = marked cell)
+#   +80: dirty     (i64 — 1 = stops changed since the ramp was built)
+# ================================================================
+var SD_GRADIENT_KIND_OFFSET   = 0;
+var SD_GRADIENT_SPREAD_OFFSET = 8;
+var SD_GRADIENT_A_OFFSET      = 16;
+var SD_GRADIENT_B_OFFSET      = 24;
+var SD_GRADIENT_C_OFFSET      = 32;
+var SD_GRADIENT_D_OFFSET      = 40;
+var SD_GRADIENT_STOPS_OFFSET  = 48;
+var SD_GRADIENT_NSTOPS_OFFSET = 56;
+var SD_GRADIENT_CAP_OFFSET    = 64;
+var SD_GRADIENT_RAMP_OFFSET   = 72;
+var SD_GRADIENT_DIRTY_OFFSET  = 80;
+var SD_GRADIENT_SIZE          = 88;
+
+# The second result of _sd_paint_divq (the remainder) and _sd_paint_radial_t (1 = inexact).
+var _sd_paint_rem = 0;
+
+fn _sd_gradient_new(kind, a, b, c, d): i64 {
+    var g = sd_alloc(SD_GRADIENT_SIZE);
+    if (g == 0) { return 0; }
+    var stops = sd_alloc(SD_GRADIENT_STOP_CAP * 16);
+    if (stops == 0) { return 0; }
+    var ramp = sd_alloc((SD_GRADIENT_RAMP_N + 1) * 4);
+    if (ramp == 0) { return 0; }
+    store64(g + SD_GRADIENT_KIND_OFFSET, kind);
+    store64(g + SD_GRADIENT_SPREAD_OFFSET, SD_SPREAD_PAD);
+    store64(g + SD_GRADIENT_A_OFFSET, a);
+    store64(g + SD_GRADIENT_B_OFFSET, b);
+    store64(g + SD_GRADIENT_C_OFFSET, c);
+    store64(g + SD_GRADIENT_D_OFFSET, d);
+    store64(g + SD_GRADIENT_STOPS_OFFSET, stops);
+    store64(g + SD_GRADIENT_NSTOPS_OFFSET, 0);
+    store64(g + SD_GRADIENT_CAP_OFFSET, SD_GRADIENT_STOP_CAP);
+    store64(g + SD_GRADIENT_RAMP_OFFSET, ramp);
+    store64(g + SD_GRADIENT_DIRTY_OFFSET, 1);
+    return g;
+}
+
+# @public — a linear gradient along (x0, y0) -> (x1, y1), 16.16 canvas coordinates. No stops yet;
+# spread PAD. Returns the SdGradient ptr, or 0 on OOM.
+fn sd_gradient_linear(x0, y0, x1, y1): i64 {
+    return _sd_gradient_new(SD_GRADIENT_LINEAR, x0, y0, x1, y1);
+}
+
+# @public — a radial gradient centred on (cx, cy) with radius r, all 16.16 canvas coordinates;
+# t = distance / r. No stops yet; spread PAD. Returns the SdGradient ptr, or 0 on OOM.
+fn sd_gradient_radial(cx, cy, r): i64 {
+    return _sd_gradient_new(SD_GRADIENT_RADIAL, cx, cy, r, 0);
+}
+
+# @public
+fn sd_gradient_stop_count(g): i64 { return load64(g + SD_GRADIENT_NSTOPS_OFFSET); }
+
+# @public — add a colour stop. `offset` is 16.16, clamped to [0, SD_ONE]; `color` is 0xAARRGGBB
+# under the legacy alpha rule (alpha byte 0 == opaque). Inserted after every stop whose offset is
+# <= this one (stable). Returns SADISH_OK, SADISH_ERR_BOUNDS for g == 0, or SADISH_ERR_OOM when
+# growing the stop block fails (the gradient is unchanged).
+fn sd_gradient_add_stop(g, offset, color): i64 {
+    if (g == 0) { return SADISH_ERR_BOUNDS; }
+    var o = offset;
+    if (o < 0) { o = 0; }
+    if (o > SD_ONE) { o = SD_ONE; }
+    var stops = load64(g + SD_GRADIENT_STOPS_OFFSET);
+    var n = load64(g + SD_GRADIENT_NSTOPS_OFFSET);
+    var cap = load64(g + SD_GRADIENT_CAP_OFFSET);
+    if (n >= cap) {
+        var ncap = cap * 2;
+        var grown = sd_alloc(ncap * 16);
+        if (grown == 0) { return SADISH_ERR_OOM; }
+        memcpy(grown, stops, n * 16);
+        stops = grown;
+        store64(g + SD_GRADIENT_STOPS_OFFSET, stops);
+        store64(g + SD_GRADIENT_CAP_OFFSET, ncap);
+    }
+    # Shift every stop with a strictly GREATER offset up one slot; equal offsets stay in front.
+    var i = n;
+    var stop = 0;
+    while (stop == 0) {
+        if (i == 0) {
+            stop = 1;
+        } else {
+            var prev = stops + (i - 1) * 16;
+            if (load64(prev) > o) {
+                store64(prev + 16, load64(prev));
+                store64(prev + 24, load64(prev + 8));
+                i = i - 1;
+            } else {
+                stop = 1;
+            }
+        }
+    }
+    store64(stops + i * 16, o);
+    store64(stops + i * 16 + 8, color);
+    store64(g + SD_GRADIENT_NSTOPS_OFFSET, n + 1);
+    store64(g + SD_GRADIENT_DIRTY_OFFSET, 1);
+    return SADISH_OK;
+}
+
+# @public — set the spread mode (SD_SPREAD_PAD | _REPEAT | _REFLECT). Returns SADISH_OK, or
+# SADISH_ERR_BOUNDS for g == 0 / an unknown mode (the gradient is unchanged).
+fn sd_gradient_set_spread(g, spread): i64 {
+    if (g == 0) { return SADISH_ERR_BOUNDS; }
+    if (spread < SD_SPREAD_PAD) { return SADISH_ERR_BOUNDS; }
+    if (spread > SD_SPREAD_REFLECT) { return SADISH_ERR_BOUNDS; }
+    store64(g + SD_GRADIENT_SPREAD_OFFSET, spread);
+    return SADISH_OK;
+}
+
+# The colour of `n` sorted stops at t (16.16, [0, SD_ONE]), given k = the LAST stop whose offset is
+# <= t (0 when t lies before every stop): stop k's colour before the first stop and from the last
+# one on, otherwise the per-channel interpolation to stop k + 1, rounded to nearest. 0xAARRGGBB with
+# the actual alpha.
+fn _sd_gradient_lerp(stops, n, k, t): i64 {
+    var lo = stops + k * 16;
+    var c = load64(lo + 8);
+    var e = sd_rgba(sd_color_r(c), sd_color_g(c), sd_color_b(c), sd_alpha_of(c));
+    if (t < load64(lo)) { return e; }
+    if (k + 1 >= n) { return e; }
+    # load64(lo) <= t < offset[k+1], so the span is > 0.
+    var hi = lo + 16;
+    var c1 = load64(hi + 8);
+    var span = load64(hi) - load64(lo);
+    var w1 = t - load64(lo);
+    var w0 = span - w1;
+    var half = span >> 1;
+    var r = (sd_color_r(c) * w0 + sd_color_r(c1) * w1 + half) / span;
+    var gg = (sd_color_g(c) * w0 + sd_color_g(c1) * w1 + half) / span;
+    var b = (sd_color_b(c) * w0 + sd_color_b(c1) * w1 + half) / span;
+    var a = (sd_alpha_of(c) * w0 + sd_alpha_of(c1) * w1 + half) / span;
+    return sd_rgba(r, gg, b, a);
+}
+
+# The colour at t (16.16, [0, SD_ONE]) by a stop search — for t inside a marked ramp cell.
+fn _sd_gradient_eval(g, t): i64 {
+    var stops = load64(g + SD_GRADIENT_STOPS_OFFSET);
+    var n = load64(g + SD_GRADIENT_NSTOPS_OFFSET);
+    var k = 0;
+    var adv = 0;
+    while (adv == 0) {
+        if (k + 1 >= n) {
+            adv = 1;
+        } else {
+            if (load64(stops + (k + 1) * 16) <= t) { k = k + 1; } else { adv = 1; }
+        }
+    }
+    return _sd_gradient_lerp(stops, n, k, t);
+}
+
+# Resolve the sorted stops into the ramp: entry i = the colour at t = i * 64 (16.16), or 0 (alpha
+# byte 0: no real entry has it) when a stop lies strictly inside (i * 64, (i + 1) * 64). Requires
+# n_stops >= 1. Entry 1024 is never marked: no offset exceeds SD_ONE.
+fn _sd_gradient_build_ramp(g): i64 {
+    var stops = load64(g + SD_GRADIENT_STOPS_OFFSET);
+    var n = load64(g + SD_GRADIENT_NSTOPS_OFFSET);
+    var ramp = load64(g + SD_GRADIENT_RAMP_OFFSET);
+    var cell = SD_ONE >> SD_GRADIENT_RAMP_BITS;
+    var k = 0;                       # the LAST stop whose offset <= t (0 while t is before them all)
+    var i = 0;
+    while (i <= SD_GRADIENT_RAMP_N) {
+        var t = i * cell;
+        var adv = 0;
+        while (adv == 0) {
+            if (k + 1 >= n) {
+                adv = 1;
+            } else {
+                if (load64(stops + (k + 1) * 16) <= t) { k = k + 1; } else { adv = 1; }
+            }
+        }
+        var e = _sd_gradient_lerp(stops, n, k, t);
+        # The first stop with an offset > t: k + 1, or k itself while t is before every stop.
+        var nxt = k + 1;
+        if (load64(stops + k * 16) > t) { nxt = k; }
+        if (nxt < n) {
+            if (load64(stops + nxt * 16) < t + cell) { e = 0; }
+        }
+        store32(ramp + i * 4, e);
+        i = i + 1;
+    }
+    store64(g + SD_GRADIENT_DIRTY_OFFSET, 0);
+    return 0;
+}
+
+# Map t = floor(true_t * one) (`one` a power of two) into [0, one] under `spread`, still a floor.
+# `frac` is 1 when true_t * one is not an integer. Two's-complement `&` IS the floor-based modulo, so
+# negative t needs no special case; REFLECT mirrors through the ceiling, floor(2 - x) = 2 - ceil(x).
+fn _sd_gradient_spread(spread, t, frac, one): i64 {
+    if (spread == SD_SPREAD_REPEAT) { return t & (one - 1); }
+    if (spread == SD_SPREAD_REFLECT) {
+        var v = t & (one * 2 - 1);
+        var c = v + frac;
+        if (c > one) { v = one * 2 - c; }
+        return v;
+    }
+    if (t < 0) { return 0; }
+    if (t > one) { return one; }
+    return t;
+}
+
+# @public — the colour the paint has at parameter `t` (16.16, any value; spread applied), as
+# 0xAARRGGBB — exactly what a blit paints for a pixel whose t is `t`: the ramp entry, or the stop
+# evaluation in a cell that holds a stop. Byte 3 is the ACTUAL interpolated alpha, 1..255: it is
+# never 0, because no stop can express 0 (legacy rule) and interpolation stays between its stops —
+# so the value also reads back unchanged through sd_alpha_of. Read it with sd_color_a. Returns 0
+# for g == 0 or a gradient with no stops; a caller tells that apart from a colour by
+# sd_gradient_stop_count (0), never by the value.
+fn sd_gradient_color_at(g, t): i64 {
+    if (g == 0) { return 0; }
+    if (load64(g + SD_GRADIENT_NSTOPS_OFFSET) == 0) { return 0; }
+    if (load64(g + SD_GRADIENT_DIRTY_OFFSET) != 0) { _sd_gradient_build_ramp(g); }
+    var u = _sd_gradient_spread(load64(g + SD_GRADIENT_SPREAD_OFFSET), t, 0, SD_ONE);
+    var ramp = load64(g + SD_GRADIENT_RAMP_OFFSET);
+    var e = load32(ramp + (u >> (SD_SHIFT - SD_GRADIENT_RAMP_BITS)) * 4);
+    if (e == 0) { e = _sd_gradient_eval(g, u); }
+    return e;
+}
+
+# floor(n * 2^k / b) for b > 0, by restoring binary long division; the remainder, in [0, b), is left
+# in _sd_paint_rem. Exact, and no intermediate exceeds b (< 2^63) — a remainder is doubled only when
+# that stays below b — as long as the quotient itself fits (the direct product would not).
+fn _sd_paint_divq(n, b, k): i64 {
+    var neg = 0;
+    var rem = n;
+    if (rem < 0) { rem = 0 - rem; neg = 1; }
+    var q = rem / b;
+    rem = rem - q * b;
+    var i = 0;
+    while (i < k) {
+        q = q << 1;
+        if (rem >= b - rem) {
+            rem = rem - (b - rem);
+            q = q + 1;
+        } else {
+            rem = rem + rem;
+        }
+        i = i + 1;
+    }
+    if (neg != 0) {
+        q = 0 - q;
+        if (rem != 0) {
+            q = q - 1;
+            rem = b - rem;
+        }
+    }
+    _sd_paint_rem = rem;
+    return q;
+}
+
+# floor(sqrt(n)) — the same value as sd_isqrt, which starts Newton at n itself (~log2(n)/2 halving
+# divisions before it converges). This one starts at 2^ceil(bits/2), within 2x of the root, so it
+# converges in a handful of divisions: it runs once per covered pixel of a radial blit.
+fn _sd_paint_isqrt(n): i64 {
+    if (n <= 0) { return 0; }
+    var v = n;
+    var bits = 1;
+    if (v >= 4294967296) { v = v >> 32; bits = bits + 32; }
+    if (v >= 65536) { v = v >> 16; bits = bits + 16; }
+    if (v >= 256) { v = v >> 8; bits = bits + 8; }
+    if (v >= 16) { v = v >> 4; bits = bits + 4; }
+    if (v >= 4) { v = v >> 2; bits = bits + 2; }
+    if (v >= 2) { bits = bits + 1; }
+    var x = 1 << ((bits + 1) >> 1);   # n < 2^bits  ⇒  sqrt(n) < x
+    var y = (x + n / x) >> 1;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) >> 1;
+    }
+    return x;
+}
+
+# floor(sqrt(d2) * 2^16 / r) for 0 <= d2 < 2^63 and r > 0 — a radial pixel's t in 16.16, EXACT.
+# _sd_paint_rem is left 1 when sqrt(d2) * 2^16 / r is not an integer, else 0.
+# The root is taken to 16 fraction bits, R = floor(sqrt(d2 * 2^32)), and t = R / r (a floor of a
+# floor is the floor). Below 2^31, d2 * 2^32 fits and R is its root. Above it, with
+# s = floor(sqrt(d2)) and m = d2 - s^2, the fraction bits are f = floor(m * 2^16 / (sqrt(d2) + s)),
+# which is floor(m * 2^16 / 2s) or one less: the two quotients differ by < 2^16 / (2s + 1), under 1
+# for any s >= 32,768, and here s >= 46,340. (s * 2^16 + f)^2 <= d2 * 2^32 decides it, as
+# f^2 <= ((m * 2^16) mod 2s) * 2^16 — i64 throughout, where the direct square needs ~96 bits.
+# (m == 2s makes the quotient 65536 with remainder 0, which that test takes down to 65535.)
+fn _sd_paint_radial_t(d2, r): i64 {
+    var root = 0;
+    var inexact = 0;
+    if (d2 < 2147483648) {
+        var big = d2 << 32;
+        root = _sd_paint_isqrt(big);
+        if (root * root != big) { inexact = 1; }
+    } else {
+        var s = _sd_paint_isqrt(d2);
+        var num = (d2 - s * s) << 16;
+        var f = num / (2 * s);
+        if (f * f > ((num - f * 2 * s) << 16)) { f = f - 1; }
+        root = (s << 16) + f;
+        if (num != 0) { inexact = 1; }
+    }
+    var t = root / r;
+    if (t * r != root) { inexact = 1; }
+    _sd_paint_rem = inexact;
+    return t;
+}
+
+# ================================================================
+# sd_canvas_blit_paint_at — composite the canvas coverage onto `surface` with the canvas's (0,0) at
+# surface pixel (dx, dy), the source colour of each pixel coming from gradient `g` sampled at the
+# pixel's centre in CANVAS space. Source alpha = coverage * paint_alpha / 255; src-over as
+# sd_canvas_blit_at: every pixel with coverage != 0 is written, dst alpha byte 255. Clipped to the
+# surface on every side; rows addressed by sd_surface_stride. Returns SADISH_OK (also for a gradient
+# with no stops, which paints nothing), or SADISH_ERR_BOUNDS for a null cv / surface / g.
+# ================================================================
+# @public
+fn sd_canvas_blit_paint_at(cv, surface, g, dx, dy): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (surface == 0) { return SADISH_ERR_BOUNDS; }
+    if (g == 0) { return SADISH_ERR_BOUNDS; }
+    if (load64(g + SD_GRADIENT_NSTOPS_OFFSET) == 0) { return SADISH_OK; }
+    if (load64(g + SD_GRADIENT_DIRTY_OFFSET) != 0) { _sd_gradient_build_ramp(g); }
+    var ramp = load64(g + SD_GRADIENT_RAMP_OFFSET);
+    var spread = load64(g + SD_GRADIENT_SPREAD_OFFSET);
+    var cw = sd_canvas_width(cv);
+    var ch = sd_canvas_height(cv);
+    var covbuf = sd_canvas_coverage(cv);
+    var covstride = sd_canvas_stride(cv);
+    var sw = sd_surface_width(surface);
+    var sh = sd_surface_height(surface);
+    var spx = sd_surface_pixels(surface);
+    var pitch = sd_surface_stride(surface);
+
+    # Clip the canvas rect [dx, dx+cw) x [dy, dy+ch) to the surface (canvas coordinates).
+    var x0 = 0;
+    if (dx < 0) { x0 = 0 - dx; }
+    var y0 = 0;
+    if (dy < 0) { y0 = 0 - dy; }
+    var x1 = cw;
+    if (dx + x1 > sw) { x1 = sw - dx; }
+    var y1 = ch;
+    if (dy + y1 > sh) { y1 = sh - dy; }
+
+    # mode: 0 linear, 1 radial, 2 solid (the degenerate cases: the colour at t = 1, the last stop).
+    var mode = 2;
+    var one32 = 1 << 32;
+    var gx = load64(g + SD_GRADIENT_A_OFFSET);
+    var gy = load64(g + SD_GRADIENT_B_OFFSET);
+    var rad = load64(g + SD_GRADIENT_C_OFFSET);
+    # Linear DDA, all in t * 2^32 = quotient + remainder / |d|^2: (qx, rx) per pixel step, (qy, ry)
+    # per row, (rq, rr) at the row's first pixel; cx / cy = l2 - rx / l2 - ry, so carrying a
+    # remainder never forms a sum >= l2.
+    var l2 = 0;
+    var qx = 0;
+    var rx = 0;
+    var cx = 0;
+    var qy = 0;
+    var ry = 0;
+    var cy = 0;
+    var rq = 0;
+    var rr = 0;
+    if (load64(g + SD_GRADIENT_KIND_OFFSET) == SD_GRADIENT_LINEAR) {
+        var ddx = load64(g + SD_GRADIENT_C_OFFSET) - gx;
+        var ddy = load64(g + SD_GRADIENT_D_OFFSET) - gy;
+        l2 = ddx * ddx + ddy * ddy;
+        if (l2 >= 65536) {
+            mode = 0;
+            qx = _sd_paint_divq(ddx, l2, 48);
+            rx = _sd_paint_rem;
+            cx = l2 - rx;
+            qy = _sd_paint_divq(ddy, l2, 48);
+            ry = _sd_paint_rem;
+            cy = l2 - ry;
+            var ex = (x0 << SD_SHIFT) + (SD_ONE >> 1) - gx;
+            var ey = (y0 << SD_SHIFT) + (SD_ONE >> 1) - gy;
+            rq = _sd_paint_divq(ex * ddx + ey * ddy, l2, 32);
+            rr = _sd_paint_rem;
+        }
+    } else {
+        if (rad > 0) { mode = 1; }
+    }
+    var solid = load32(ramp + SD_GRADIENT_RAMP_N * 4);
+
+    var y = y0;
+    while (y < y1) {
+        var tq = rq;
+        var tr = rr;
+        var ey2 = 0;
+        if (mode == 1) {
+            var eyr = (y << SD_SHIFT) + (SD_ONE >> 1) - gy;
+            ey2 = eyr * eyr;
+        }
+        var x = x0;
+        while (x < x1) {
+            var a = load8(covbuf + y * covstride + x);
+            if (a != 0) {
+                var e = solid;
+                if (mode == 0) {
+                    var u = tq;
+                    if (spread == SD_SPREAD_PAD) {
+                        if (u < 0) { u = 0; }
+                        if (u > one32) { u = one32; }
+                    } else {
+                        var fr = 0;
+                        if (tr != 0) { fr = 1; }
+                        u = _sd_gradient_spread(spread, tq, fr, one32);
+                    }
+                    e = load32(ramp + (u >> 22) * 4);
+                    if (e == 0) { e = _sd_gradient_eval(g, u >> 16); }
+                }
+                if (mode == 1) {
+                    var exr = (x << SD_SHIFT) + (SD_ONE >> 1) - gx;
+                    var t16 = _sd_paint_radial_t(exr * exr + ey2, rad);
+                    var u16 = _sd_gradient_spread(spread, t16, _sd_paint_rem, SD_ONE);
+                    e = load32(ramp + (u16 >> 6) * 4);
+                    if (e == 0) { e = _sd_gradient_eval(g, u16); }
+                }
+                var sa = a;
+                var pa = (e >> 24) & 255;
+                if (pa != 255) { sa = (a * pa) / 255; }
+                var sr = (e >> 16) & 255;
+                var sg = (e >> 8) & 255;
+                var sb = e & 255;
+                var off = (y + dy) * pitch + (x + dx) * 4;
+                if (sa == 255) {
+                    store8(spx + off, sb);
+                    store8(spx + off + 1, sg);
+                    store8(spx + off + 2, sr);
+                    store8(spx + off + 3, 255);
+                } else {
+                    var ia = 255 - sa;
+                    store8(spx + off, (sb * sa + load8(spx + off) * ia) / 255);
+                    store8(spx + off + 1, (sg * sa + load8(spx + off + 1) * ia) / 255);
+                    store8(spx + off + 2, (sr * sa + load8(spx + off + 2) * ia) / 255);
+                    store8(spx + off + 3, 255);
+                }
+            }
+            if (tr >= cx) {
+                tr = tr - cx;
+                tq = tq + qx + 1;
+            } else {
+                tr = tr + rx;
+                tq = tq + qx;
+            }
+            x = x + 1;
+        }
+        if (rr >= cy) {
+            rr = rr - cy;
+            rq = rq + qy + 1;
+        } else {
+            rr = rr + ry;
+            rq = rq + qy;
+        }
+        y = y + 1;
+    }
+    return SADISH_OK;
+}
+
+# @public — sd_canvas_blit_paint_at with the canvas at the surface origin.
+fn sd_canvas_blit_paint(cv, surface, g): i64 {
+    return sd_canvas_blit_paint_at(cv, surface, g, 0, 0);
+}

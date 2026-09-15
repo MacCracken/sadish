@@ -25,7 +25,10 @@ output = "build/sadish-smoke"
 # (declared in src/lib.cyr), then domain modules in dependency order.
 # error.cyr is dep-free; surface.cyr (SdSurface BGRA pixel buffer) + draw.cyr
 # (direct opaque primitives) build on error only; geom.cyr uses error;
-# path.cyr builds on geom; raster.cyr consumes path. Don't reorder without
+# path.cyr builds on geom; coverage.cyr (the opt-in SD_AA_AREA engine) builds on
+# geom + error; raster.cyr consumes path and dispatches into coverage; stroke.cyr
+# fills through raster (fill_union, the fill + stroker scratch); paint.cyr
+# (gradient paint) composites through raster's SdCanvas. Don't reorder without
 # re-running `cyrius distlib` and verifying the concatenated bundle compiles.
 # alloc.cyr is FIRST: the allocation seam (sd_alloc) every other module draws from.
 [lib]
@@ -37,7 +40,10 @@ modules = [
     "src/present.cyr",
     "src/geom.cyr",
     "src/path.cyr",
+    "src/coverage.cyr",
     "src/raster.cyr",
+    "src/stroke.cyr",
+    "src/paint.cyr",
 ]
 
 [deps]
