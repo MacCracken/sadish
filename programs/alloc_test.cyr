@@ -217,10 +217,13 @@ fn main(): i64 {
     }
     var hw1 = arena_used(g_arena) - ab;
     # ⭐ THE HEADLINE. Twenty frames of fill + union + stroke + clip + blit: not one byte on the
-    # global heap. MEASURED: the twenty rounds put 900,000 B on the arena (45,000 B per round; the
-    # same round cost the global heap 3,456,048 B on 0.5.4). The arena is 4 MiB so it never chains
-    # a chunk — a chunk would come from the global allocator and fail this, which is the correct
-    # answer for an arena sized too small.
+    # global heap. MEASURED 2026-09-16: the twenty rounds put 269,760 B on the arena (13,488 B per
+    # round; the same round cost the global heap 3,456,048 B on 0.5.4). ⚠ Was 893,760 B / 44,688 B
+    # per round through 0.7.2 — 0.8.0 opened the round stroker's piece paths at their exact capacity
+    # (src/stroke.cyr), which takes 31,200 B a round off the arena: the stroke of the 4-vertex rect
+    # below went from 34,432 B to 3,232 B. The arena is 4 MiB so it never chains a chunk — a chunk
+    # would come from the global allocator and fail this, which is the correct answer for an arena
+    # sized too small.
     check(alloc_used() - gb, 0);                                       # 35
     check(hw1 > 0, 1);                                                 # 36 — and the arena paid for it
     # Convergence: reset, repeat, same high-water mark — the arena is not growing frame over frame.
@@ -265,8 +268,11 @@ fn main(): i64 {
     gc = alloc_used();
     sd_canvas_stroke_path(cv, rect, SD_ONE);
     var stroke_cost2 = alloc_used() - gc;
-    # A stroke still builds a path per segment + per vertex disc (on the seam): MEASURED 34,432 B
-    # for a closed 4-vertex rect (was 2,789,528 B, 16x16), identical on the second call.
+    # A stroke still builds a path per segment + per vertex disc (on the seam): MEASURED 3,232 B
+    # for a closed 4-vertex rect (was 34,432 B through 0.7.2 and 2,789,528 B on 0.5.4, 16x16),
+    # identical on the second call. ⚠ 0.8.0 opened those paths at sd_path_new_cap(5, 4) and
+    # (17, 16) instead of SD_PATH_CAP; the ALLOCATION COUNT did not move (104), only the bytes.
+    # The exact figure is pinned by programs/stroke_style_test.cyr #13; #48 below is a bound.
     check(stroke_cost > 0, 1);                                         # 46
     check(stroke_cost, stroke_cost2);                                  # 47
     check(stroke_cost < 65536, 1);                                     # 48

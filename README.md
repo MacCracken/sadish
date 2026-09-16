@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.7.2
+Version: 0.8.0
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -115,12 +115,27 @@ toolkit are all **consumers**, not re-implementations.
     gained an argument.
   - **Three coverage loads and three shipped headers** that no suite could tell
     apart, or that stated the opposite of the code, are pinned and corrected.
-- **next (candidates, none started):** inline `(x, y)` storage in `SdPath` instead
-  of `SdPoint` pointers — an ABI change rekha measured as worth 78,656 → 58,672 B
-  for the ASCII glyph set and one fewer allocation per point; separate verb/point
-  capacities on `SdPath` (the same record, same question); a premultiplied AGNOS
-  `blit#39` fast path; and `sd_present_open`'s own `/dev/fb0` allocation guards,
-  which no test can reach without writing to the live display.
+- **v0.8.0 — the repair backlog closes (shipped).** ⛔ All four issue filings are
+  archived; `docs/development/issues/` holds only its README:
+  - **The stroker's piece paths open at their exact size** — `sd_path_new_cap`
+    finally has an in-tree caller. A closed 8x8 rect stroke costs the seam
+    34,432 B → **3,232 B**, a 54-glyph round-stroked label 16,357,904 B →
+    **1,557,176 B**, both in an unchanged number of allocations (which is what
+    proves no array doubled).
+  - **A flattened polyline says whether it is whole** — `SdPolyline` is 24 B with
+    a verdict word; `sd_polyline_truncated` / `_degraded` / `_verdict`. The prefix
+    is flagged, not refused; "refuse" belongs at the draw, where it has been since
+    0.7.1.
+  - **The presenter's `open()` is reachable without a display** —
+    `sd_present_open_fd` / `_path`, gated over a regular file with descriptors
+    counted; it also gates three `memset`s that only a reused arena can see.
+- **next: v0.9.0 — inline `(x, y)` storage in `SdPath`** instead of `SdPoint`
+  pointers: rekha measured 78,656 → 58,672 B for the ASCII glyph set and one fewer
+  allocation per point. ⚠ An ABI break — 14 reads across 6 rekha programs walk the
+  points array — so it ships alone, with a filing into rekha carrying the port.
+- **later (candidates):** a premultiplied AGNOS `blit#39` fast path; rekha adopting
+  `sd_path_new_cap` (`proposals/2026-09-15-path-capacity-…` item 3); and
+  `sd_present_open`'s single remaining ungated line, which only a display can gate.
 
 ## Place in the stack
 
@@ -157,7 +172,8 @@ core — fill, stroke, gradient, affine transforms, clip, and analytic AA — is
 live as of **v0.4.0**; styled strokes, gradient paint and exact 2-axis coverage
 as of **v0.6.0**; dashes, focal gradients and premultiplied output as of **v0.7.0**;
 bounded flattening and checked allocations as of **v0.7.1**; hook-safe strokes and
-bounded fills as of **v0.7.2**.
+bounded fills as of **v0.7.2**; exact-size piece paths and a self-describing
+polyline as of **v0.8.0**.
 
 ## Dependencies
 
@@ -178,7 +194,8 @@ cyrius build programs/smoke.cyr build/sadish-smoke    # link-check
 # RUN tests (each self-checks and exits non-zero on failure)
 for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present blend alloc \
          stride stroke_style paint area integration grow_edges paint_focal premul \
-         dash clip_pitch paint_premul flatten_bound oom stroke_oom path_cap; do
+         dash clip_pitch paint_premul flatten_bound oom stroke_oom path_cap \
+         present_open; do
   cyrius build "programs/${t}_test.cyr" "build/${t}_test" && "./build/${t}_test"
 done
 ```

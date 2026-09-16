@@ -2,7 +2,7 @@
 # by rekha against 0.7.0:
 #
 #   1. THE MID-POINT WASTE + THE WORK PAST THE CAP
-#      (issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md)
+#      (issues/archived/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md)
 #      Through 0.7.0 every subdivision node allocated 3 (quad) or 6 (cubic) SdPoints through
 #      sd_pt_mid and threw all but one away, and the recursion went on subdividing after the output
 #      could take nothing more. MEASURED on 0.7.0: 4,096 maximally non-flat quads through one
@@ -37,6 +37,11 @@
 # ⭐ GROUP P IS WHAT THAT RE-MEASURE WOULD OTHERWISE HAVE COST: 102/103/104 were the only gate on
 # sd_flatten_quad / sd_flatten_cubic's OWN per-curve operation, which the STROKER still depends on.
 # ⛔ Never re-measure a figure without asking what it was pinning.
+# ⭐ GROUP Q IS 0.8.0's CHANGE — the SdPolyline carries its OWN truncated/degraded verdict, item 1
+# of the filing's "Still open" section (the two globals are sticky by design and cannot answer for
+# a result taken a while ago). It moves nothing: the record grew 16 B -> 24 B, so four measured
+# BYTE figures in group D and three arena sizes here are 8 B larger, and every allocation COUNT,
+# every point count and every coverage figure in this file is unchanged.
 # Exit code = failed checks; each failure prints its check number.
 
 include "src/lib.cyr"
@@ -110,6 +115,20 @@ var g_skip = 0;
 fn hook_skip(n): i64 {
     g_calls = g_calls + 1;
     if (g_calls == g_skip) { return 0; }
+    return alloc(n);
+}
+
+# A SIZE-CAPPED hook: grants anything up to g_maxn bytes and refuses anything larger. Set it to
+# SD_FLATTEN_CAP * 8 and sd_path_flatten gets its initial output array, its 24 B ctx, its
+# mid-points and its 24 B polyline header — but never the 131,072 B doubling. That is the only
+# shape in which ONE call earns BOTH verdicts (group Q4): the budget cuts curves to chords, and
+# the chords then overrun an output that cannot grow.
+var g_maxn = 0;
+
+fn hook_cap(n): i64 {
+    g_calls = g_calls + 1;
+    if (n > g_maxn) { return 0; }
+    g_bytes = g_bytes + n;
     return alloc(n);
 }
 
@@ -648,6 +667,8 @@ fn main(): i64 {
     #   4,096 |    1,048,577 |69,377 |  83,623,976 | 3,076,136 |    3,133,451 | 65,287
     # ⇒ At 4,096 quads: 27.2x the bytes and 48.0x the allocations, and the work no longer grows
     # with the curve count at all (the 1,024 and 4,096 rows are the same figure — the budget).
+    # ⚠ THE ASSERTED BYTES ARE 0.7.1's + 8 (0.8.0): the SdPolyline header carries a verdict word
+    # and is 24 B, not 16. The ALLOCATION COUNTS are untouched — it is the same one header.
     var d32 = hostile_quads(32);
     var d64 = hostile_quads(64);
     var d1k = hostile_quads(1024);
@@ -658,7 +679,8 @@ fn main(): i64 {
     var dpl = sd_path_flatten(d32, TOL);
     sd_alloc_set(prev);
     check(sd_polyline_count(dpl), 8193);                              # 46
-    check(g_bytes, 327208);                                           # 47
+    check(g_bytes, 327216);                                           # 47 — 0.7.2: 327,208 (+8:
+    #                                                                   the 24 B polyline header)
     check(g_calls, 8164);                                             # 48
     check(sd_flatten_degraded(), 0);                                  # 49 — 8,193 < 65,536
     g_calls = 0;
@@ -667,7 +689,7 @@ fn main(): i64 {
     dpl = sd_path_flatten(d64, TOL);
     sd_alloc_set(prev);
     check(sd_polyline_count(dpl), 16385);                             # 50
-    check(g_bytes, 719912);                                           # 51
+    check(g_bytes, 719920);                                           # 51 — 0.7.2: 719,912
     check(g_calls, 16325);                                            # 52
     g_calls = 0;
     g_bytes = 0;
@@ -675,7 +697,7 @@ fn main(): i64 {
     dpl = sd_path_flatten(d1k, TOL);
     sd_alloc_set(prev);
     check(sd_polyline_count(dpl), 66305);                             # 53 — the budget, then chords
-    check(g_bytes, 3076136);                                          # 54
+    check(g_bytes, 3076144);                                          # 54 — 0.7.2: 3,076,136
     check(g_calls, 65287);                                            # 55
     check(sd_flatten_degraded(), 1);                                  # 56 — and it SAYS it degraded
     g_calls = 0;
@@ -684,7 +706,7 @@ fn main(): i64 {
     dpl = sd_path_flatten(d4k, TOL);
     sd_alloc_set(prev);
     check(sd_polyline_count(dpl), 69377);                             # 57
-    check(g_bytes, 3076136);                                          # 58 — same as 1,024 quads
+    check(g_bytes, 3076144);                                          # 58 — same as 1,024 quads
     check(g_calls, 65287);                                            # 59 — the bound is a BOUND
     check(sd_flatten_degraded(), 1);                                  # 60
     check(sd_flatten_truncated(), 0);                                 # 61 — degraded is not truncated
@@ -725,12 +747,13 @@ fn main(): i64 {
 
     # ── F) A FULL OUTPUT STOPS THE SUBDIVISION ──────────────────
     # An arena sized for out (65,536) + ctx (24) + the 8,160 mid-points of 32 quads + the polyline
-    # (16), and nothing more: the 8,193rd emit asks for a 131,072 B doubling, is refused, and the
-    # 32 REMAINING quads must then cost ZERO allocation attempts. Through 0.7.0 each of them still
+    # header (24 B since 0.8.0, 16 through 0.7.2), and nothing more: the 8,193rd emit asks for a
+    # 131,072 B doubling, is refused, and the 32 REMAINING quads must then cost ZERO allocation
+    # attempts. Through 0.7.0 each of them still
     # ran a full depth-8 subdivision: 32 x 765 = 24,480 more requests for points nothing could
     # hold. Total attempts here: 1 out + 1 ctx + 8,160 points + 1 refused doubling + 1 polyline.
     var fpath = hostile_quads(64);
-    var fa = arena_new(65536 + 24 + 8160 * 16 + 16);
+    var fa = arena_new(65536 + 24 + 8160 * 16 + 24);
     check(fa != 0, 1);                                                # 69
     var keep = g_arena;
     g_arena = fa;
@@ -746,7 +769,7 @@ fn main(): i64 {
     check(sd_flatten_truncated(), 1);                                 # 72 — and it says it lost some
     check(g_calls, 8164);                                             # 73 — ⛔ 32 quads cost NOTHING
     check(g_calls - g_ok, 1);                                         # 74 — exactly one refusal
-    check(arena_used(fa), 65536 + 24 + 8160 * 16 + 16);               # 75 — the arena is exactly full
+    check(arena_used(fa), 65536 + 24 + 8160 * 16 + 24);               # 75 — the arena is exactly full
     # the prefix is the SAME prefix 0.7.0 produced — stopping early changed no point
     var fref = ref_flatten(fpath, TOL, 8192);
     check(poly_vs_ref(fpl, fref), 0);                                 # 76
@@ -1128,7 +1151,7 @@ fn main(): i64 {
     # K1. A cubic node that cannot emit must not subdivide either. The arena holds the output
     # array, the ctx, room for mid-points and the polyline — but never the 131,072 B doubling.
     var kpath = hostile_cubics(64);
-    var ka = arena_new(65536 + 24 + 200000 + 16);
+    var ka = arena_new(65536 + 24 + 200000 + 24);
     check(ka != 0, 1);                                                # 185
     var kkeep = g_arena;
     g_arena = ka;
@@ -1357,7 +1380,7 @@ fn main(): i64 {
     var msmall = sd_path_flatten(mnarrow, TOL);
     var mnpts = sd_polyline_count(msmall);
     check(mnpts > 1, 1);                                              # 243 — it is a real curve
-    var marena = arena_new(65536 + 24 + 40 * 16 + 16);
+    var marena = arena_new(65536 + 24 + 40 * 16 + 24);
     check(marena != 0, 1);                                            # 244
     var mkeep = g_arena;
     g_arena = marena;
@@ -1868,6 +1891,211 @@ fn main(): i64 {
     sd_canvas_stroke_path(spfull, spcirc, 4 * SD_ONE);
     check(cov_sum(spfull), 126930);                                   # 371 — and unbudgeted it is
     check(sd_flatten_degraded(), 0);                                  # 372   the same whole picture
+
+    # ── Q) THE POLYLINE CARRIES ITS OWN VERDICT (0.8.0) ─────────────
+    # ⛔⛔ ITEM 1 OF THE FILING'S "Still open": *"set a flag on the polyline ... so a truncated
+    # contour is refused or clearly degraded, rather than filled open"*. 0.7.1 and 0.7.2 shipped
+    # the parenthetical (a fill and the three strokes return SADISH_ERR_OOM); the polyline itself
+    # still said nothing, and the two process-wide witnesses cannot stand in for it — both are
+    # sticky BY DESIGN (truncated() until the next sd_path_flatten, degraded() until the next
+    # depth-0 operation), so a consumer holding a result from a while ago has no way to ask.
+    # sd_path_flatten now freezes two bits into the record when its verb walk ends.
+    # ⚠ THE PREFIX IS STILL RETURNED, NOT REFUSED — see sd_path_flatten's header for the three
+    # reasons. Group F's 8,192-point prefix is byte-identical to the whole flattening's first
+    # 8,192 points (check 76) and a caller recovering from a starved frame may still want it; 0 is
+    # already spoken for twice; and "refuse" belongs at the DRAW, where it already is.
+    # ⭐ Every check below fails on 0.7.2 (the accessors do not exist there), so what they really
+    # gate is each site of the new code — the two `_sd_flat_cut = 1` sets, its clear, the capture
+    # and the store. Q5, Q6 and Q9 are the three that a plausible WRONG implementation fails and
+    # the rest do not: reading the globals at poll time (Q5), reading _sd_flat_degraded instead of
+    # the call's own flag (Q6), and clearing the call's flag at the BOTTOM of sd_path_flatten
+    # instead of the top (Q9 — and that mutant passes all 29 suites without Q9).
+    check(SD_POLYLINE_SIZE, 24);                                      # 373 — 16 through 0.7.2
+    check(SD_POLYLINE_VERDICT_OFFSET, 16);                            # 374
+    check(SD_POLYLINE_TRUNCATED, 1);                                  # 375 — one word of bits, so
+    check(SD_POLYLINE_DEGRADED, 2);                                   # 376   a third costs 0 B
+    # Q1. A COMPLETE FLATTEN REPORTS NEITHER — and it reports neither even though the call before
+    # it degraded, which is what pins the per-call flag's CLEAR (drop it and 379/381 read 1).
+    sd_flatten_budget_set(64);
+    sd_path_flatten(hostile_quads(32), TOL);                          # leaves the cut flag set
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 64);      # 377
+    var qwhole = sd_path_flatten(mixed_path(), TOL);
+    check(sd_polyline_count(qwhole) > 1, 1);                          # 378 — a real flattening
+    check(sd_polyline_degraded(qwhole), 0);                           # 379 — ⛔ NOT the last call's
+    check(sd_polyline_truncated(qwhole), 0);                          # 380
+    check(sd_polyline_verdict(qwhole), 0);                            # 381 — the whole word
+    check(sd_flatten_truncated(), 0);                                 # 382 — and the globals agree
+    check(sd_flatten_degraded(), 0);                                  # 383
+    # Q2. A BUDGET-DEGRADED FLATTEN: degraded, NOT truncated — every point it wanted is there.
+    check(sd_flatten_budget_set(64), SD_FLATTEN_BUDGET_DEFAULT);      # 384
+    var qdeg = sd_path_flatten(hostile_quads(32), TOL);
+    check(sd_polyline_count(qdeg), 98);                               # 385 — group G's figure
+    check(sd_polyline_degraded(qdeg), 1);                             # 386
+    check(sd_polyline_truncated(qdeg), 0);                            # 387
+    check(sd_polyline_verdict(qdeg), SD_POLYLINE_DEGRADED);           # 388
+    # ⛔ THE CUBIC RECURSION HAS ITS OWN COPY OF THE SET, exactly as it has its own copy of the
+    # budget guard — a cubic-only outline walks straight past a flag set in the quad branch alone.
+    var qdegk = sd_path_flatten(hostile_cubics(32), TOL);
+    check(sd_polyline_count(qdegk), 98);                              # 389 — group K2's figure
+    check(sd_polyline_degraded(qdegk), 1);                            # 390 — the cubic's own set
+    check(sd_polyline_truncated(qdegk), 0);                           # 391
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 64);      # 392
+    # Q3. A STARVED FLATTEN: truncated, NOT degraded. Group L3's shape — refuse the first
+    # mid-point and grant everything after it, so the result is the moveto alone.
+    var qfp = hostile_quads(2);
+    g_calls = 0;
+    g_skip = 3;
+    prev = sd_alloc_set(&hook_skip);
+    var qstarve = sd_path_flatten(qfp, TOL);
+    sd_alloc_set(prev);
+    g_skip = 0;
+    check(sd_polyline_count(qstarve), 1);                             # 393 — the moveto, and no more
+    check(sd_polyline_truncated(qstarve), 1);                         # 394 — ⛔ THE FILING'S ASK
+    check(sd_polyline_degraded(qstarve), 0);                          # 395 — nothing was CUT
+    check(sd_polyline_verdict(qstarve), SD_POLYLINE_TRUNCATED);       # 396
+    # ...and the other starvation shape, a refused DOUBLING of a full output (group F's arena).
+    var qfpath = hostile_quads(64);   # ⚠ built OFF the hook — the arena is for the flatten alone
+    var qfa = arena_new(65536 + 24 + 8160 * 16 + 24);
+    check(qfa != 0, 1);                                               # 397
+    var qkeep = g_arena;
+    g_arena = qfa;
+    prev = sd_alloc_set(&hook_arena);
+    var qfull = sd_path_flatten(qfpath, TOL);
+    sd_alloc_set(prev);
+    g_arena = qkeep;
+    check(sd_polyline_count(qfull), 8192);                            # 398 — the points that fit
+    check(sd_polyline_truncated(qfull), 1);                           # 399
+    check(sd_polyline_degraded(qfull), 0);                            # 400 — 8,192 < 65,536
+    # Q4. BOTH BITS, IN ONE RESULT — they are independent, and one call can earn both. A budget of
+    # 64 cuts curve 1 and chords the rest; 9,000 chords then overrun an 8,192-point output whose
+    # doubling this hook refuses. MEASURED: the record reads 3.
+    check(sd_flatten_budget_set(64), SD_FLATTEN_BUDGET_DEFAULT);      # 401
+    var qboth_path = hostile_quads(9000);
+    g_maxn = SD_FLATTEN_CAP * 8;
+    g_calls = 0;
+    prev = sd_alloc_set(&hook_cap);
+    var qboth = sd_path_flatten(qboth_path, TOL);
+    sd_alloc_set(prev);
+    g_maxn = 0;
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 64);      # 402
+    check(qboth != 0, 1);                                             # 403 — a result, not a fault
+    check(sd_polyline_count(qboth), SD_FLATTEN_CAP);                  # 404 — the output never grew
+    check(sd_polyline_truncated(qboth), 1);                           # 405 — points were lost
+    check(sd_polyline_degraded(qboth), 1);                            # 406 — and curves were cut
+    check(sd_polyline_verdict(qboth), 3);                             # 407 — both bits, one word
+    # Q5. ⛔⛔ THE VERDICT BELONGS TO THE POLYLINE. Four results are still in hand from Q1-Q4; the
+    # flattens that ran between them moved BOTH globals several times over, and not one of the
+    # four records moved with them. This is the whole difference from sd_flatten_truncated() /
+    # sd_flatten_degraded(), and an implementation that read either global at poll time would
+    # report one answer for all four.
+    var qcirc = circle_cubic(32 * SD_ONE, 32 * SD_ONE, 20 * SD_ONE);
+    var qlater = sd_path_flatten(qcirc, TOL);
+    check(sd_flatten_truncated(), 0);                                 # 408 — the globals say WHOLE
+    check(sd_flatten_degraded(), 0);                                  # 409
+    check(sd_polyline_verdict(qwhole), 0);                            # 410 — and each record still
+    check(sd_polyline_verdict(qdeg), SD_POLYLINE_DEGRADED);           # 411   says what it said
+    check(sd_polyline_verdict(qstarve), SD_POLYLINE_TRUNCATED);       # 412
+    check(sd_polyline_verdict(qboth), 3);                             # 413
+    check(sd_polyline_verdict(qlater), 0);                            # 414
+    # ...and the same with the globals pushed the OTHER way: a starved flatten now, and the whole
+    # results from before must not catch its verdict.
+    g_calls = 0;
+    g_skip = 1;
+    prev = sd_alloc_set(&hook_skip);
+    check(sd_path_flatten(qfp, TOL), 0);                              # 415 — out refused: no record
+    sd_alloc_set(prev);
+    g_skip = 0;
+    check(sd_flatten_truncated(), 1);                                 # 416 — the global says LOST
+    check(sd_polyline_verdict(qwhole), 0);                            # 417 — the records do not
+    check(sd_polyline_verdict(qlater), 0);                            # 418
+    check(sd_polyline_truncated(qdeg), 0);                            # 419
+    # Q6. DEGRADED IS THE CALL'S VERDICT, WHERE sd_flatten_degraded() IS THE OPERATION'S. Two
+    # flattens inside ONE consumer scope share one budget: the first spends it and is cut, the
+    # second is whole. The global answers 1 for both — that is its documented contract — and the
+    # second RECORD must answer 0. ⛔ An implementation that stamped _sd_flat_degraded into the
+    # record passes every other check in this group and fails this one.
+    sd_flatten_budget_set(64);
+    check(sd_flatten_op_begin(), 1);                                  # 420
+    var qcut = sd_path_flatten(hostile_quads(32), TOL);
+    check(sd_polyline_degraded(qcut), 1);                             # 421 — it spent the budget
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 64);      # 422
+    var qafter = sd_path_flatten(mixed_path(), TOL);
+    check(sd_flatten_degraded(), 1);                                  # 423 — the OPERATION degraded
+    check(sd_polyline_degraded(qafter), 0);                           # 424 — ⛔ THIS CALL DID NOT
+    check(sd_polyline_count(qafter), sd_polyline_count(qwhole));      # 425 — and it really is whole
+    check(sd_polyline_truncated(qafter), 0);                          # 426
+    check(sd_flatten_op_end(), 0);                                    # 427
+    # Q7. THE TWO ZEROS ARE STILL THE GLOBAL'S JOB, AND THE VERDICT DOES NOT HELP THERE — a call
+    # that returns no record has nowhere to put one. Stated as a check so nobody reads the new
+    # accessors as having closed this: an empty path and a refused allocation both return 0, and
+    # sd_flatten_truncated() is what separates them, exactly as it has since 0.7.1 (group M3).
+    var qempty = sd_path_new();
+    check(sd_path_flatten(qempty, TOL), 0);                           # 428 — empty
+    check(sd_flatten_truncated(), 0);                                 # 429 — ...and it says so
+    g_calls = 0;
+    g_skip = 2;
+    prev = sd_alloc_set(&hook_skip);
+    check(sd_path_flatten(qfp, TOL), 0);                              # 430 — ctx refused
+    sd_alloc_set(prev);
+    g_skip = 0;
+    check(sd_flatten_truncated(), 1);                                 # 431 — ...and it says THAT
+    # Q8. THE GLOBALS STILL BEHAVE EXACTLY AS THE REST OF THIS SUITE PINS THEM — read once more
+    # after all the verdict work, with a whole fill to say rendering did not move either.
+    var qcv = sd_canvas_new(64, 64);
+    check(sd_canvas_fill_path(qcv, qcirc, SD_FILL_NONZERO), SADISH_OK);   # 432
+    check(cov_sum(qcv), 312280);                                      # 433 — M6's true picture
+    check(sd_flatten_truncated(), 1);                                 # 434 — ⚠ STILL Q7's refused
+    #                                                                   flatten: a healthy fill
+    #                                                                   SCOPES the flag to itself
+    #                                                                   and puts the caller's
+    #                                                                   standing verdict back
+    check(sd_flatten_degraded(), 0);                                  # 435 — its own operation
+    check(sd_path_flatten(mixed_path(), TOL) != 0, 1);                # 436 — and sd_path_flatten
+    check(sd_flatten_truncated(), 0);                                 # 437   is what clears it
+    check(sd_flatten_budget_get(), SD_FLATTEN_BUDGET_DEFAULT);        # 438
+
+    # Q9. ⛔⛔ THE CUT FLAG IS CLEARED AT THE TOP OF sd_path_flatten, AND WHERE IT SITS IS THE
+    # WHOLE CONTRACT. _sd_flat_cut is set inside the two subdivision recursions, and those are
+    # reached by the PUBLIC per-curve entries sd_flatten_quad / sd_flatten_cubic as well — which is
+    # the road a FILL (sd_fill_impl) and the STROKER take. So between two sd_path_flatten calls, a
+    # cut can be made by something that is not an sd_path_flatten at all, and the ONLY thing
+    # keeping it out of the next polyline's verdict is that clear running BEFORE the walk.
+    # ⚠ Q1 DOES NOT HOLD THAT, and neither does Q6: in both, the call that does the cutting is
+    # itself an sd_path_flatten, so a clear DISPLACED to the bottom of the function handles them.
+    # MEASURED on this tree — `_sd_flat_cut = 0;` moved from the top of sd_path_flatten to just
+    # after the verdict store — ALL 29 SUITES STAYED GREEN while a fill-then-flatten stamped an
+    # entirely whole result DEGRADED. These checks are what fails on that mutant, and they are
+    # written in the shape a consumer actually hits: draw something, then flatten something.
+    var qcv2 = sd_canvas_new(64, 64);
+    check(sd_flatten_budget_set(4), SD_FLATTEN_BUDGET_DEFAULT);       # 439 — 1 curve's worth
+    check(sd_canvas_fill_path(qcv2, qcirc, SD_FILL_NONZERO), SADISH_OK);  # 440 — cut, not refused
+    check(sd_flatten_degraded(), 1);                                  # 441 — the FILL cut curves
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 4);       # 442
+    var qafill = sd_path_flatten(qcirc, TOL);
+    check(sd_polyline_count(qafill) > 1, 1);                          # 443 — a real flattening
+    check(sd_polyline_degraded(qafill), 0);                           # 444 — ⛔ NOT THE FILL'S
+    check(sd_polyline_verdict(qafill), 0);                            # 445 — the whole word
+    # ...and the stroker's own shape: ONE curve verb handed straight to sd_flatten_quad, cut by the
+    # budget, with no sd_path_flatten anywhere between that cut and the flatten that must ignore it.
+    var qsctx = alloc(24);
+    store64(qsctx + 0, alloc(4096 * 8));
+    store64(qsctx + 8, 0);
+    store64(qsctx + 16, 4096);
+    var qsp0 = sd_point_new(0, 0);
+    var qsp1 = sd_point_new(1000000000, 1000000000);
+    var qsp2 = sd_point_new(0, 0);
+    check(sd_flatten_budget_set(1), SD_FLATTEN_BUDGET_DEFAULT);       # 446
+    check(sd_flatten_op_begin(), 1);                                  # 447 — a consumer's scope
+    sd_flatten_quad(qsctx, qsp0, qsp1, qsp2, TOL, SD_FLATTEN_MAX_DEPTH);
+    check(sd_flatten_degraded(), 1);                                  # 448 — the CURVE was cut
+    check(sd_flatten_op_end(), 0);                                    # 449
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 1);       # 450
+    var qaquad = sd_path_flatten(qcirc, TOL);
+    check(sd_polyline_count(qaquad), sd_polyline_count(qafill));      # 451 — the same whole flatten
+    check(sd_polyline_degraded(qaquad), 0);                           # 452 — ⛔ NOR THAT CURVE'S
+    check(sd_polyline_verdict(qaquad), 0);                            # 453
+    check(sd_flatten_truncated(), 0);                                 # 454 — and nothing was lost
+    check(sd_flatten_budget_get(), SD_FLATTEN_BUDGET_DEFAULT);        # 455 — budget left as found
 
     if (g_fails == 0) {
         var ok = "flatten_bound_test: PASS (mid-points, the bound, sd_path_new_cap, checked allocs)\n";

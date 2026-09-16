@@ -19,7 +19,8 @@
 # three 0.4.0 behaviours no other cap/join pair has: a drawing verb after CLOSE continues the same
 # run ("M 4,4 L 28,4 L 28,20 Z L 4,20" strokes a closed rectangle; the styled path, like the fill,
 # reads a triangle and then (4,4) -> (4,20)); a pixel two pieces split reads the MAX of their
-# parts, not their sum (below); and 34,432 B of paths per closed-rect stroke, on the seam.
+# parts, not their sum (below); and a path per piece on the seam — 3,232 B per closed-rect stroke
+# since 0.8.0 opened each at its exact capacity, 34,432 B for the same 104 allocations before that.
 #
 # ⭐ THE STYLED PATH COLLECTS ITS PIECES AS ONE EDGE LIST AND FILLS IT ONCE. Piece-per-pass MAX
 # union is not a union: where two pieces share an edge INSIDE a pixel, the pixel gets max(a, b),
@@ -158,7 +159,25 @@ var SD_MITER_LIMIT_MAX = 67108864;
 # Returns SADISH_OK, or SADISH_ERR_OOM when the piece path, one of its four SdPoints or the fill
 # underneath is refused — this piece then draws NOTHING (the half-built path is abandoned to an
 # allocator with no free()), and every piece already drawn stays on the canvas. ⚠ 7 sd_alloc calls
-# a rect on the consumer's seam: sd_path_new's record + verbs + points, then one SdPoint a corner.
+# a rect on the consumer's seam: the path's record + verbs + points, then one SdPoint a corner.
+#
+# ⭐ THE PATH IS OPENED AT ITS EXACT SIZE (0.8.0) — item 2 of
+# docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md's "Still open": this is
+# one of the two in-tree sites that knew its size and bought SD_PATH_CAP = 256 + 256 anyway.
+# ⛔ THE COUNTS ARE READ OFF THE FIVE CALLS BELOW, NOT ESTIMATED: moveto + 3 linetos + close = 5
+# verbs; moveto and each lineto carry one point and close carries none = 4 points. Both land under
+# SD_PATH_CAP_MIN = 8, so each array is opened at 8 and neither can grow here — the path is built
+# with 3 VERB SLOTS AND 4 POINT SLOTS SPARE.
+# ⚠ THAT SLACK IS REAL, SO ADDING ONE CALL BELOW DOES NOT BUY A DOUBLING — MEASURED, at these same
+# arguments: one extra lineto is 256 B in 8 sd_allocs (6 verbs, 5 points, both capacities still 8),
+# three extra 288 B in 10 (8 verbs, 7 points, the verb array exactly full), and neither array has
+# moved. The verb array first doubles at the NINTH verb — moveto + 7 linetos + close — which is
+# 432 B in 12 with vcap 8 -> 16; the point array at the ninth point, one lineto later.
+# ⇒ What FAILS when the five calls below become six is group N's COUNT checks in
+# programs/path_cap_test.cyr (5 verbs, 4 points), NOT its capacity checks: those do not move until
+# the fourth extra lineto. Group N8 pins the whole boundary, so these numbers stay honest.
+# ⭐ MEASURED on the seam, per call: 4,208 B -> 240 B in the SAME 7 allocations (176 B of path —
+# 48 + 64 + 64 — plus the four 16 B SdPoints); the closed 8x8 rect stroke 34,432 B -> 3,232 B.
 fn sd_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
     var dx = bx - ax;
     var dy = by - ay;
@@ -168,7 +187,7 @@ fn sd_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
     if (l == 0) { return SADISH_OK; }
     var ox = ((0 - dy) * hw) / l;    # perpendicular offset, magnitude hw
     var oy = (dx * hw) / l;
-    var rp = sd_path_new();
+    var rp = sd_path_new_cap(5, 4);        # 5 verbs, 4 points — the five calls below, counted
     if (rp == 0) { return SADISH_ERR_OOM; }
     if (sd_path_moveto(rp, ax + ox, ay + oy) != SADISH_OK) { return SADISH_ERR_OOM; }
     if (sd_path_lineto(rp, bx + ox, by + oy) != SADISH_OK) { return SADISH_ERR_OOM; }
@@ -181,8 +200,21 @@ fn sd_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
 # A radius-hw disc (16-gon) at (cx, cy) — round cap / round join filler.
 # SADISH_OK, or SADISH_ERR_OOM on a refusal (nothing of this disc drawn), as sd_stroke_seg.
 # ⚠ 19 sd_alloc calls a disc: the path's three, then one SdPoint per vertex.
+#
+# ⭐ EXACT CAPACITY, LIKE sd_stroke_seg (0.8.0) — the second of the proposal's two in-tree sites.
+# ⛔ THE 17 AND THE 16 ARE THE `while (k < 16)` BELOW, COUNTED: 16 iterations emit one moveto and 15
+# linetos, then sd_path_close adds the 17th verb and no point — so 17 verbs and 16 points, and the
+# two arrays are EXACTLY full when the disc is built. ⚠ That is the tightest fit in the tree, and a
+# capacity one slot short of it pays a doubling and a memcpy: MEASURED, this shape opened at (16, 16)
+# is 816 B in 20 sd_alloc calls against 568 B in 19 — still well under the 4,400 B the 256-slot
+# default cost, and still 248 B and one copy more than deriving the count costs. ⚠ Raise the 16 (and
+# the `411775 / 16` step with it) without moving these arguments and BOTH arrays double: MEASURED at
+# k < 17, 1,112 B. programs/path_cap_test.cyr group N reads the capacities AND the counts back off
+# the record, so a changed 16 fails a check instead of quietly buying a doubling.
+# ⭐ MEASURED on the seam, per call: 4,400 B -> 568 B in the SAME 19 allocations (312 B of path —
+# 48 + 136 + 128 — plus the sixteen 16 B SdPoints).
 fn sd_stroke_disc(cv, cx, cy, hw): i64 {
-    var dp = sd_path_new();
+    var dp = sd_path_new_cap(17, 16);      # 16 vertices + the close = 17 verbs, 16 points
     if (dp == 0) { return SADISH_ERR_OOM; }
     var step = 411775 / 16;          # 2*pi / 16 in 16.16
     var k = 0;

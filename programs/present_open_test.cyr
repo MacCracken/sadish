@@ -1,0 +1,507 @@
+# programs/present_open_test.cyr — RUN test for the ACQUISITION half of the framebuffer presenter:
+# sd_present_open_path / sd_present_open_fd, their four allocation guards, and their fd hygiene.
+#
+# ⭐⭐ WHAT THIS EXISTS TO PROVE. Through 0.7.2 the presenter's four `sd_alloc` guards were gated
+# (programs/oom_test.cyr checks #69-#99, through `_sd_present_probe` and `_sd_presenter_build`) but
+# `sd_present_open` ITSELF was reached by no test at all — its first act was
+# `open("/dev/fb0", O_RDWR)`, and every test in this repo is forbidden from touching the live
+# display. That was the last note left on
+# docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md
+# and a named candidate in README.md. 0.8.0 makes the acquisition an ARGUMENT — `sd_present_open_fd`
+# takes a descriptor the caller already has, `sd_present_open_path` opens one by name, and
+# `sd_present_open` is what remains: those two tokens, "/dev/fb0". This suite drives everything
+# below the device name over a REGULAR FILE under build/, in 131 checks across groups A-J.
+#
+# ⛔ NOTHING HERE OPENS /dev/fb0, and nothing here may be edited into doing so. The stand-in is
+# build/present_open_test.fb, created O_RDWR|O_CREAT|O_TRUNC by this file. `sd_present_open` is
+# never called — it is named in comments and nowhere else.
+#
+# ⛔ THE THREE THINGS ASSERTED AT EVERY ACQUISITION:
+#   (a) the documented return — a presenter, or 0 for a failed open and for each of the four
+#       refusals, with the process running to completion;
+#   (b) NO DESCRIPTOR LEAKED. /proc/self/fd is counted before and after every call, including the
+#       nine refusals; a presenter that returns 0 holding an fd would show up as a count that
+#       never comes back down, and nothing else in the tree would notice.
+#   (c) the SUCCESS path is a whole presenter — four blocks, the geometry the fallbacks imply, and
+#       a blit whose bytes land in the file at the offsets a display would have seen.
+#
+# ⚠ WHY A NEW SUITE RATHER THAN MORE OF oom_test. Two reasons, both mechanical. oom_test's own
+# header states "NOTHING HERE TOUCHES /dev/fb0. `sd_present_open`'s first act is to open the live
+# display, so it is never called" — the sentence that scopes it away from this entry point, which
+# adding these cases would have to falsify. And oom_test pins exact GLOBAL-HEAP deltas (its checks
+# 4, 110, 125, 127, 151-156); the presenter this file opens costs 1,229,384 B in four blocks and
+# the descriptor probe below allocates a 4 KiB dirent buffer, neither of which belongs inside that
+# accounting. The refused-allocation contract is oom_test's; the acquisition contract is this file's.
+#
+# ⚠ WHAT THE GEOMETRY HERE IS, AND WHAT IT IS NOT. A regular file answers no ioctl (MEASURED:
+# FBIOGET_VSCREENINFO on one returns ENOTTY, -25), so `_sd_present_probe`'s two buffers stay zeroed
+# and its `<= 0` fallbacks produce 640x480x32 at a 2,560 B pitch. That is sadish's fallback
+# geometry, NOT the file's, and it is still worth gating: it is the same code path a device that
+# answers nothing takes, it exercises all four allocations at a real 1.2 MB scratch size, and the
+# blit it feeds writes its band at a real offset which this file reads back.
+#
+# ⛔ WHAT REMAINS UNGATED, said plainly rather than faked:
+#   1. `sd_present_open`'s body — the string "/dev/fb0" and the delegation to
+#      `sd_present_open_path`. Its argument IS the live display. An edit that misspelled the device
+#      or dropped the call leaves all 30 suites green; only a display can tell.
+#   2. The ioctl-ANSWERED direction inside `_sd_present_probe`. All four branches there — the three
+#      `<= 0` fallbacks and the `pitch < minpitch` clamp — are driven in the FALLBACK direction
+#      only, because nothing this suite is allowed to open can return real geometry. In particular
+#      the four `load32` offsets into the ioctl buffers (`xres` +0, `yres` +4, `bits_per_pixel` +24,
+#      `line_length` +48) are asserted by NO suite: a wrong offset reads a 0 out of a zeroed buffer
+#      and lands on the same 640x480x32 this file checks. Those offsets are the `fb_var_screeninfo`
+#      / `fb_fix_screeninfo` ABI, and only a framebuffer can gate them.
+#   3. REACHING `bpp == 16` THROUGH THE PROBE. This suite blits at 32 bpp because that is what the
+#      fallback geometry gives, and only a 16 bpp device could make `_sd_present_probe` produce
+#      anything else. ⚠ The PACKING itself is not a gap: `programs/stride_test.cyr` checks 96-97
+#      build a 16 bpp presenter record by hand (`st_presenter(fd, 30, 22, 16, 64)`) and assert the
+#      exact RGB565 word — MEASURED, a `(r >> 3)` -> `(r >> 2)` mutation of `sd_present_blit` fails
+#      stride_test #97 and nothing else. What no suite can reach is the ROUTE: probe -> 16.
+#
+# ⭐ AND WHAT IS GATED HERE AND NOWHERE ELSE: the three `memset`s inside the presenter. Every other
+# caller in the tree allocates from the global bump allocator, which hands back fresh zeroed pages,
+# so deleting any of the three leaves all 30 suites green. Group I opens through an arena filled
+# with 0xAB and reset — the frame-arena shape `lib/alloc.cyr` documents as REUSE — which is the only
+# arrangement in which those three lines are observable. See group I's own comment for the measured
+# consequence of each.
+#
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "present_open_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    var sep = "  got ";
+    syscall(1, 2, sep, strlen(sep));
+    fmt_int_fd(2, got);
+    var sep2 = " want ";
+    syscall(1, 2, sep2, strlen(sep2));
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- the descriptor probe — the instrument, calibrated in group A ------------------------
+# /proc/self/fd holds one entry per open descriptor, plus "." and "..", plus the directory fd the
+# listing itself is holding: the process's own count is entries - 3. Both buffers come from the
+# GLOBAL alloc, never sd_alloc, so an armed hook never sees them and a refusal can never blind the
+# instrument measuring it.
+var g_po_dirbuf = 0;
+var g_po_win = 0;
+
+fn po_fd_count(): i64 {
+    var d = syscall(2, "/proc/self/fd", 65536, 0);      # open O_RDONLY|O_DIRECTORY
+    if (d < 0) { return 0 - 1; }
+    var n = 0;
+    var got = syscall(217, d, g_po_dirbuf, 4096);       # getdents64
+    while (got > 0) {
+        var pos = 0;
+        while (pos < got) {
+            n = n + 1;
+            pos = pos + load16(g_po_dirbuf + pos + 16); # linux_dirent64.d_reclen
+        }
+        got = syscall(217, d, g_po_dirbuf, 4096);
+    }
+    syscall(3, d);
+    return n - 3;
+}
+
+# Field `off` of presenter `p`, or -1 for a null one. ⚠ Every geometry check below goes through
+# this rather than a bare load64: a mutation that makes an open return 0 should fail the `p != 0`
+# check and then REPORT the next four as -1, not fault the process out of its own tally.
+fn po_field(p, off): i64 {
+    if (p == 0) { return 0 - 1; }
+    return load64(p + off);
+}
+
+# ---- the failing hook, in the two modes oom_test uses -------------------------------------
+# BUDGET (po_budget k): grant the first k allocations, refuse every one after — an arena that ran
+#   out mid-frame. FAIL-ONLY (po_fail_only k): refuse the k-th alone — the sweep that isolates ONE
+#   site, and the only one that can tell a missing guard from a guard one line later.
+# The arena is 4 MiB; the one successful open driven through it takes 1,229,384 B.
+var g_po_arena = 0;
+var g_po_mode = 0;
+var g_po_k = 0;
+var g_po_seen = 0;
+var g_po_grants = 0;
+var g_po_refusals = 0;
+
+fn po_hook(n): i64 {
+    g_po_seen = g_po_seen + 1;
+    var refuse = 0;
+    if (g_po_mode == 0) {
+        if (g_po_seen > g_po_k) { refuse = 1; }
+    } else {
+        if (g_po_seen == g_po_k) { refuse = 1; }
+    }
+    if (refuse != 0) {
+        g_po_refusals = g_po_refusals + 1;
+        return 0;
+    }
+    g_po_grants = g_po_grants + 1;
+    return arena_alloc(g_po_arena, n);
+}
+
+fn po_arm(mode, k): i64 {
+    g_po_mode = mode;
+    g_po_k = k;
+    g_po_seen = 0;
+    g_po_grants = 0;
+    g_po_refusals = 0;
+    sd_alloc_set(&po_hook);
+    return 0;
+}
+
+fn po_budget(k): i64 { return po_arm(0, k); }
+fn po_fail_only(k): i64 { return po_arm(1, k); }
+
+fn po_restore(): i64 {
+    sd_alloc_set(0);
+    return 0;
+}
+
+# ---- the stand-in file --------------------------------------------------------------------
+# Create/truncate `path` as an empty regular file and close it again. Returns 0, or -1.
+fn po_make_file(path): i64 {
+    var fd = syscall(2, path, 578, 420);   # O_RDWR|O_CREAT|O_TRUNC, mode 0644
+    if (fd < 0) { return 0 - 1; }
+    syscall(3, fd);
+    return 0;
+}
+
+# Byte length of `path`, or -1.
+fn po_file_size(path): i64 {
+    var fd = syscall(2, path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var n = syscall(8, fd, 0, 2);          # lseek SEEK_END
+    syscall(3, fd);
+    return n;
+}
+
+# Read `n` bytes of `path` from `off` into g_po_win; returns the count read, or -1.
+fn po_read_at(path, off, n): i64 {
+    var fd = syscall(2, path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    syscall(8, fd, off, 0);                # lseek SEEK_SET
+    var got = syscall(0, fd, g_po_win, n);
+    syscall(3, fd);
+    return got;
+}
+
+# Does `fd` still accept a write? 1 = closed (EBADF or any error), 0 = still open.
+# ⚠ Writes one byte, so it is only ever pointed at a descriptor sadish should already have closed.
+fn po_fd_dead(fd): i64 {
+    if (syscall(1, fd, g_po_win, 1) < 0) { return 1; }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    g_po_dirbuf = alloc(4096);
+    g_po_win = alloc(64);
+    store8(g_po_win, 65);
+    var fb = "build/present_open_test.fb";
+    var gone = "build/present_open_test_missing.fb";
+    syscall(87, gone);                                                 # unlink: it must NOT exist
+
+    # ── A) CALIBRATE THE INSTRUMENT ──────────────────────────
+    # Every leak claim below is a difference of this number, so it is pinned first, in both
+    # directions — checks 3-6 drive the count up twice and back down twice, which is the whole of
+    # what the instrument has to do.
+    # ⚠ `>= 3`, not `== 3`: the process starts with stdin/stdout/stderr, but a harness may pass more
+    # in (a make jobserver pipe, a lock fd, a coverage tool) and that is not a sadish defect.
+    # MEASURED: `./build/present_open_test 3</dev/null` used to fail here and nowhere else. The
+    # probe's `entries - 3` constant is not pinned by anything and does not need to be — it cancels
+    # out of every claim in the file, all of which are `base + n`.
+    var base = po_fd_count();
+    check(base >= 3, 1);                                               # 1
+    var t1 = syscall(2, fb, 578, 420);
+    check(t1 >= 0, 1);                                                 # 2
+    check(po_fd_count(), base + 1);                                    # 3 — one open, one entry
+    var t2 = syscall(2, fb, 578, 420);
+    check(po_fd_count(), base + 2);                                    # 4
+    syscall(3, t2);
+    check(po_fd_count(), base + 1);                                    # 5 — and it counts back down
+    syscall(3, t1);
+    check(po_fd_count(), base);                                        # 6
+    g_po_arena = arena_new_growable(4194304);
+    check(g_po_arena != 0, 1);                                         # 7
+    check(sd_alloc_get(), 0);                                          # 8 — no hook armed yet
+
+    # ── B) AN ACQUISITION THAT NEVER HAPPENS COSTS NOTHING ──────────────────
+    # The fd < 0 branch: what sd_present_open returns when /dev/fb0 is absent or unreadable, which
+    # is the ONLY branch of it a machine without a framebuffer ever took. Driven three ways, with a
+    # hook armed that refuses everything: g_po_seen is the load-bearing assertion — the allocator
+    # was not asked for so much as one block, so a guard moved BELOW the first sd_alloc would show
+    # up here and nowhere else.
+    po_budget(0);
+    check(sd_present_open_fd(0 - 1), 0);                               # 9 — a negative descriptor
+    check(g_po_seen, 0);                                               # 10 ⭐ nothing was allocated
+    po_restore();
+    check(po_fd_count(), base);                                        # 11
+    po_budget(0);
+    check(sd_present_open_path(gone), 0);                              # 12 — ENOENT, O_RDWR with no O_CREAT
+    check(g_po_seen, 0);                                               # 13 ⭐ a failed open allocates nothing
+    po_restore();
+    check(po_fd_count(), base);                                        # 14
+    check(po_file_size(gone), 0 - 1);                                  # 15 ⛔ and it did NOT create the file
+    po_budget(0);
+    check(sd_present_open_path(0), 0);                                 # 16 — a null path is EFAULT, not a fault
+    check(g_po_seen, 0);                                               # 17
+    po_restore();
+    check(po_fd_count(), base);                                        # 18
+
+    # ── C) THE WHOLE OPEN PATH OVER A REGULAR FILE ─────────────────────
+    # sd_present_open's own logic end to end, with the device name as the only difference. The
+    # geometry is the ioctl-less fallback (see the header): 640x480 at 32 bpp, pitch = xres * 4.
+    check(po_make_file(fb), 0);                                        # 19
+    check(po_file_size(fb), 0);                                        # 20 — starts empty
+    var p = sd_present_open_path(fb);
+    check(p != 0, 1);                                                  # 21
+    check(po_fd_count(), base + 1);                                    # 22 ⭐ the presenter holds ONE fd
+    check(po_field(p, SD_PRES_FD_OFFSET) >= 0, 1);                      # 23
+    check(po_field(p, SD_PRES_XRES_OFFSET), 640);                       # 24 — the <= 0 fallbacks
+    check(po_field(p, SD_PRES_YRES_OFFSET), 480);                       # 25
+    check(po_field(p, SD_PRES_BPP_OFFSET), 32);                         # 26
+    check(po_field(p, SD_PRES_PITCH_OFFSET), 640 * 4);                  # 27 — minpitch, not the file's 0
+    check(po_field(p, SD_PRES_BLIT_OFFSET) != 0, 1);                    # 28 — a whole record, not a stub
+
+    # The blit, read back out of the file. 4x2 surface into 640x480: scale = min(160, 240) = 160,
+    # xoff = 0, yoff = (480 - 320) / 2 = 80, so the band starts at 80 * 2,560 = 204,800 and runs
+    # 320 * 2,560 = 819,200 bytes. ⛔ This is what gates the O_RDWR in sd_present_open_path: with an
+    # O_RDONLY open every call here still succeeds and the file stays 0 bytes long.
+    var s = sd_surface_new(4, 2);
+    sd_plot(s, 0, 0, sd_rgb(255, 0, 0));
+    sd_plot(s, 1, 0, sd_rgb(0, 255, 0));
+    check(sd_present_blit(p, s), SADISH_OK);                           # 29
+    check(po_file_size(fb), 204800 + 819200);                          # 30 ⭐ the band landed
+    check(po_read_at(fb, 204800 - 1, 1), 1);                           # 31
+    check(load8(g_po_win), 0);                                         # 32 — the letterbox above it is a hole
+    check(po_read_at(fb, 204800, 8), 8);                               # 33
+    check(load8(g_po_win + 0), 0);                                     # 34 — pixel (0,0) red, BGRA
+    check(load8(g_po_win + 1), 0);                                     # 35
+    check(load8(g_po_win + 2), 255);                                   # 36
+    check(load8(g_po_win + 3), 255);                                   # 37 — alpha forced opaque
+    check(po_read_at(fb, 204800 + 640, 4), 4);                         # 38 — 160 columns on, pixel (1,0)
+    check(load8(g_po_win + 0), 0);                                     # 39
+    check(load8(g_po_win + 1), 255);                                   # 40 — green
+    check(load8(g_po_win + 2), 0);                                     # 41
+    check(po_read_at(fb, 204800 + 2560, 4), 4);                        # 42 — the next display row
+    check(load8(g_po_win + 2), 255);                                   # 43 ⭐ scale replicated it
+    check(load8(g_po_win + 3), 255);                                   # 44
+
+    var held = po_field(p, SD_PRES_FD_OFFSET);
+    check(sd_present_close(p), SADISH_OK);                             # 45
+    check(po_fd_count(), base);                                        # 46 ⭐ close releases the fd
+    check(po_fd_dead(held), 1);                                        # 47 — and the number is dead
+
+    # ── D) DESCRIPTOR 0 IS A DESCRIPTOR ─────────────────────────
+    # ⛔ The guard is `fd < 0` and not `fd <= 0`, and only this arrangement can tell the two
+    # spellings apart: with stdin closed the next open() returns the lowest free number, 0, and a
+    # `<= 0` guard would refuse a perfectly good framebuffer — the failure mode of a daemon that
+    # closed its standard streams before opening the display. stdin is restored from /dev/null
+    # before the group ends, and check 53 proves the count came back.
+    # ⚠ Nothing here reads stdin, and the check printer writes to fd 2.
+    syscall(3, 0);
+    var zfd = syscall(2, fb, 2, 0);                                    # O_RDWR, and it lands on 0
+    check(zfd, 0);                                                     # 48
+    var pz = sd_present_open_fd(zfd);
+    check(pz != 0, 1);                                                 # 49 ⭐ `<= 0` would return 0 here
+    check(po_field(pz, SD_PRES_FD_OFFSET), 0);                          # 50 — held by number
+    check(sd_present_close(pz), SADISH_OK);                            # 51
+    check(syscall(2, "/dev/null", 0, 0), 0);                           # 52 — stdin back, on 0 again
+    check(po_fd_count(), base);                                        # 53
+    check(po_file_size(fb), 204800 + 819200);                          # 54 — and the band is untouched
+
+    # ── E) EACH OF THE FOUR BLOCKS REFUSED IN TURN, THROUGH THE OPEN PATH ─────────
+    # FAIL-ONLY: the k-th allocation alone is refused, so every 0 below is the guard named beside
+    # it and not a later one catching it. The four are `vinfo` (256 B), `finfo` (256 B), the 72 B
+    # record and the pitch * yres = 1,228,800 B blit scratch. ⛔ THE fd IS THE POINT: each of these
+    # calls opened the file itself, so a refusal that forgot to close would leak a descriptor the
+    # caller never had a chance to see.
+    po_fail_only(1);
+    check(sd_present_open_path(fb), 0);                                # 55 — vinfo refused
+    check(g_po_grants, 0);                                             # 56
+    po_restore();
+    check(po_fd_count(), base);                                        # 57 ⭐ no fd leaked
+    po_fail_only(2);
+    check(sd_present_open_path(fb), 0);                                # 58 — finfo refused
+    check(g_po_grants, 1);                                             # 59
+    po_restore();
+    check(po_fd_count(), base);                                        # 60 ⭐
+    po_fail_only(3);
+    check(sd_present_open_path(fb), 0);                                # 61 — the 72 B record refused
+    check(g_po_grants, 2);                                             # 62
+    po_restore();
+    check(po_fd_count(), base);                                        # 63 ⭐
+    po_fail_only(4);
+    check(sd_present_open_path(fb), 0);                                # 64 — the blit scratch refused
+    check(g_po_grants, 3);                                             # 65
+    po_restore();
+    check(po_fd_count(), base);                                        # 66 ⭐
+
+    # ── F) THE SAME FOUR AS AN ARENA THAT RAN OUT ─────────────────────
+    # BUDGET: grant k, refuse the rest — the shape a per-frame arena actually fails in, where the
+    # refusal is every block from the k-th on rather than one of them.
+    po_budget(0);
+    check(sd_present_open_path(fb), 0);                                # 67
+    po_restore();
+    check(po_fd_count(), base);                                        # 68
+    po_budget(1);
+    check(sd_present_open_path(fb), 0);                                # 69
+    po_restore();
+    check(po_fd_count(), base);                                        # 70
+    po_budget(2);
+    check(sd_present_open_path(fb), 0);                                # 71
+    po_restore();
+    check(po_fd_count(), base);                                        # 72
+    po_budget(3);
+    check(sd_present_open_path(fb), 0);                                # 73
+    po_restore();
+    check(po_fd_count(), base);                                        # 74
+    # And the fourth grant is the one that completes it. ⭐ MEASURED on the arena: 1,229,384 B in
+    # exactly four blocks — 256 + 256 + 72 + 1,228,800 — which is what pins the block COUNT: a
+    # fifth allocation anywhere in the open path fails checks 75 and 77, a missing one 76 and 78.
+    var au = arena_used(g_po_arena);
+    po_budget(4);
+    var p2 = sd_present_open_path(fb);
+    po_restore();
+    check(p2 != 0, 1);                                                 # 75
+    check(g_po_grants, 4);                                             # 76
+    check(g_po_refusals, 0);                                           # 77
+    check(arena_used(g_po_arena) - au, 256 + 256 + 72 + 1228800);      # 78
+    check(po_fd_count(), base + 1);                                    # 79
+    check(sd_present_close(p2), SADISH_OK);                            # 80
+    check(po_fd_count(), base);                                        # 81
+
+    # ── G) sd_present_open_fd OWNS THE DESCRIPTOR IT IS GIVEN ─────────────────
+    # ⛔ The half of the contract a caller gets wrong: on a refusal sadish closes the fd the CALLER
+    # opened, so the caller must not close it again. Asserted rather than described, because the
+    # opposite convention is just as plausible and only the code says which one this is.
+    var own = syscall(2, fb, 2, 0);                                    # open O_RDWR
+    check(own >= 0, 1);                                                # 82
+    check(po_fd_count(), base + 1);                                    # 83
+    po_fail_only(1);
+    check(sd_present_open_fd(own), 0);                                 # 84
+    po_restore();
+    check(po_fd_count(), base);                                        # 85 ⭐ sadish closed the caller's fd
+    check(po_fd_dead(own), 1);                                         # 86 — a second close would be a bug
+    # And on success the presenter holds that same descriptor, by number.
+    var own2 = syscall(2, fb, 2, 0);
+    var p3 = sd_present_open_fd(own2);
+    check(p3 != 0, 1);                                                 # 87
+    check(po_field(p3, SD_PRES_FD_OFFSET), own2);                       # 88 ⭐ the caller's fd, not a new one
+    check(po_fd_count(), base + 1);                                    # 89 — still exactly one
+    check(sd_present_close(p3), SADISH_OK);                            # 90
+    check(po_fd_count(), base);                                        # 91
+    check(po_fd_dead(own2), 1);                                        # 92
+
+    # ── H) NINE REFUSALS LATER, NOTHING MOVED ──────────────────────
+    # The same open that worked in group C, after every refusal above, on the global allocator.
+    check(po_make_file(fb), 0);                                        # 93
+    var p4 = sd_present_open_path(fb);
+    check(p4 != 0, 1);                                                 # 94
+    check(po_field(p4, SD_PRES_XRES_OFFSET), 640);                      # 95
+    check(po_field(p4, SD_PRES_YRES_OFFSET), 480);                      # 96
+    check(po_field(p4, SD_PRES_BPP_OFFSET), 32);                        # 97
+    check(po_field(p4, SD_PRES_PITCH_OFFSET), 640 * 4);                 # 98
+    check(sd_present_blit(p4, s), SADISH_OK);                          # 99
+    check(po_file_size(fb), 204800 + 819200);                          # 100 — byte for byte group C's band
+    check(po_read_at(fb, 204800, 4), 4);                               # 101
+    check(load8(g_po_win + 2), 255);                                   # 102
+    check(sd_present_close(p4), SADISH_OK);                            # 103
+    check(po_fd_count(), base);                                        # 104 ⭐ every descriptor accounted for
+    check(sd_alloc_get(), 0);                                          # 105 — and every hook scope unwound
+
+    # ── I) THE ALLOCATOR'S LEFTOVERS ARE NOT THE FRAME'S ───────────────
+    # ⛔ EVERY GROUP ABOVE RAN ON MEMORY THAT HAPPENED TO ARRIVE ZEROED. The global bump allocator
+    # hands back fresh pages, and so does a growable arena on its first pass — so the three memsets
+    # inside the presenter are invisible to all of it: delete any one of them and groups A-H stay
+    # green. A consumer's frame arena is the case that is not fresh: `lib/alloc.cyr` documents
+    # `arena_reset` as rewind-and-REUSE ("that retention is the point"), so from the second frame on
+    # `sd_alloc` returns bytes the previous frame wrote. This group is the only place in the tree
+    # that presents out of dirty memory: fill an arena with 0xAB, reset it, open through it.
+    #   · `_sd_present_probe`'s `memset(vinfo/finfo)` — the ioctls write NOTHING on a regular file,
+    #     so without the zeroing the four load32s read 0xABABABAB, every `<= 0` fallback is skipped
+    #     and the geometry is garbage. MEASURED with both lines deleted: the open returns 0, so
+    #     checks 109-113 carry it.
+    #   · `_sd_presenter_build`'s `memset(blit)` — `sd_present_blit` paints only the scaled surface,
+    #     and the LETTERBOX around it is written to the display untouched. A 6x2 surface is what
+    #     makes that visible: scale = min(640 / 6, 480 / 2) = 106, so xoff = (640 - 636) / 2 = 2 and
+    #     the first 8 bytes of every band row are two letterbox pixels the blit loop never stores to.
+    #     MEASURED with the line deleted: 171 (0xAB) at all three, read back OUT OF THE FILE.
+    #     ⚠ Group C's 4x2 cannot see this and no rearrangement of it could: scale 160 makes
+    #     sw * scale exactly 640, so xoff is 0 and every byte of its band is painted. Its check 32
+    #     reads a sparse-file HOLE below the band, which is the filesystem's zero, not sadish's.
+    var dirty = arena_new_growable(4194304);
+    check(dirty != 0, 1);                                              # 106
+    var mud = arena_alloc(dirty, 2000000);
+    check(mud != 0, 1);                                                # 107
+    memset(mud, 0xAB, 2000000);
+    arena_reset(dirty);                                                # the frame boundary
+    g_po_arena = dirty;
+    check(po_make_file(fb), 0);                                        # 108 — and a file with no band in it
+    po_budget(4);
+    var p5 = sd_present_open_path(fb);
+    po_restore();
+    check(p5 != 0, 1);                                                 # 109 ⭐ the probe did not read 0xAB
+    check(po_field(p5, SD_PRES_XRES_OFFSET), 640);                     # 110 ⭐ the fallbacks still fired
+    check(po_field(p5, SD_PRES_YRES_OFFSET), 480);                     # 111 ⭐
+    check(po_field(p5, SD_PRES_BPP_OFFSET), 32);                       # 112 ⭐
+    check(po_field(p5, SD_PRES_PITCH_OFFSET), 640 * 4);                # 113 ⭐
+    var s6 = sd_surface_new(6, 2);
+    sd_plot(s6, 0, 0, sd_rgb(255, 0, 0));
+    check(sd_present_blit(p5, s6), SADISH_OK);                         # 114
+    check(sd_present_close(p5), SADISH_OK);                            # 115
+    # Band: yoff = (480 - 212) / 2 = 134, rows = 212, so it runs 134 * 2,560 = 343,040 to
+    # 346 * 2,560 = 885,760 and the file ends there.
+    check(po_file_size(fb), 885760);                                   # 116
+    check(po_read_at(fb, 343040, 16), 16);                             # 117
+    check(load8(g_po_win + 0), 0);                                     # 118 ⭐ letterbox pixel 0, B
+    check(load8(g_po_win + 3), 0);                                     # 119 ⭐ ... and its alpha byte
+    check(load8(g_po_win + 7), 0);                                     # 120 ⭐ letterbox pixel 1, last byte
+    check(load8(g_po_win + 10), 255);                                  # 121 — and the first PAINTED byte is red
+    check(load8(g_po_win + 11), 255);                                  # 122 — alpha forced opaque
+    check(po_fd_count(), base);                                        # 123
+
+    # ── J) THE DESCRIPTOR THE CALLER SUPPLIES IS THE CALLER'S PROBLEM ─────────
+    # ⛔ `fd >= 0` IS THE ONLY THING sd_present_open_fd CHECKS, and its header says so because this
+    # group makes it true rather than hopeful. A descriptor opened O_RDONLY is not rejected anywhere:
+    # the ioctls are allowed to fail by design, and sd_present_blit's write result is not looked at.
+    # What the caller gets is a whole presenter — four blocks, 1.2 MB — that reports SADISH_OK from
+    # every blit and displays nothing. Asserted here so the header cannot rot into a guarantee.
+    # ⚠ The other half of the same silence — a positive number that is not an open descriptor —
+    # is MEASURED in the header (a presenter, 1,229,384 B, SADISH_OK) and deliberately NOT asserted
+    # here: pointing an 819,200-byte write at a number this process does not own is exactly what a
+    # test must not do.
+    check(po_make_file(fb), 0);                                        # 124
+    var ro = syscall(2, fb, 0, 0);                                     # open O_RDONLY
+    check(ro >= 0, 1);                                                 # 125
+    var pro = sd_present_open_fd(ro);
+    check(pro != 0, 1);                                                # 126 ⭐ no complaint at open
+    check(sd_present_blit(pro, s), SADISH_OK);                         # 127 ⭐ and none at blit
+    check(po_file_size(fb), 0);                                        # 128 ⛔ yet nothing was displayed
+    check(sd_present_close(pro), SADISH_OK);                           # 129
+    check(po_fd_count(), base);                                        # 130
+    check(sd_alloc_get(), 0);                                          # 131
+
+    if (g_fails == 0) {
+        var ok = "present_open_test: PASS (open path driven over a regular file, no fd leaked)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "present_open_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

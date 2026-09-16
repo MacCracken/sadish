@@ -10,6 +10,10 @@
 #      pitch, and write the active band. Adapted from encom-hits/src/engine.cyr
 #      (probe/blit) — which fixed the "tiles across the top band" pitch bug
 #      shared by cyrius-doom/-polyomino. See docs/development/prior-art.md.
+#      0.8.0 splits the ACQUISITION off that entry: sd_present_open_fd(fd)
+#      presents onto a descriptor the caller already has, sd_present_open_path(path)
+#      opens one by name, and sd_present_open is the two-token wrapper that names
+#      the device. Gated by programs/present_open_test.cyr over a regular file.
 #
 # The encom original was module-global + fixed 320x240; sadish's is
 # struct-based (reentrant) and takes the surface's own dimensions. Timing /
@@ -25,6 +29,14 @@
 # leaves the target file exactly as it was; the presenter closes the framebuffer fd on every one of
 # its four refusal paths and never returns a half-built record. Gated by programs/oom_test.cyr.
 # Closes half of docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md.
+# ⭐ AND THE fd THAT REACHES THEM IS NOW THE CALLER'S TO SUPPLY, 0.8.0. That filing's one remaining
+# note was that sd_present_open itself — the open() above those four blocks — was reachable by no
+# test, because its argument is the live display. programs/present_open_test.cyr drives
+# sd_present_open_path / _open_fd over a regular file under build/ instead: 131 checks, all four
+# blocks refused in turn, the documented 0 each time, and /proc/self/fd counted before and after
+# every call (MEASURED: 3 descriptors at entry, 3 after each of the nine refusals). Its group I is
+# also the only thing in the tree that presents out of RECYCLED memory, which is what makes the
+# three memsets below observable at all.
 
 # ---- PPM sink (platform-neutral) --------------------------------
 # Write the decimal ASCII of a non-negative n into buf at off; return new off.
@@ -142,6 +154,10 @@ var SD_PRESENTER_SIZE    = 72;
 # open("/dev/fb0"), and a test that ran it would be writing to the live display. Taking the fd as
 # an argument makes both refusals reachable from programs/oom_test.cyr with a regular file's fd.
 # _sd_present_probe is the only in-tree caller.
+# ⚠ It is also the only caller that chooses the geometry, which is why oom_test can build a
+# 30x22x32 presenter at a 128 B pitch and programs/present_open_test.cyr — coming through the probe
+# — cannot: a regular file answers no ioctl, so everything above this function falls back to
+# 640x480x32.
 fn _sd_presenter_build(fd, xres, yres, bpp, pitch): i64 {
     var p = sd_alloc(SD_PRESENTER_SIZE);
     if (p == 0) {
@@ -158,6 +174,14 @@ fn _sd_presenter_build(fd, xres, yres, bpp, pitch): i64 {
         syscall(3, fd);
         return 0;
     }
+    # ⛔ THIS memset IS THE LETTERBOX, not hygiene. sd_present_blit paints only the scaled surface;
+    # every byte outside it — the centering bars — is whatever the scratch already held, and the
+    # WHOLE band is written to the display. Under the global bump allocator that is a fresh zeroed
+    # page and the omission is invisible; under a consumer's FRAME ARENA, which lib/alloc.cyr
+    # documents as REUSE and not re-zeroing ("that retention is the point"), it is the previous
+    # frame's pixels. MEASURED with this line deleted, opening through an arena filled with 0xAB and
+    # reset: 171 in the letterbox, read back out of the file. Gated by programs/present_open_test.cyr
+    # group I, which is the only place in the tree that allocates the scratch out of dirty memory.
     memset(blit, 0, pitch * yres);
     store64(p + SD_PRES_BLIT_OFFSET, blit);
     return p;
@@ -171,7 +195,8 @@ fn _sd_presenter_build(fd, xres, yres, bpp, pitch): i64 {
 # safe on a REGULAR FILE, which is the only fd programs/oom_test.cyr is willing to hand it.
 # ⛔ Split out of sd_present_open at 0.7.1 for the same reason as _sd_presenter_build: everything
 # above it in sd_present_open is open("/dev/fb0"), and a test that ran that would be writing to the
-# live display. sd_present_open is the only in-tree caller.
+# live display. sd_present_open_fd — the public entry 0.8.0 put in front of it — is the only in-tree
+# caller.
 fn _sd_present_probe(fd): i64 {
     var vinfo = sd_alloc(256);
     if (vinfo == 0) {
@@ -183,6 +208,13 @@ fn _sd_present_probe(fd): i64 {
         syscall(3, fd);
         return 0;
     }
+    # ⛔ THESE TWO memsets ARE WHAT MAKES "a device that answers nothing" MEAN 640x480x32. The
+    # ioctls below are allowed to write nothing at all, and the four load32s read the buffers either
+    # way — so an un-zeroed buffer hands back whatever sd_alloc last held, the three <= 0 fallbacks
+    # never fire, and the geometry is garbage. Same blind spot as the scratch memset above: a fresh
+    # page hides it, a recycled arena does not. MEASURED with both lines deleted, opening through an
+    # arena filled with 0xAB and reset: the probe skips every fallback and the open returns 0.
+    # Gated by programs/present_open_test.cyr group I.
     memset(vinfo, 0, 256);
     memset(finfo, 0, 256);
     syscall(16, fd, 0x4600, vinfo);   # ioctl FBIOGET_VSCREENINFO
@@ -199,6 +231,62 @@ fn _sd_present_probe(fd): i64 {
     return _sd_presenter_build(fd, xres, yres, bpp, pitch);
 }
 
+# @public — present onto a framebuffer descriptor the CALLER already opened: everything
+# sd_present_open does after its open(). Probes the fd's geometry, applies the fallbacks for a
+# device that answers neither ioctl, and takes the four blocks a presenter needs. Returns the
+# SdPresenter, or 0 if fd is negative or any of the four is refused.
+# ⛔ THE PRESENTER TAKES OWNERSHIP OF `fd`, and that is the whole of this entry's contract:
+#   · On SUCCESS the record holds the descriptor at +0 and sd_present_close is what releases it.
+#     ⚠ Do not close an fd a live presenter still holds — the next blit would lseek and write
+#     through a number the kernel has already handed to someone else's open() — and do not hand
+#     one fd to two presenters, which is the same fault with two owners.
+#   · On a 0 CAUSED BY A REFUSAL the fd is ALREADY CLOSED (all four refusal paths below close it),
+#     so the caller must not close it again: a second close is EBADF, or worse once the number has
+#     been reused. A caller that gets 0 has nothing left to release.
+#   · fd < 0 is the one 0 that closes nothing and allocates nothing — it is what a failed open()
+#     already returned, so there is nothing to own. Passing an open() result straight in is
+#     therefore safe, which is exactly what sd_present_open_path does.
+#     ⚠ `< 0`, NOT `<= 0`: descriptor 0 is a descriptor. A process that closed its standard streams
+#     before opening the display gets 0 from the next open() and a presenter from here — driven,
+#     with stdin closed, by programs/present_open_test.cyr group D.
+# ⛔ NOT NEGATIVE IS THE ONLY THING CHECKED. `fd` must also be OPEN and opened for WRITING (O_RDWR or
+# O_WRONLY), and neither is verified here or anywhere below: the ioctls are allowed to fail by
+# design, and sd_present_blit lseeks and writes without checking either result. A caller that gets
+# this wrong is not told. MEASURED on both mistakes:
+#   · a positive number that is not an open descriptor — sd_present_open_fd(500) returns a PRESENTER,
+#     costs 1,229,384 B in four blocks, and every sd_present_blit on it returns SADISH_OK having
+#     written nothing.
+#   · a descriptor opened O_RDONLY — same: a whole presenter, SADISH_OK from every blit, and a target
+#     that stays 0 bytes long. Asserted by programs/present_open_test.cyr group J.
+# ⇒ The fd is the ONE thing this entry cannot supply for itself, so validating it is the caller's
+# job. sd_present_open_path exists so the common case does not have to: it opens O_RDWR and hands
+# the result straight in.
+# ⚠ A REGULAR FILE IS A LEGAL ARGUMENT, and it is the only fd a sadish test is allowed to present
+# onto. Both ioctls fail on one (MEASURED: ENOTTY, -25), the zeroed probe buffers fall through to
+# 640x480x32 at a 2,560 B pitch, and the blit writes its band into the file at the same offsets it
+# would write to a display. ⛔ That geometry is sadish's FALLBACK, not the file's: no regular file
+# can answer FBIOGET_VSCREENINFO, so the ioctl-answered branch is gated by no suite anywhere —
+# programs/present_open_test.cyr says so in its own header rather than pretending otherwise.
+fn sd_present_open_fd(fd): i64 {
+    if (fd < 0) { return 0; }
+    return _sd_present_probe(fd);
+}
+
+# @public — open `path` O_RDWR and present onto it: sd_present_open's body with the device name as
+# an argument. Returns an SdPresenter, or 0 if the path will not open (no such file, no permission,
+# a null pointer) or if any of the four blocks is refused.
+# ⚠ EVERY 0 LEAVES NO OPEN fd: either the open failed, or the fd it produced was closed by the
+# refusal path it reached. On success the presenter owns the fd — see sd_present_open_fd for who
+# closes it and when.
+# ⛔ O_RDWR, NOT O_RDONLY, and the difference is invisible until a frame is late: sd_present_blit
+# lseeks and WRITES the active band through this descriptor, and nothing checks that write's result.
+# A read-only open therefore yields a presenter that opens, probes and blits without complaint and
+# displays nothing. programs/present_open_test.cyr reads the band back out of a regular file for
+# exactly that reason.
+fn sd_present_open_path(path): i64 {
+    return sd_present_open_fd(syscall(2, path, 2, 0));   # open O_RDWR
+}
+
 # @public — open /dev/fb0 and probe geometry. Returns an SdPresenter, or 0 if
 # the framebuffer is unavailable (no device / no permission), or if any of the four blocks it
 # needs is refused — callers fall back to sd_surface_write_ppm.
@@ -206,10 +294,14 @@ fn _sd_present_probe(fd): i64 {
 # released, and all four refusal paths close it before returning. Through 0.7.0 the four blocks
 # were stored through unchecked, so a refused `vinfo` was a null-pointer memset and a refused
 # `blit` a presenter whose scratch was 0.
+# ⛔ WHAT IS GATED AND WHAT IS NOT, 0.8.0. Everything below the device name is reachable without a
+# display: programs/present_open_test.cyr drives sd_present_open_path and sd_present_open_fd over a
+# regular file under build/ and sweeps a refusing hook across all four blocks. What no suite may run
+# is THIS function, whose argument IS the live display — so what stays ungated is one line: the
+# string "/dev/fb0" and this delegation. An edit that misspelled the device, or dropped the call,
+# would leave every suite green; nothing but a display can tell.
 fn sd_present_open(): i64 {
-    var fd = syscall(2, "/dev/fb0", 2, 0);   # open O_RDWR
-    if (fd < 0) { return 0; }
-    return _sd_present_probe(fd);
+    return sd_present_open_path("/dev/fb0");
 }
 
 # @public — scale + center-letterbox `s` into the framebuffer and write it.

@@ -1,16 +1,28 @@
 # `sd_path_flatten` keeps subdividing — and allocating mid-points — after its 8,192-point output is full
 
-**Status:** 🟡 **OPEN — the BOUND shipped in 0.7.1, the FILL got the budget's scope in 0.7.2, and the
-REPORTING half of the second suggested fix still has not.** The mid-point waste, the cross-curve stop
-and the per-operation budget are all in, and every figure in the closing section at the foot of this
-file was RE-MEASURED 2026-09-15 against 0.7.1 (HEAD `f722e8c`) and reproduced. ⭐ **0.7.2 closed
-Still-open item 3**, the one the Severity line is about: `sd_fill_impl` now opens ONE flatten
-operation for the whole fill, so an unwrapped `sd_canvas_fill_path` of an untrusted outline is
-bounded by the budget and `sd_flatten_degraded()` answers for it (MEASURED: the hostile 4,096-quad
-fill 16,711,680 B → **1,044,480 B**, 1,044,480 → **65,280** allocations, and the same figure at 1,024
-quads — the work no longer grows with the curve count). What is STILL NOT in: a truncated contour is
-filled open, there is no flag on the polyline, and STROKES get no error at all. See **Still open** at
-the foot. ⛔ This line read "🟢 CLOSED — FIXED in sadish 0.7.1" until that re-audit; a reader of the
+**Status:** 🟢 **CLOSED in 0.8.0 — the BOUND shipped in 0.7.1, the FILL got the budget's scope and the
+STROKES their return code in 0.7.2, and the POLYLINE its own verdict in 0.8.0. All three Still-open
+items are closed.** ⛔ Item 2 was closed by 0.7.2 and this filing did not say so: the finding was
+written against 0.7.1 and left standing verbatim rather than re-pointed — correct for a record, wrong
+for a Status line. MEASURED 2026-09-16 on 0.8.0 (a 3 px-wide stroke of a cubic on 64x64 under a hook
+granting K allocations): `sd_canvas_stroke_path` and `sd_canvas_stroke_path_ex` both return
+`SADISH_ERR_OOM` at K = 0, 1, 2 and 3, where 0.7.1 returned `SADISH_OK` over a partial picture and the
+round stroker faulted. Gated by `programs/stroke_oom_test.cyr` (153 checks). The mid-point waste, the cross-curve stop and the per-operation budget are
+all in, and every figure in the closing section at the foot of this file was RE-MEASURED 2026-09-15
+against 0.7.1 (HEAD `f722e8c`) and reproduced. ⭐ **0.7.2 closed Still-open item 3**, the one the
+Severity line is about: `sd_fill_impl` now opens ONE flatten operation for the whole fill, so an
+unwrapped `sd_canvas_fill_path` of an untrusted outline is bounded by the budget and
+`sd_flatten_degraded()` answers for it (MEASURED: the hostile 4,096-quad fill 16,711,680 B →
+**1,044,480 B**, 1,044,480 → **65,280** allocations, and the same figure at 1,024 quads — the work no
+longer grows with the curve count). ⭐ **0.8.0 closed Still-open item 1**, the first half of the
+second suggested fix: `SdPolyline` is 24 B and carries its own `truncated` / `degraded` verdict,
+frozen when `sd_path_flatten` finishes, so a consumer holding a result can tell a complete flattening
+from a PREFIX without polling a process-wide flag that has moved on. ⚠ The prefix is still RETURNED
+rather than refused — the bullet's own "refused **or** clearly degraded" — and section 5 at the foot
+says why, on the record. ⛔ **This filing is still NOT archivable**: item 2 is open, and this file's
+own ⛔ note under it records that 0.7.2 already changed the tree it describes, so what is left of that
+ask has to be re-derived against the shipped code rather than read off these words.
+⛔ This line read "🟢 CLOSED — FIXED in sadish 0.7.1" until the 0.7.1 re-audit; a reader of the
 Status line alone came away with the wrong picture.
 Was 🟡 OPEN — MEASURED on sadish **0.6.0** (and identically on 0.5.5 and 0.7.0).
 **Filed:** 2026-09-15, by **rekha** (0.3.11 audit — a fresh security review measured it through rekha's
@@ -233,6 +245,119 @@ group-H figures this deliberately moves (102: 16,711,680 → 1,044,480 B; 103: 1
 `refagree` prints *BYTE-IDENTICAL on all 200 paths* against the 0.7.2 `dist/`, and rekha's 23 suites
 and dhancha's 18 pass against it with no `undefined function`.
 
+### 5. THE POLYLINE CARRIES ITS OWN VERDICT (0.8.0) — Still-open item 1
+
+`sd_path_flatten` now returns a 24 B `SdPolyline` — `points`, `count`, and a **verdict word at +16** —
+and freezes two bits into it the moment its verb walk ends:
+
+| accessor | 1 means |
+|---|---|
+| `sd_polyline_truncated(pl)` | points were LOST (a growth or an `SdPoint` was refused): the array is a PREFIX and the contour is open where it stops |
+| `sd_polyline_degraded(pl)` | at least one curve of **this call** was cut to its chord by the budget |
+| `sd_polyline_verdict(pl)` | the raw word: `SD_POLYLINE_TRUNCATED` (1) `\|` `SD_POLYLINE_DEGRADED` (2) |
+
+**Why this was not already answered by the two globals**, which is the whole of the ask. Both are
+sticky on purpose: `sd_flatten_truncated()` holds until the next `sd_path_flatten` and
+`sd_flatten_degraded()` until the next operation opens at depth 0. That is right for "did anything go
+wrong since?" and useless for "is THIS polyline whole?" — a consumer that flattens three paths and
+then looks gets one answer for all three. MEASURED as `flatten_bound_test` checks **408-419**: four
+results held at once while later flattens drive both globals to 0 and back to 1; every record still
+reads what it read when it was made.
+
+⚠ **`degraded` is the CALL's, not the operation's — one new module global, `_sd_flat_cut`.** Reading
+`_sd_flat_degraded` at the end of the walk looks equivalent and is not: inside a consumer's
+`sd_flatten_op_begin` scope a budget spent by an EARLIER flatten leaves it standing at 1, so a whole
+result would stamp itself DEGRADED — a per-result verdict that is really a poll of a shared global,
+i.e. the defect this closure exists to fix. The two subdivision recursions now set both flags;
+`_sd_flat_cut` is cleared by `sd_path_flatten` at the top of every call and read once at the bottom,
+and nothing else in the process touches it. `sd_flatten_degraded()` is byte-for-byte unchanged.
+
+⛔ **The clear's POSITION is part of the contract, and a review caught that it was not gated.** The
+recursions that set `_sd_flat_cut` are also reached by the public per-curve entries
+`sd_flatten_quad` / `sd_flatten_cubic` — the road `sd_fill_impl` and the stroker take — so between
+two `sd_path_flatten` calls a cut can be made by something that is not an `sd_path_flatten` at all.
+Only a clear that runs BEFORE the walk keeps it out of the next polyline's verdict. MEASURED with
+the clear moved to just after the verdict store: **all 29 suites stayed green** while a budget-cut
+fill followed by an untouched `sd_path_flatten` handed back a record reading `SD_POLYLINE_DEGRADED`.
+Groups Q1 and Q6 do not hold this — in both, the call doing the cutting is itself an
+`sd_path_flatten`, which a displaced clear handles. **Group Q9 (checks 439-455) is what holds it**,
+in both shapes a consumer actually produces: a degraded `sd_canvas_fill_path`, and a bare
+`sd_flatten_quad` inside a consumer's own operation scope.
+
+⭐ **THE PREFIX IS FLAGGED, NOT REFUSED — and that is a choice, taken on the bullet's own "refused
+**or** clearly degraded".** Returning 0 for a truncated flatten was weighed and rejected for three
+reasons: (a) it throws away a result callers use — the starved flatten of check 76 keeps 8,192 points
+that are byte-identical to the whole flattening's first 8,192, which is exactly what a consumer
+recovering from an out-of-memory frame wants to draw; (b) `0` already means two things here (empty
+path, refused allocation) and a third meaning on the same sentinel would deepen the confusion this
+release is repairing, not settle it; (c) "refuse" belongs at the DRAW, where a partial contour
+actually gets filled open, and it is already there — `sd_canvas_fill_path` (0.7.1) and
+`sd_canvas_stroke_path` / `_ex` / `_dash` (0.7.2) return `SADISH_ERR_OOM` rather than paint half an
+outline and report success. ⛔ So a polyline is NOT self-validating: nothing in sadish refuses to
+rasterize a truncated one. `if (sd_polyline_truncated(pl) != 0)` is the caller's, and it is one line.
+
+**The record grew, and that is the whole cost.** `SD_POLYLINE_SIZE` 16 → 24 B: +8 B per
+`sd_path_flatten` that returns a result, no extra allocation and no extra call. Affordable because
+nothing embeds an `SdPolyline` — swept 2026-09-16 over `src/`, `programs/`, rekha, dhancha, agnos,
+setu and the two repos that vendor `dist/sadish.cyr` (crab, puka): `sd_path_flatten` is the only
+constructor, `src/path.cyr` the only writer, no `SdPolyline` is ever a field of another record or an
+array element, and every reader outside that file goes through `sd_polyline_count` /
+`sd_polyline_points`. No consumer repo names `SD_POLYLINE_*` or calls `sd_polyline_*` at all; crab's
+vendored bundle carries its own 0.6-vintage copy of the whole thing and is unaffected until it
+re-vendors. **Seven asserted figures move, all of them +8 B, and no allocation COUNT does:**
+
+| check | 0.7.2 | 0.8.0 |
+|---|---:|---:|
+| `flatten_bound_test` 47 / 51 / 54 / 58 (D: one flatten's bytes, 32 / 64 / 1,024 / 4,096 quads) | 327,208 / 719,912 / 3,076,136 / 3,076,136 | **327,216 / 719,920 / 3,076,144 / 3,076,144** |
+| `flatten_bound_test` 75 (F: the exactly-full arena) | 196,136 | **196,144** |
+| `grow_edges_test` 45 / 79 (a flatten at or under 8,192 points) | 65,576 | **65,584** |
+| `grow_edges_test` 76 (20,001 points: 3 arrays + ctx + header) | 458,792 | **458,800** |
+
+⇒ On the largest flatten these suites measure, the whole 24 B header is **0.005 %** of the 458,800 B
+the call costs, and the 8 B this release adds is **0.002 %**.
+
+**Proof the gate bites** — MEASURED on this tree, each mutation applied ALONE and reverted, with a
+full 29-suite sweep under each:
+
+| mutation of the 0.8.0 change | what fails |
+|---|---|
+| the `store64(pl + SD_POLYLINE_VERDICT_OFFSET, …)` deleted | `flatten_bound_test` 386, 388, 390, 394, 396, 399, 405, 406, 407, 411, 412, 413, 421 — no other suite. ⚠ This row leaves the verdict word UNINITIALISED, so which checks fail is heap-content dependent in principle; re-measured three consecutive runs on this tree, identical each time |
+| the QUAD recursion's `_sd_flat_cut = 1` deleted | 386, 388, 406, 407, 411, 413, 421 — no other suite |
+| the CUBIC recursion's `_sd_flat_cut = 1` deleted | 390 — and nothing else, in any suite |
+| the per-call clear (`_sd_flat_cut = 0`) deleted | 379, 381, 395, 396, 400, 410, 412, 414, 417, 418, 424, 444, 445, 452, 453 |
+| the per-call clear MOVED from the top of `sd_path_flatten` to just after the verdict store — *the mutation a review found unguarded* | **444, 445, 452, 453** — and **nothing at all** before group Q9 existed: all 29 suites passed the mutant |
+| the verdict stamped from `_sd_flat_degraded` — *the plausible wrong implementation* | **424 alone**, in any suite |
+| the TRUNCATED bit dropped | 394, 396, 399, 405, 407, 412, 413 |
+| `sd_polyline_degraded` returning the raw masked word (2, not 1) | 386, 390, 406, 421 |
+| the DEGRADED bit assigned rather than added (so it eats TRUNCATED) | 405, 407, 413 |
+| `SD_POLYLINE_SIZE` left at 16 while the verdict still stores at +16 | 47, 51, 54, 58, 75, 373, 410, 411, 412, 413, 417 **and** `grow_edges_test` 45, 76, 79 |
+| the verdict taken AFTER the header allocation | **EQUIVALENT** — the only thing between the two points is this function's own refused `sd_alloc`, which returns 0 and hands back no record; all 29 suites stay green, as expected |
+
+⛔ Still true of 0.8.0, and worth saying again: ten of those eleven mutations fail
+`programs/flatten_bound_test.cyr` and (except the record size, which is arithmetic) **no other
+suite**. It remains the single program this entire repair rests on — ⚠ and the displaced-clear row
+is what that concentration costs when a gate is missing: one wrong line, 29 green suites, and the
+only thing that noticed was a review reading the clear's position against its own header.
+
+**Byte-identical**, as 0.7.1 and 0.7.2 were: all 29 suites pass with their assertions unedited except
+the seven +8 B figures above, agnos's `refagree` prints *BYTE-IDENTICAL on all 200 paths* against a
+`dist/` built from this tree, and rekha's 23 suites and dhancha's 18 pass against it with no
+`undefined function`. `flatten_bound_test` 372 → **455** checks (group Q's 83).
+
+⚠ **Re-derived lines for `src/path.cyr` at 0.8.0**, since this file's older paragraphs cite 0.7.2's.
+⛔ The first cut of this table was **off by one on every entry** — a review re-derived it and found
+0-based numbers in a 1-based citation, in the one filing that exists partly because references rot.
+These are `grep -n` output, and the command is here so the next reader re-derives rather than trusts:
+
+```sh
+grep -n 'var SD_POLYLINE_\|^fn sd_polyline_\|^var _sd_flat_cut\|^fn sd_flat_emit\|^fn _sd_flat_enter\|^fn sd_path_flatten' src/path.cyr
+```
+
+The polyline constants are `:376-386` (were `:352-354`), the accessors `:388-417`, `_sd_flat_cut`
+`:510`, `sd_flat_emit`'s unconditional `return 0;` `:644` (was `:549`), `_sd_flat_enter`'s
+`(count, cap)` test `:689` (was `:603`), `sd_path_flatten` `:909`. ⭐ Cite the FUNCTIONS; these will
+rot too — this table rotted once before it shipped.
+
 ### Geometry
 
 ⛔ Byte-identical. `programs/flatten_bound_test.cyr` carries 0.7.0's recursion verbatim — its own
@@ -291,22 +416,43 @@ gained a set site in `_sd_flat_put`, had its clear moved before the empty-path r
   are skipped and so flatten nothing), **335-339** (that fill neither opens nor closes a level of a
   consumer's own scope: begin, begin, fill, end → 1, end → 0) and **343-344** (the other half — a
   fill that DOES flatten a curve answers for itself and clears what it inherited).
+- ⭐ **There is a THIRD verdict since 0.8.0, and it is the only one that is not a global.**
+  `sd_polyline_truncated(pl)` / `sd_polyline_degraded(pl)` belong to one RESULT and never move once
+  `sd_path_flatten` has returned it. Reach for them when you hold a polyline; reach for the two
+  globals when you do not — after a fill or a stroke, or when `sd_path_flatten` returned 0 and you
+  need to know whether that was an empty path or a refused allocation. See section 5 above.
 
 ---
 
-## Still open (re-audited 2026-09-15 against 0.7.1, HEAD `f722e8c`; item 3 closed by 0.7.2)
+## Still open — EMPTY: all three closed (audited 2026-09-15 against 0.7.1; re-checked 2026-09-16 against 0.8.0)
 
 Three of the "Suggested fix" asks above were not met by the shipped code. Each is MEASURED, and each
-is already stated somewhere in the body — the Status line is what did not say so. **Item 3 is now
-closed; items 1 and 2 are still open and this filing cannot be archived until they are.**
+was already stated somewhere in the body — the Status line is what did not say so. **All three are now
+closed: item 3 by 0.7.2, item 2 by 0.7.2, item 1 by 0.8.0.** The findings are kept verbatim as written
+against 0.7.1, because a filing records what was measured; the ⛔ notes say what the tree does now.
 
-1. **"a truncated contour is refused or clearly degraded, rather than filled open"** — it is still
-   filled open. `sd_fill_impl` (`src/raster.cyr:595` at 0.7.2) says so in the tree: *"The canvas
-   still holds that partial picture — the caller decides whether to clear and retry."* Nothing is
-   refused. There is no flag on the polyline either: `SdPolyline` is still 16 B, points + count
-   (`SD_POLYLINE_*_OFFSET`, `src/path.cyr:352-354` at 0.7.2). What shipped is a sticky global verdict
-   plus a return code.
-2. **The `/stroke` half of the same bullet** — not done. `sd_fill_impl`'s note
+1. ~~**"a truncated contour is refused or clearly degraded, rather than filled open"** — there is no
+   flag on the polyline~~ — **CLOSED in 0.8.0** (`src/path.cyr` `sd_path_flatten` and the
+   `sd_polyline_*` accessors, gated by `programs/flatten_bound_test.cyr` group Q, checks 373-455).
+   The finding stood as follows. `sd_fill_impl` (`src/raster.cyr:595` at 0.7.2) said so in the tree:
+   *"The canvas still holds that partial picture — the caller decides whether to clear and retry."*
+   Nothing was refused. There was no flag on the polyline either: `SdPolyline` was 16 B, points +
+   count (`SD_POLYLINE_*_OFFSET`, `src/path.cyr:352-354` at 0.7.2). What had shipped was a sticky
+   global verdict plus a return code.
+   **What 0.8.0 does:** the record is 24 B with a verdict word at +16, and `sd_polyline_truncated(pl)`
+   / `sd_polyline_degraded(pl)` / `sd_polyline_verdict(pl)` read it. See section 5 at the foot for the
+   measurement, the mutation table, and the reasoning behind FLAGGING the prefix rather than refusing
+   it — which is the half of the bullet this closure deliberately does not take.
+   ⚠ **What it does not do**, so nobody has to re-derive it: `sd_canvas_fill_path` still fills a
+   truncated contour open and returns `SADISH_ERR_OOM` about it (the 0.7.1 behaviour, unchanged);
+   nothing in sadish refuses to rasterize a flagged polyline; and the two zeros `sd_path_flatten`
+   returns — empty path, refused allocation — are still told apart by `sd_flatten_truncated()` alone,
+   because neither has a record to carry a verdict.
+2. ~~**The `/stroke` half of the same bullet**~~ — **CLOSED in 0.7.2** (`sd_canvas_stroke_path` / `_ex`
+   / `_dash` scope the flatten verdict per call and return `SADISH_ERR_OOM`; gated by
+   `programs/stroke_oom_test.cyr`). ⚠ Like the fill, a starved stroke still PAINTS its prefix and
+   reports rather than refusing — the same deliberate choice item 1 explains.
+   The finding stood as follows. `sd_fill_impl`'s note
    (`src/raster.cyr:597` at 0.7.1): *"Strokes are NOT covered by this return."*
    `sd_canvas_fill_union`'s result is discarded in `sd_stroke_seg` and `sd_stroke_disc`
    (`src/stroke.cyr:139` and `:156` at 0.7.1), so a stroke of a starved path still returns success.
@@ -315,8 +461,8 @@ closed; items 1 and 2 are still open and this filing cannot be archived until th
    covered by this return through 0.7.1 … Since 0.7.2 each stroke entry scopes the verdict the same
    way and returns SADISH_ERR_OOM itself"* (`sd_fill_impl`, `src/raster.cyr:599-602`), and
    `sd_stroke_seg` / `sd_stroke_disc` now RETURN `sd_canvas_fill_union`'s result
-   (`src/stroke.cyr:178`, `:201`). Whether the ask is closed is the sibling filing's 0.7.2 closing
-   section, not a line number.
+   (`src/stroke.cyr:178`, `:201`). The ask IS closed, re-verified 2026-09-16 on 0.8.0: both entry
+   points answer `SADISH_ERR_OOM` at every K of a starved cubic stroke.
 3. ~~**"whatever replaces the cap should still bound total flatten work per call"**~~ — **CLOSED in
    0.7.2** (`src/raster.cyr` `sd_fill_impl`, gated by `programs/flatten_bound_test.cyr` group O and
    by group H's re-measured 102/103/104).

@@ -369,8 +369,9 @@ fn main(): i64 {
     # A warm STYLED stroke of a straight path costs the global heap nothing but the canvas — every
     # later figure is a seam figure. ⚠ Not the ROUND stroker and not a CURVE: the piece paths and
     # the flatten mid-points are sd_alloc calls, and with no hook armed sd_alloc IS the global heap
-    # (MEASURED here: 126,176 B for the round stroker on this closed curve, 192 B of mid-points for
-    # a dashed one).
+    # (MEASURED here: 13,144 B for the round stroker on this closed curve — canvas included, and
+    # 126,176 B through 0.7.2, before 0.8.0 opened the piece paths at their exact capacity — and
+    # 192 B of mid-points for a dashed one).
     var gh = alloc_used();
     var a1 = so_canvas(SD_AA_SUBSCANLINE);
     check(draw_case(11, a1), SADISH_OK);                               # 10
@@ -380,12 +381,16 @@ fn main(): i64 {
     check(so_count(11, SD_AA_SUBSCANLINE), 0);                         # 12
     check(so_count(14, SD_AA_SUBSCANLINE), 0);                         # 13 — a dashed line likewise
     # The round stroker pays 7 sd_allocs a segment rect and 19 a disc: the 2-point line is one rect
-    # and two discs.
+    # and two discs. ⛔ 0.8.0 MOVED THE BYTES AND NOT THIS COUNT — sd_path_new_cap makes the same
+    # three requests sd_path_new did (record, verbs, points), for smaller blocks — so every K in
+    # every sweep below is where it was. This check is what says so: a capacity one slot short of
+    # its site's real need would double an array and read 47 here (MEASURED, as a mutation).
     check(so_count(0, SD_AA_SUBSCANLINE), 7 + 19 + 19);                # 14
     check(so_count(2, SD_AA_SUBSCANLINE) > 0, 1);                      # 15 — the curve's mid-points
 
     # ── B) THE ROUND STROKER: EVERY K, BOTH ENGINES ────────────────────
-    # ⛔ K = 0 is the audit's SIGSEGV: sd_path_new refused, sd_path_moveto through the 0 it returns.
+    # ⛔ K = 0 is the audit's SIGSEGV: the piece path's constructor refused (sd_path_new then,
+    # sd_path_new_cap since 0.8.0 — both answer 0 the same way), sd_path_moveto through the 0.
     check(sweep_case(0, SD_AA_SUBSCANLINE, 0), 0);                     # 16
     check(sweep_case(0, SD_AA_AREA, 0), 0);                            # 17
     check(sweep_case(1, SD_AA_SUBSCANLINE, 0), 0);                     # 18 — closed, curved

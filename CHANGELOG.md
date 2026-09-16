@@ -5,6 +5,102 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-09-16 — the repair backlog closes
+
+The last three asks any filing still had. ⛔ **All four issue filings are now archived**, and
+`docs/development/issues/` holds only its README; the one document still open is rekha's
+`sd_path_new_cap` proposal, whose remaining item is an adoption this repo cannot verify. Rendering does
+not move: agnos's `refagree` prints **BYTE-IDENTICAL on all 200 paths**, and rekha (23 suites) and
+dhancha (18) pass against this `dist/`.
+
+### Changed — the round stroker's piece paths are opened at their exact size
+
+`sd_path_new_cap` shipped in 0.7.1 and had **no caller in `src/` at all** — only two test suites — while
+`sd_stroke_seg` and `sd_stroke_disc` each bought `SD_PATH_CAP` = 256 verbs + 256 points (4,096 B of
+arrays plus the record) for a path of five, or of seventeen, slots — per SEGMENT and per VERTEX of every
+round stroke, on the consumer's seam. They now call `sd_path_new_cap(5, 4)` and `sd_path_new_cap(17, 16)`,
+the counts derived from the calls that fill each path.
+⭐ MEASURED on the seam, every row in the SAME number of `sd_alloc` calls:
+
+| | 0.7.2 | 0.8.0 | | calls |
+|---|---:|---:|---:|---:|
+| one segment rect | 4,208 B | **240 B** | 17.5x | 7 → 7 |
+| one 16-gon disc | 4,400 B | **568 B** | 7.75x | 19 → 19 |
+| closed 8x8 rect stroke | 34,432 B | **3,232 B** | 10.65x | 104 → 104 |
+| round stroke of a cubic | 73,376 B | **7,144 B** | 10.27x | 234 → 234 |
+| 54-glyph label, round-stroked | 16,357,904 B | **1,557,176 B** | 10.50x | 50,593 → 50,593 |
+
+⛔ **The allocation COUNT is the proof.** `sd_path_new_cap` makes the same three requests `sd_path_new`
+did, for smaller blocks, so an unchanged count means neither array doubled and no piece was dropped.
+`path_cap_test` group N reads the capacities and counts **off the record the hook handed the real site**:
+the disc's path is 17 verbs of 17 and 16 points of 16, exactly full — one slot short, at (16, 16), costs
+816 B in 20 allocations against 568 in 19.
+⚠ The segment path is NOT tight: `SD_PATH_CAP_MIN` = 8 floors its (5, 4), so it carries 3 spare verb and
+4 spare point slots, and the verb array first doubles at the NINTH verb. Group N8 pins that boundary,
+because the first draft of the header stated it wrong and `cyrius distlib` ships `src/` headers verbatim
+into every consumer's bundle.
+**One assertion moved in 29 suites**: `stroke_style_test` #13, 34,432 → 3,232 B.
+
+### Fixed — a flattened polyline says whether it is whole
+
+The flatten filing's item 1 asked for "a flag on the polyline … so a truncated contour is refused or
+clearly degraded". 0.7.1 and 0.7.2 shipped the parenthetical (the fill and all three stroke entries
+return `SADISH_ERR_OOM`); the RESULT still said nothing, and the two witnesses that existed are sticky by
+design, so a consumer holding a polyline taken a while ago could not ask about it.
+`SdPolyline` is now **24 B**: points, count, and a verdict word at +16 carrying `SD_POLYLINE_TRUNCATED`
+and `SD_POLYLINE_DEGRADED`, frozen when `sd_path_flatten`'s walk ends. New: `sd_polyline_truncated`,
+`sd_polyline_degraded`, `sd_polyline_verdict`.
+⚠ **The prefix is FLAGGED, not refused** — the bullet said "refused OR clearly degraded", and this is the
+other branch, taken on three grounds: a starved flatten's prefix is byte-identical to the whole
+flattening's first N points and a consumer recovering from an out-of-memory frame still wants it; `0`
+already means two things here (empty path, refused allocation) and a third would deepen the confusion
+this release repairs; and "refuse" belongs at the DRAW, where it has been since 0.7.1.
+⚠ **`degraded` is the CALL's verdict where `sd_flatten_degraded()` is the OPERATION's.** Two flattens
+sharing one `sd_flatten_op_begin` budget report separately: the one whose curve was cut says 1, the whole
+one says 0, while the global says 1 for both.
+⛔ **The call-scoped flag is cleared at the TOP of `sd_path_flatten`, not the bottom**, because the
+recursions that set it are also reached by `sd_flatten_quad` / `_cubic` — the road a fill and the stroker
+take. MEASURED with the clear displaced by a few lines: all 29 suites stayed green while a budget-cut
+fill followed by a whole flatten returned a record stamped with the fill's verdict.
+
+### Fixed — the presenter's own `open()` is reachable without a display
+
+0.7.1 split `_sd_present_probe` and `_sd_presenter_build` out so a regular file's fd could drive their
+allocation guards; the function they were split OUT OF stayed unreachable, because its first act is
+`open("/dev/fb0")` and no suite here may touch the live display. **`sd_present_open_fd(fd)`** is now
+everything `sd_present_open` does after the open — taking OWNERSHIP of the descriptor —
+**`sd_present_open_path(path)`** opens by name and delegates, and `sd_present_open()` is unchanged in
+signature, behaviour and cost: `return sd_present_open_path("/dev/fb0");`.
+⭐ Gated by the new `programs/present_open_test.cyr` (**131 checks**) over a regular file: the four blocks
+refused one at a time, the documented 0 each time, and `/proc/self/fd` counted before and after every
+call — 3 descriptors at entry and 3 after each of the nine refusals.
+⭐ **It also gates three `memset`s nothing in the tree could see.** Every other caller allocates from the
+global bump allocator, which hands back fresh zeroed pages, so deleting `_sd_presenter_build`'s
+`memset(blit)` or either of the probe's left all 30 suites green. Group I opens through an arena filled
+with `0xAB` and reset — the rewind-and-REUSE shape a consumer actually installs — and MEASURED **171** in
+the letterbox, read back out of the file: the previous frame's pixels on their way to the display.
+⛔ **What is still ungated is named, not hidden.** Changing `sd_present_open`'s `"/dev/fb0"` to
+`"/dev/fb1"`, or replacing its body with `return 0;`, leaves all 30 suites green. That one line is the
+residue, and only a display can gate it.
+
+### Verified
+
+All **30** suites pass, including the new `present_open_test` (131 checks); `path_cap_test` 170 → 252 and
+`flatten_bound_test` grew its group Q. `fmt --check` clean, `lint` 0 warnings, `vet` clean, `distlib` in
+sync with no duplicate top-level names. `sadish_version()` → **800**.
+⚠ `SdPolyline` grew 16 → 24 B and `SD_POLYLINE_SIZE` moved with it — the one layout change in this
+release; `sd_path_flatten` is the only thing in the ecosystem that allocates one, and its accessors are
+unchanged.
+
+### Still open
+
+- `docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md` item 3 — **rekha
+  adoption**, which this repo cannot verify: `rekha/src/glyf.cyr` still calls `sd_path_new`. rekha's 23
+  suites passing against this `dist/` says the change is COMPATIBLE, not that the ask is met.
+- Inline `(x, y)` storage in `SdPath` instead of `SdPoint` pointers — **0.9.0**, sequenced on its own
+  because it is an ABI break that reaches 14 reads across 6 rekha programs; rekha gets a filing with the
+  port and the measured 78,656 → 58,672 B.
+
 ## [0.7.2] - 2026-09-16 — the residue a 0.7.1 audit found under four "closed" filings
 
 0.7.1 archived nothing: an audit re-verified every closure claim in `docs/development/` against the
@@ -113,7 +209,7 @@ detector with absolute ink constants rather than a geometry check.
 
 ### Still open
 
-- `docs/development/issues/2026-09-15-flatten-keeps-subdividing-…` — items 1 and 2 of its Still-open
+- `docs/development/issues/archived/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md` — items 1 and 2 of its Still-open
   section: a truncated contour is still FILLED OPEN rather than refused (there is no flag on
   `SdPolyline`), and a stroke of a starved path reports through the return code but the filing asked for
   the contour itself to be refused or clearly degraded.
@@ -131,7 +227,7 @@ this `dist/`.
 
 ### Fixed — `sd_path_flatten` stops allocating mid-points it throws away
 
-Closes `docs/development/issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md`.
+Closes `docs/development/issues/archived/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md`.
 The de Casteljau recursion allocated three `SdPoint`s per quad node (six per cubic) on the seam and kept
 only the one that reached the output. It now carries its mids as plain i64 locals and allocates exactly
 the points it emits — *(points emitted − 1)* per curve, with no scratch to warm, size or grow.
@@ -401,7 +497,7 @@ Byte-identical on every canvas `sd_canvas_new` makes.
 
 ### Filed by rekha — for 0.7.1, not fixed here
 
-- `docs/development/issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md`
+- `docs/development/issues/archived/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md`
   — `sd_flatten_quad` / `_cubic` keep subdividing (and allocating mid-points) past the output cap.
   ⚠ **This release changes the shape of that cost, and not only for the better.** RE-MEASURED on this
   tree with the same repro: 0.6.0 emitted 8,192 points for 50,200,616 B; 0.7.0 emits all 1,048,577 for

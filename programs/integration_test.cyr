@@ -11,7 +11,7 @@
 #   C. that dispatch honours the clip mask and MAX-combines with existing coverage;
 #   D. gradient paint through AREA coverage onto a WRAPPED surface equals sd_canvas_blit_at;
 #   E. a drawing verb before any MOVETO faults nothing, and paints nothing (0.7.1);
-#   F. sadish_version() == 702.
+#   F. sadish_version() == 800.
 # Exit code = failed checks; each failure prints its check number.
 
 include "src/lib.cyr"
@@ -212,7 +212,7 @@ fn main(): i64 {
     if (it_right_sum(bcv3, 0) <= 0) { g_fails = g_fails + 1; }         # 43 — the triangle is there
 
     # ---- F. version probe -----------------------------------------------------------------------
-    check(sadish_version(), 702);                                      # 44
+    check(sadish_version(), 800);                                      # 44
 
     if (g_fails == 0) {
         var ok = "integration_test: PASS (AREA styled strokes, clip/MAX, paint on wrapped, first-use alloc)\n";

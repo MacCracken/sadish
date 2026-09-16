@@ -684,14 +684,22 @@ fn main(): i64 {
     g0 = alloc_used();
     sd_canvas_stroke_path_ex(acv, arect, W4, SD_CAP_ROUND, SD_JOIN_BEVEL, ML4);
     check(alloc_used() - g0, 0);                                       # 11 — no hook: still 0 B
-    # ROUND/ROUND through _ex is the round stroker, allocations included (34,432 B, its paths).
+    # ROUND/ROUND through _ex is the round stroker, allocations included (3,232 B, its paths).
+    # ⭐ 34,432 B through 0.7.2, 3,232 B here — 10.65x less, in the SAME 104 sd_alloc calls. 0.8.0
+    # opened sd_stroke_seg's rect at sd_path_new_cap(5, 4) and sd_stroke_disc's 16-gon at
+    # sd_path_new_cap(17, 16) instead of SD_PATH_CAP = 256 + 256 (item 2 of
+    # docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md). The closed square
+    # is 4 segment rects at 240 B and 4 vertex discs at 568 B: 4 * 240 + 4 * 568 = 3,232. ⛔ The
+    # ALLOCATION COUNT is what says neither array grew — 7 a rect and 19 a disc, exactly as before,
+    # since a doubling would add one more (programs/path_cap_test.cyr group N reads the capacities
+    # off the record and asserts the counts too).
     g0 = alloc_used();
     sd_canvas_stroke_path(acv, arect, W2);
     var round_cost = alloc_used() - g0;
     g0 = alloc_used();
     sd_canvas_stroke_path_ex(acv, arect, W2, SD_CAP_ROUND, SD_JOIN_ROUND, ML4);
     check(alloc_used() - g0, round_cost);                              # 12
-    check(round_cost, 34432);                                          # 13
+    check(round_cost, 3232);                                           # 13 — was 34,432 through 0.7.2
 
     # ── B) ARGUMENT CONTRACT ────
     var line = seg(2 * SD_ONE, 4 * SD_ONE, 6 * SD_ONE, 4 * SD_ONE);

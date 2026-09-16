@@ -1,16 +1,21 @@
 # Capacity-sized paths: `sd_path_new_cap(n_verbs, n_points)` for callers that know the path's size
 
-**Status:** 🟡 **STILL OPEN — the CAPABILITY is complete as of 0.7.2, the ADOPTION asks are not.**
-0.7.2 gives the verb and point arrays separate capacities (`SD_PATH_CAP_OFFSET` = verbs,
+**Status:** 🟡 **STILL OPEN — items 1 and 2 are closed; item 3 is a REKHA ask this repo cannot
+verify.** 0.7.2 gave the verb and point arrays separate capacities (`SD_PATH_CAP_OFFSET` = verbs,
 `SD_PATH_PCAP_OFFSET` = points, in the 48 B record's former `reserved` word), so
-`sd_path_new_cap(n_verbs, n_points)` now opens each array at exactly its own requested capacity and
-each doubles alone: **MEASURED 78,656 B on this proposal's own ASCII set, its target to the byte**
-(`programs/path_cap_test.cyr` #160, 170 checks, 24 single mutations each killed). That closes item 1
-of **Still open** and nothing else — items 2 (no in-tree adopter: `sd_stroke_seg` / `sd_stroke_disc`
-still call `sd_path_new`) and 3 (rekha adoption) are untouched, so ⛔ **this filing does not archive
-yet.** Was 🟡 OPEN — SHIPPED in 0.7.1 with a deviation from this proposal's first bullet, and 🟡 OPEN
-— a capability request before that. It read "🟢 **CLOSED — SHIPPED**" until the 2026-09-15 re-audit
-against HEAD `f722e8c`.
+`sd_path_new_cap(n_verbs, n_points)` opens each array at exactly its own requested capacity and each
+doubles alone: **MEASURED 78,656 B on this proposal's own ASCII set, its target to the byte**
+(`programs/path_cap_test.cyr` #160, 170 checks, 24 single mutations each killed) — item 1.
+0.8.0 puts sadish's own two known-size sites on that call: `sd_stroke_seg` at
+`sd_path_new_cap(5, 4)` and `sd_stroke_disc` at `sd_path_new_cap(17, 16)`, so the proposal at last
+has an IN-TREE ADOPTER — **MEASURED, the closed 8x8 rect stroke 34,432 B → 3,232 B in the SAME 104
+`sd_alloc` calls** (`programs/path_cap_test.cyr` group N, 82 of the suite's 252 checks;
+`programs/stroke_style_test.cyr` #13) — item 2. ⛔ **This filing STILL does not archive:** item 3,
+*"rekha updates that test when it adopts the new call"*, is a promise made on rekha's behalf and
+nothing in this repo can witness it. Was 🟡 STILL OPEN — the CAPABILITY complete as of 0.7.2 and the
+ADOPTION asks not; 🟡 OPEN — SHIPPED in 0.7.1 with a deviation from this proposal's first bullet
+before that; and 🟡 OPEN — a capability request before that. It read "🟢 **CLOSED — SHIPPED**" until
+the 2026-09-15 re-audit against HEAD `f722e8c`.
 **Filed:** 2026-09-15, by **rekha** (dhancha's 2026-09-13 arena filing already named this cost: *"4,144 B
 of which is `sd_path_new`'s opening capacity — a sadish/rekha question"*).
 **Placement:** `src/path.cyr`, beside `sd_path_new`.
@@ -283,31 +288,260 @@ left and remains out of scope (see "Not done (still open, deliberately)" above).
 
 ---
 
-## Still open (item 1 closed 0.7.2; re-audited 2026-09-15 against 0.7.1, HEAD `f722e8c`)
+## CLOSED — item 2, sadish 0.8.0 (`src/stroke.cyr`, `programs/path_cap_test.cyr` group N)
+
+⚠ **Everything above this line is 0.7.1's and 0.7.2's record.** What follows is the ADOPTION — the
+item that said `sd_path_new_cap` had no caller in `src/` at all.
+
+```cyr
+fn sd_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
+    var rp = sd_path_new_cap(5, 4);        # was sd_path_new()
+fn sd_stroke_disc(cv, cx, cy, hw): i64 {
+    var dp = sd_path_new_cap(17, 16);      # was sd_path_new()
+```
+
+**Two lines. Nothing else in `src/` changed** beyond the comments that carried the old figures
+(`sd_stroke_seg`'s and `sd_stroke_disc`'s headers, this file's header block, and
+`_sd_scratch_init`'s in `src/raster.cyr`).
+
+### Where the counts come from — DERIVED, not estimated
+
+- `sd_stroke_seg` calls `sd_path_moveto` once, `sd_path_lineto` three times and `sd_path_close`
+  once: **5 verbs**; moveto and each lineto carry one point, close carries none: **4 points**. Both
+  are under `SD_PATH_CAP_MIN` = 8, so each array is opened at 8.
+- `sd_stroke_disc`'s `while (k < 16)` emits one moveto and 15 linetos, then `sd_path_close` adds the
+  17th verb: **17 verbs, 16 points**, and both arrays are EXACTLY full when the disc is built.
+- ⛔ **A SWEEP OF `src/` FOUND NO THIRD SITE.** `sd_path_new` is called nowhere else in `src/`
+  (grep, 2026-09-16); `src/dash.cyr` builds no `SdPath` at all — its piece buffer, curve flags and
+  four cut-point records come from the GLOBAL `alloc` in `_sd_dash_init`, not from a path — and the
+  styled stroker's discs are edges in `_sd_sb_disc`, not paths. The two sites this proposal named
+  are the whole set.
+
+### MEASURED on this tree — the same calls before and after, on the allocation seam
+
+| | 0.7.2 | 0.8.0 | | `sd_alloc` calls |
+|---|---:|---:|---:|---:|
+| `sd_stroke_seg`, one call | 4,208 B | **240 B** | 17.5× less | **7 → 7** |
+| `sd_stroke_disc`, one call | 4,400 B | **568 B** | 7.75× less | **19 → 19** |
+| closed 8x8 rect stroke (this proposal's own quoted case) | 34,432 B | **3,232 B** | 10.65× less | **104 → 104** |
+| round stroke of a cubic (8 rects, 9 discs, 7 mid-points) | 73,376 B | **7,144 B** | 10.27× less | **234 → 234** |
+| 54-glyph label, round-stroked (a dhancha-shaped text draw) | 16,357,904 B | **1,557,176 B** | 10.50× less | **50,593 → 50,593** |
+
+⇒ 240 = 48 + 64 + 64 + 4·16; 568 = 48 + 136 + 128 + 16·16; 3,232 = 4·240 + 4·568. The item's own
+estimate was **3,264 B**, computed under 0.7.1's single capacity; re-derived here as this file asked
+("re-derive it when the adoption is made rather than quoting it"), it is **3,232 B** — 4 × 8 B lower,
+one 8 B verb slot per disc path, exactly the correction the item predicted.
+⚠ **The 54-glyph label is the figure that answers the arena filing this proposal was opened about**:
+14,800,728 B off one label's arena, per draw. It is a synthetic corpus (this file's own ASCII-shaped
+paths, round-stroked at width 1), not a rekha/dhancha measurement — the shape is honest, the font is
+not real.
+
+### ⛔ THE ALLOCATION COUNT IS THE SECOND HALF OF EVERY ROW, AND IT IS THE PROOF OF NO GROWTH
+
+`sd_path_new_cap` makes the same three requests `sd_path_new` did — record, verb array, point array
+— for smaller blocks. So an unchanged count means **nothing was batched away, no piece was dropped,
+and NEITHER ARRAY EVER DOUBLED**: a growth is an extra `sd_alloc` and would show. Three independent
+gates say it:
+
+- `programs/path_cap_test.cyr` group N reads the capacities and the counts **off the record the
+  allocation hook handed the real site** (not off a rebuild of its geometry): `sd_stroke_seg`'s path
+  is 5 verbs in an 8-slot array and 4 points in an 8-slot array (#180-#185); `sd_stroke_disc`'s is
+  **17 of 17 and 16 of 16** (#193-#196) — count EQUALS capacity in both arrays.
+- `programs/stroke_oom_test.cyr` #14 pins the round stroker's own allocation count for a 2-point
+  line at `7 + 19 + 19` = 45, and it is **unchanged**. MEASURED as mutations: `(16, 16)` on the disc
+  reads 47 there, and so do `(17, 15)` and `(16, 17)`.
+- Group N #197-#202 measures what the off-by-one costs: the same 17-verb / 16-point shape opened at
+  `(16, 16)` is **816 B in 20 allocations** against 568 B in 19 — **248 B and one memcpy** for one
+  slot. ⚠ Still far under the 4,400 B the 256-slot default cost, so a rounded-down capacity is not
+  "worse than before"; 248 B is what deriving the count off the code buys over rounding it, and it
+  is why the capacities are read back rather than reasoned about.
+
+### ⚠ A CORRECTION TO THIS RELEASE'S OWN HEADER: the seg path has SLACK, and the first draft said it had none
+
+The `⛔` block this release added over `sd_stroke_seg` read: *"Both land under `SD_PATH_CAP_MIN` = 8,
+so each array is opened at 8 and neither can grow here — a fifth lineto added below without moving
+these arguments would double an array instead (128 B and a copy), which is why
+`programs/path_cap_test.cyr` group N asserts the capacities AND the counts after the call."*
+**It is false, and `cyrius distlib` copies `src/` headers verbatim into `dist/sadish.cyr`** — so a
+⛔-voiced measurement that is wrong reaches every consumer vendoring the dist. Caught in review.
+
+`sd_stroke_seg` asks for `(5, 4)` and `SD_PATH_CAP_MIN` = 8 floors BOTH, so the path is built with
+**3 spare verb slots and 4 spare point slots**. MEASURED at those same arguments:
+
+| extra linetos | verbs / points | vcap / pcap | bytes | `sd_alloc` calls |
+|---:|---|---|---:|---:|
+| 0 (the site today) | 5 / 4 | 8 / 8 | 240 | 7 |
+| +1 | 6 / 5 | 8 / 8 | 256 | 8 |
+| +3 | 8 / 7 | 8 / 8 | 288 | 10 |
+| +4 | 9 / 8 | **16** / 8 | 432 | 12 |
+
+⇒ The "128 B and a copy" figure is right for the doubling itself; its **trigger is four more
+linetos, not one**. The verb array first doubles at the NINTH verb (`moveto` + 7 `lineto`s +
+`close`), the point array at the ninth point one lineto later.
+⇒ The sentence was also wrong about its own tests: #180/#181 (the capacities) do not move until the
+fourth extra lineto, so they are **not** what catches an added call — #182/#183 (the counts, 5 and
+4) are. The header now states both, and **group N8 (#236-#252) pins the whole boundary** rather than
+leaving it to prose: #240/#241 are asserted against the real site's own measured 240 B / 7 calls,
+and #252 says the step from "exactly full" to "one past" is one `SdPoint` plus one 128 B doubling.
+⚠ `sd_stroke_disc`'s header was re-checked with it and is correct as written: that path is exactly
+full in both arrays, so `k < 17` without moving the arguments really does double both (1,112 B).
+
+### ⛔ The refusal contract 0.7.2 established holds, unchanged
+
+`sd_path_new_cap` returns **0** exactly where `sd_path_new` did, and both sites' 0-checks
+(`if (rp == 0)` / `if (dp == 0)`) still turn that into `SADISH_ERR_OOM` rather than a store through
+address 0. Group N #219-#232 walks the constructor's three requests one at a time under a hook that
+grants K and then refuses: K = 0 refuses the record (1 request made), K = 1 the VERB array (2),
+K = 2 the POINT array (3), K = 3 the first `SdPoint` (4) — `SADISH_ERR_OOM` at every one, for the
+rect and for the disc, and the whole round stroker likewise; the next healthy stroke is
+byte-identical to a clean one (#233-#235).
+⚠ **The K sweeps in `programs/stroke_oom_test.cyr` did NOT shift, and that is a finding rather than
+an oversight.** They are keyed to each call's allocation COUNT, measured at run time by `so_count`,
+and this change moved bytes only. All 153 of its checks pass untouched.
+
+### ⛔ Rendering does not move
+
+agnos `refagree`: **BYTE-IDENTICAL on all 200 paths**. All 29 suites green with every assertion but
+one unedited; rekha (23 suites) and dhancha (18) pass against this `dist/`. Group N #216-#218 pins
+three absolute ink totals measured on BOTH trees — the closed 8x8 rect at 16,092 coverage units, the
+cubic at 12,582, the 54-glyph label at 21,932 — so a stroke that quietly lost a piece to a growth
+failure would fail them where a self-comparison could not.
+
+### The one assertion that moved, and the figures that were comments
+
+`programs/stroke_style_test.cyr` #13, `round_cost` **34,432 → 3,232** — the figure this item named as
+the one that would move, and the only check in any suite that did. Four MEASURED figures living in
+comments moved with it and were re-measured rather than left: `programs/alloc_test.cyr`'s group B
+arena high-water (893,760 B / 44,688 B a round → **269,760 / 13,488**) and its group C stroke note
+(34,432 → **3,232**), `programs/stroke_oom_test.cyr`'s group A heap note (126,176 → **13,144 B**,
+canvas included), and `src/raster.cyr`'s `_sd_scratch_init` header (34,432 → **3,232**).
+
+### ⚠ Eight of group N's checks compared two literals; seven are now relations between measurements
+
+Review found that #179, #192, #202, #206, #207, #211, #212 and #216 as first written compared two
+constant expressions — `check(4 * 240 + 4 * 568, 3232)` and the like. No sadish state reached either
+side, so **none of them could ever fail**: building the suite as it then was against 0.7.2's
+`src/stroke.cyr` failed 13 checks and not one of these eight. They inflated the group's count
+without gating anything.
+
+Seven were rewritten to relate values the suite MEASURED rather than values it restates — the
+single-call costs are now carried in `n_seg` / `n_segc` / `n_disc` / `n_discc` and the totals are
+asserted against them:
+
+| was | is |
+|---|---|
+| `check(176 + 4 * 16, 240)` | `check(g_sz1 + g_sz2 + g_sz3 + 4 * 16, g_bytes)` |
+| `check(312 + 16 * 16, 568)` | `check(g_sz1 + g_sz2 + g_sz3 + 16 * 16, g_bytes)` |
+| `check(816 - 568, 248)` | `check(g_bytes - n_disc, 248)` |
+| `check(4 * 240 + 4 * 568, 3232)` | `check(4 * n_seg + 4 * n_disc, g_bytes)` |
+| `check(4 * 7 + 4 * 19, 104)` | `check(4 * n_segc + 4 * n_discc, g_calls)` |
+| `check(8 * 240 + 9 * 568 + 7 * 16, 7144)` | `check(8 * n_seg + 9 * n_disc + 7 * 16, g_bytes)` |
+| `check(8 * 7 + 9 * 19 + 7, 234)` | `check(8 * n_segc + 9 * n_discc + 7, g_calls)` |
+
+⇒ These now gate something the byte totals alone do not: that the measured total **decomposes** into
+the measured pieces, so a dropped piece, an extra piece, or a growth request hiding outside the
+first three sizes fails them.
+⚠ **They are corroboration, not adoption gates, and the re-measurement says so plainly.** Rebuilding
+the rewritten suite against 0.7.2's `src/stroke.cyr` fails 15 checks — #174, #177, #178, #180, #181,
+#187, #190, #191, #193, #194, #202, #204, #209, #214, #240 — and the six decomposition rows are NOT
+among them, because a 4,208 B rect decomposes as honestly as a 240 B one (48 + 2,048 + 2,048 + 64 =
+4,208). What they catch is a fourth path allocation appearing: MEASURED under the `(16, 16)`
+capacity mutation, #192 reads 560 against a measured 816 while #189 (48 B) and #191 (128 B) still
+read their exact expected sizes. Only #202 of the eight became an adoption gate outright.
+⇒ The eighth, `check(16357904 - 1557176, 14800728)`, was **deleted**: its 0.7.2 side is history, not
+a value this tree can measure, so no honest form of it exists. The arithmetic is kept as a comment
+beside #214, which is the gate. Group N is 82 checks (#171-#252), and the suite 252.
+
+### MUTATIONS — 17 single edits, 14 killed, 3 equivalent
+
+Each applied alone, all 29 suites built and run against it, then the file restored and its MD5
+checked against the pristine copy. The last four target `src/path.cyr` — the floor and the doubling
+that group N8 measures — rather than the two changed call sites.
+
+| mutation | killed by |
+|---|---|
+| `(5, 4)` → `sd_path_new()` | `path_cap_test` #174 (4,208), `stroke_style_test` #13 |
+| `(17, 16)` → `sd_path_new()` | `path_cap_test` #187 (4,400), `stroke_style_test` #13 |
+| `(5, 4)` → `(9, 4)` | `path_cap_test` #174 (248), `stroke_style_test` #13 (3,264) |
+| `(5, 4)` → `(5, 9)` | `path_cap_test` #174 (248), `stroke_style_test` #13 (3,264) |
+| `(17, 16)` → `(16, 16)` | `path_cap_test` #187 (816), `stroke_oom_test` #14 (47), `stroke_style_test` #13 |
+| `(17, 16)` → `(17, 15)` | `path_cap_test` #187 (800), `stroke_oom_test` #14 (47), `stroke_style_test` #13 |
+| `(17, 16)` → `(18, 16)` | `path_cap_test` #187 (576), `stroke_style_test` #13 |
+| `(17, 16)` → `(16, 17)` | `path_cap_test` #187 (824), `stroke_oom_test` #14 (47), `stroke_style_test` #13 |
+| `while (k < 16)` → `k < 17` | `path_cap_test` #187 (1,112), `stroke_oom_test` #14 (51), `stroke_style_test` #13, `flatten_bound_test` #360 |
+| `if (rp == 0) return OOM` → `return OK` | `path_cap_test` #219, `stroke_oom_test` #31 |
+| `if (dp == 0) return OOM` → `return OK` | `path_cap_test` #227, `stroke_oom_test` #16 |
+| `SD_PATH_CAP_MIN` 8 → 9 | `path_cap_test` 37 checks incl. **N8 #245 #248 #250 #251 #252**, `flatten_bound_test` #120, `stroke_style_test` #13 (3,296) |
+| `SD_PATH_CAP_MIN` 8 → 7 | `path_cap_test` 26 checks incl. **N8 #244 #245 #246 #249 #250 #251 #252**, `flatten_bound_test` #120, `stroke_style_test` #13 (3,168) |
+| `sd_path_grow` `cap * 2` → `cap * 2 + 8` | `path_cap_test` 27 checks incl. **N8 #248 #250 #252**, `flatten_bound_test` #161 |
+
+⚠ **`while (k < 16)` has TWO occurrences in `src/stroke.cyr`** — `sd_stroke_disc`'s vertex loop and
+the styled stroker's 16-entry trig table — and a one-line anchor hits both. The row above is the
+disc loop alone, anchored on the preceding `var vrc = SADISH_OK;`. A mutation harness that edits by
+substring has to count its matches before it writes; this one asserts a single match and skipped the
+edit rather than mutating two sites at once and reporting the result as one.
+
+⚠ **Three mutations SURVIVED, and all three are genuinely EQUIVALENT:** `(5, 4)` → `(4, 4)`,
+`(5, 4)` → `(5, 3)` and `(5, 4)` → `(6, 4)`. `SD_PATH_CAP_MIN` = 8 floors both of `sd_stroke_seg`'s arguments, so every
+argument pair with each value ≤ 8 builds a bit-for-bit identical path — there is nothing for a test
+to observe. No suite can kill them and none was written to pretend otherwise. What *is* asserted is
+that the arguments are the site's TRUE counts: group N #182-#183 reads 5 verbs and 4 points back off
+the path, so the pair stops being a free-floating number even where the allocator cannot tell it
+from another. Above the floor the arguments bite in both positions — `(9, 4)` and `(5, 9)` are both
+killed.
+⚠ **The capacity read-backs (#180-#185, #193-#196) killed no mutation on their own.** Every capacity
+error I could construct also moves a byte total or an allocation count, which #174/#175/#187/#188
+catch first. They are kept because they state the ask directly — "the capacities after construction,
+no growth" — and because they are what survives if a byte figure is ever re-based; they are reported
+here as corroboration, not as unique gates.
+⚠ **Group N8 is not a unique killer either, and one of its checks is.** Its capacity and byte rows
+fire under all three `src/path.cyr` mutations above, but never alone — `#199`/`#201`/`#202` or the
+group-L capacity checks catch those too. The exception is **#240**, which asserts the `+1 lineto`
+cost against the REAL site's measured `n_seg`: rebuilding the suite against 0.7.2's
+`src/stroke.cyr` fails 15 checks and #240 is one of them, so N8 is tied to the adoption and not
+only to the constructor. The rest of N8 exists to keep the corrected header's numbers MEASURED
+rather than asserted in prose — a comment cannot be mutation-tested, so the boundary it describes
+is written down as checks instead.
+
+### Not done (deliberately)
+
+Inline `(x, y)` storage instead of `SdPoint` pointers is untouched and remains the largest item on
+this file's numbers. It is still about half of what these two sites cost, as it was of the glyph set
+(51 %): of `sd_stroke_disc`'s 568 B, **256 B (45 %) are the sixteen `SdPoint` objects**; of
+`sd_stroke_seg`'s 240 B, 64 B (27 %); of the closed rect stroke's 3,232 B, **1,280 B (40 %)**. That
+change is an `SdPath` ABI break reaching into rekha and is sequenced for 0.9.0.
+
+---
+
+## Still open (items 1 and 2 closed; re-audited 2026-09-16 against 0.7.2, HEAD `cbb7229`)
 
 1. ~~**"allocate the verb and point arrays at exactly the given capacity"**~~ — 🟢 **CLOSED in
    0.7.2**, see the section above: two capacity fields in the same 48 B record, 78,656 B on this
    proposal's own set. ⚠ The ask's companion phrase "same `SdPath` layout" survives in the sense
    that mattered — the record is the same size and every published offset below +40 is where it was.
-2. **No in-tree adopter.** ⚠ Re-checked 2026-09-15 after the item-1 change: the callers of
-   `sd_path_new_cap` are `programs/flatten_bound_test.cyr` and now `programs/path_cap_test.cyr` —
-   still both TESTS, so this item stands in full. ⚠ Its 3,264 B figure was computed under ONE
-   capacity and is now 8 B per disc path lower (`sd_path_new_cap(17, 16)` opens 48 + 136 + 128 =
-   **312 B**, not 320; `(5, 4)` is 176 B either way — MEASURED, `programs/path_cap_test.cyr` #30-31);
-   re-derive it when the adoption is made rather than quoting it. sadish's own two known-size path
-   sites still call `sd_path_new`:
-   `sd_stroke_seg` (5 verbs / 4 points, `src/stroke.cyr:171` at 0.7.2) and `sd_stroke_disc`
-   (17 verbs / 16 points, `:185`). MEASURED: one round stroke of a 4-vertex rect costs
-   **34,432 B in 104 allocations** today (pinned at `programs/stroke_style_test.cyr:694`); with those
-   two sites on `sd_path_new_cap(5, 4)` and `sd_path_new_cap(17, 16)` it is **3,264 B in the SAME 104
-   allocations** — 10.5× less, every other suite still green, only that pinned figure moving. Not
-   something this proposal asks for, but it is exactly the arena cost it was opened about.
-   ⚠ Those same two sites are the ones
-   `issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md` filed as unchecked
-   `sd_path_new()` results; one edit closes both. ⚠ **Half of that cross-reference is stale at 0.7.2,
-   checked 2026-09-16:** both results ARE checked now (`if (rp == 0) { return SADISH_ERR_OOM; }` /
-   `if (dp == 0) { … }`, `src/stroke.cyr:172` / `:186`) and that filing is closed. What stands here is
-   the CAPACITY ask alone, which is untouched — both sites still call `sd_path_new`, not
-   `sd_path_new_cap`.
+2. ~~**No in-tree adopter.**~~ — 🟢 **CLOSED in 0.8.0**, see the section above. `sd_stroke_seg`
+   (in `src/stroke.cyr`) calls `sd_path_new_cap(5, 4)` and `sd_stroke_disc` `sd_path_new_cap(17, 16)`
+   — cited by function, not by line, as `issues/README.md` asks: an earlier draft of this sentence
+   said `:208` for the second, which was the line of a comment, and both numbers moved again when
+   the headers were corrected. A sweep of `src/` found no third known-size site (`src/dash.cyr`
+   builds no `SdPath`). The item's 3,264 B estimate re-derives as **3,232 B in the SAME 104
+   allocations** — it asked to be re-derived rather than quoted, and the 32 B is the four 8 B verb
+   slots 0.7.2's split capacities took off the disc path. Gated by `programs/path_cap_test.cyr`
+   group N (82 checks, #171-#252) and `programs/stroke_style_test.cyr` #13.
+   ⚠ The cross-reference to
+   `issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md` is fully
+   settled now: that filing's half (both results 0-checked) closed in 0.7.2, and this half (the
+   capacity) closes here. Both sites' `if (rp == 0)` / `if (dp == 0)` guards are unchanged and still
+   gated — `sd_path_new_cap` refuses with the same 0 `sd_path_new` did.
 3. **rekha adoption** — *"rekha updates that test when it adopts the new call"* is unverifiable from
-   this repo, and nothing here tracks it.
+   this repo, and nothing here tracks it. ⛔ **This is why the filing does not archive**, and 0.8.0
+   does not change it: rekha's `rekha_outline_to_sdpath` still calls `sd_path_new`, and neither fact
+   can be asserted from here — rekha's 23 suites were run against this `dist/` and pass, which says
+   the change is compatible, not that the ask is met. ⚠ sadish's own adoption (item 2) is evidence
+   the call is usable, not a substitute for this.
+   ⚠ **And the "test" the ask names is looser than this filing has been calling it.** Re-read on the
+   live tree 2026-09-16: `rekha/programs/alloc_test.cyr` carries 4,192 B as a MEASURED figure in the
+   comment beside its check #5 (*"4,192 B of sadish path (`sd_path_new` 4,144 + 3 points x 16)"*);
+   the assertion itself is `check(glyph_cost > 0, 1)`. So adoption there would move a documented
+   number and a `> 0` bound, not a literal pin — earlier drafts of this section said "pins", which
+   overstates what rekha would have to edit. The ask still stands; only its size was wrong here.

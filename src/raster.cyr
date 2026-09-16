@@ -224,7 +224,7 @@ var _sd_stroke_fctx = 0;       # the stroker's OWN flatten ctx (24 B)
 # pathological path makes a process keep that memory for the rest of its life. MEASURED on this
 # tree, rekha's hostile repro (4,096 maximally non-flat quads, one sd_canvas_fill_path on 64x64,
 # the shape a font file can carry — the filing is
-# docs/development/issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md):
+# docs/development/issues/archived/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md):
 # unbounded, it grows the edge list and crossings to 1,048,576 entries and the fill costs
 # 150,602,312 B of global heap, permanently. At the default below the same fill keeps its first
 # 262,144 edges, flags the truncation, and the AREA dispatch falls back to the sub-scanline loop
@@ -270,7 +270,8 @@ fn _sd_grow_alloc(n): i64 {
 # sd_canvas_stroke_path; a second call is one load + compare. MEASURED one-time cost: 589,896 B
 # (fill 458,800 + stroke 131,096), plus accrow on first use (w*8: 64 B at 8 px, 6,080 B at 760).
 # ⇒ After it, a straight-line fill costs the heap 0 B (MEASURED, 8x8 and 760x300); a stroke of the
-# closed 8x8 rect 34,432 B, all of it paths + points on the seam (was 2,789,016 B).
+# closed 8x8 rect 3,232 B, all of it paths + points on the seam (was 34,432 B through 0.7.2 and
+# 2,789,016 B on 0.5.4 — 0.8.0 opens the round stroker's piece paths at their exact capacity).
 #
 # Returns 1 when the scratch is ready, 0 when a block was refused.
 # ⛔ ALL OR NOTHING, AND `_sd_fill_ectx != 0` IS THE FLAG. Through 0.7.0 the eight blocks were
@@ -612,7 +613,7 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     # (SD_FLATTEN_BUDGET_DEFAULT = 65,536, src/path.cyr) and left the fill flattening ONE CURVE VERB
     # at a time into fbuf, each call its own operation — so an untrusted outline got one budget PER
     # CURVE and the fill's work stayed linear in the curve count, which is the severity case of
-    # docs/development/issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md
+    # issues/archived/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md
     # (rekha → dhancha → crab fill glyph outlines from font files, every frame). MEASURED on the
     # filing's own repro, 4,096 maximally non-flat quads filled on 64x64: 16,711,680 B in 1,044,480
     # sd_alloc calls per curve-scoped fill, 1,044,480 B in 65,280 with the fill scoped — 16x, and it
@@ -1164,9 +1165,9 @@ fn sd_canvas_clip_pop(cv): i64 {
 
 # ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
-# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700; 0.7.1 -> 701; 0.7.2 -> 702.
+# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700; 0.7.1 -> 701; 0.7.2 -> 702; 0.8.0 -> 800.
 # ================================================================
 # @public
 fn sadish_version(): i64 {
-    return 702;
+    return 800;
 }

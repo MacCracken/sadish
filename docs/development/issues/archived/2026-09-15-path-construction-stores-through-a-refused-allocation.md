@@ -6,6 +6,11 @@ three stroke entry points return `SADISH_ERR_OOM` instead of faulting or under-d
 and `src/alloc.cyr`'s contract states what a refusal really costs entry point by entry point. Gated
 by `programs/stroke_oom_test.cyr` (153 checks) on top of `programs/oom_test.cyr` and
 `programs/flatten_bound_test.cyr`; **Still open** at the foot is now empty and says what closed it.
+⇒ **A postscript at the foot records one thing 0.8.0 did that this filing NOTED but never asked for**:
+`sd_present_open`'s own `open("/dev/fb0")`, which no test could reach, is now driven over a regular
+file through the new `sd_present_open_path` / `sd_present_open_fd`
+(`programs/present_open_test.cyr`, 131 checks). The status above does not depend on it and does not
+change.
 ⛔ This line read "🟢 **CLOSED — FIXED in sadish 0.7.1**" before the 2026-09-15 re-audit against HEAD
 `f722e8c` reopened it, and 🟡 **OPEN** from that audit until 0.7.2.
 
@@ -106,6 +111,10 @@ numbers rot: `sd_path_new`'s verbs/points, now taken inside the shared `_sd_path
 `:146`, `:156`; `:176`, `:181`). ⚠ Only `path.cyr` and `raster.cyr` moved again between 0.7.1 and
 0.7.2 — `geom.cyr`, `error.cyr` and `present.cyr` are not in that release's diff, so their numbers
 carry one figure and hold at both. Cite the FUNCTION, not the line, in the next filing.
+⚠ **And `present.cyr`'s figures stop holding at 0.8.0**, which is the point of the sentence above:
+the postscript at the foot adds two entry points and their headers, so `sd_surface_write_ppm`'s two
+blocks are `src/present.cyr:100`, `:103`, `_sd_presenter_build`'s `:160`, `:170` and
+`_sd_present_probe`'s `:199`, `:204`. Six references, one release, no code moved between them.
 
 ## Suggested fix
 
@@ -178,6 +187,9 @@ test (that would write to the live display) — its four allocation guards are r
 `_sd_present_probe`, which 0.7.1 split out precisely so a regular file's fd can drive them.
 Re-verified 2026-09-15: no program calls `sd_present_open`; only `_sd_present_probe` /
 `_sd_presenter_build` are driven (`oom_test` checks #69-#90).
+⇒ **Answered in 0.8.0** — see the postscript at the foot. The split 0.7.1 stopped one function short
+of finishing is finished: the device NAME is the argument now, and everything under it is driven
+over a regular file.
 
 ---
 
@@ -347,7 +359,8 @@ a hook that refuses is now safe at every entry point sadish publishes, and the *
 closing clause — *"and rekha's own 0-checks become end-to-end"* — is true: rekha builds paths and
 dhancha strokes them through `dh_falloc`, and both stacks pass against this `dist/`.
 
-⚠ **Not done here, and not asked for by this filing:** `sd_present_open`'s own `open("/dev/fb0")` is
+⚠ **Not done here, and not asked for by this filing** (⇒ the first of the two IS done in 0.8.0 — see
+the postscript): `sd_present_open`'s own `open("/dev/fb0")` is
 still never exercised by a test (the note above the **Still open** section stands), and
 `sd_fill_impl` still returns `SADISH_OK` for an edge list its GROWTH truncated — that is
 `grow_edges_test` #210/#213's documented behaviour for FILLS, unchanged; strokes report it because
@@ -361,3 +374,89 @@ behaviour. It belongs to the flatten filing's file and is left for that item rat
 sentence it leaves standing is gone: `sd_flatten_truncated`'s header (`src/path.cyr:466-479`) now
 opens *"IT IS NO LONGER THE ONLY WITNESS, and the header said it was through 0.7.1"*, and
 `grep -rn "do not clear it"` over `src/*.cyr` and `dist/sadish.cyr` returns **0 hits**.
+
+---
+
+## Postscript — the presenter's own `open()`, gated in 0.8.0
+
+⚠ **This filing was already CLOSED and archived when this section was written, and closing it never
+depended on this.** Its own asks were met in 0.7.1 and 0.7.2; what is recorded here is the one note it
+left behind TWICE — above the **Still open** section and again at the foot of the 0.7.2 closing
+section — being answered, so the note does not outlive the thing it describes. `README.md` carried the
+same item as a named next-release candidate: *"`sd_present_open`'s own `/dev/fb0` allocation guards,
+which no test can reach without writing to the live display."*
+
+**What changed, in `src/present.cyr`.** 0.7.1 split `_sd_present_probe` and `_sd_presenter_build` out
+of `sd_present_open` so a regular file's fd could drive the four guards. The function they were split
+OUT OF stayed unreachable, because its first act was `open("/dev/fb0", O_RDWR)`. 0.8.0 lifts the
+acquisition into the signature, in two layers, neither of which changes an existing caller:
+
+| entry | what it is |
+|---|---|
+| `sd_present_open_fd(fd)` | everything `sd_present_open` does after the `open()`. Takes a descriptor the caller already has; `fd < 0` returns 0 having allocated nothing. |
+| `sd_present_open_path(path)` | opens `path` `O_RDWR` and delegates — `sd_present_open`'s body with the device name as an argument. |
+| `sd_present_open()` | unchanged in signature, behaviour and cost: `return sd_present_open_path("/dev/fb0");` |
+
+⛔ **Ownership was the part that needed writing down, not the plumbing.** The presenter TAKES the
+descriptor: on success the record holds it and `sd_present_close` releases it; on a refusal sadish has
+ALREADY closed it — including one the CALLER opened — so a caller that closes it again is closing a
+number the kernel may have reissued. That has been true of `_sd_present_probe` since 0.7.1 and was
+stated nowhere a consumer could read it. It is now the header of `sd_present_open_fd`, and
+`present_open_test` checks **85** (a refusal closes the caller's descriptor) and **88** (a success
+holds that same number) assert it rather than describing it.
+
+**Gated by the new `programs/present_open_test.cyr` (131 checks)**, which opens a regular file under
+`build/` and never `/dev/fb0`:
+
+| group | what it holds |
+|---|---|
+| A (1-8) | the instrument: `/proc/self/fd` counted through an open and a close, in both directions. MEASURED: 3 descriptors at entry — stdin/stdout/stderr — 4 with one file open, 3 again after the close. ⚠ The entry count is asserted as `>= 3`, not `== 3`: a harness that passes a descriptor in (a make jobserver pipe, a lock fd, a coverage tool) is not a sadish defect, and every claim in the file is a DELTA off that base. |
+| B (9-18) | an acquisition that never happens costs nothing: `sd_present_open_fd(-1)`, a missing path, a null path — 0 each, **with a refusing hook armed and `g_po_seen` still 0**, so the allocator was not asked for one block. Check 15: the failed open did not CREATE the file either (`O_RDWR`, no `O_CREAT`). |
+| C (19-47) | the whole open path: presenter, 640x480x32 at pitch 2,560, then `sd_present_blit` READ BACK OUT OF THE FILE — 1,024,000 bytes, a hole below the letterbox, the red and green pixels at band offsets 0 and 640, and the scale-replicated second row at +2,560. |
+| D (48-54) | descriptor 0 is a descriptor: with stdin closed the next `open()` lands on 0 and `sd_present_open_fd(0)` must still build. `fd <= 0` would refuse it. |
+| E (55-66) | each of the four blocks refused ALONE (fail-only 1..4) — 0 each, the grant count naming which block, and **the fd count back to the entry count every time** (MEASURED: 3). |
+| F (67-81) | the same four as a budget that ran out (0..3), then the fourth grant completing: 4 allocations, **1,229,384 B** on the arena (256 + 256 + 72 + 1,228,800). |
+| G (82-92) | `sd_present_open_fd` owns what it is given: a refusal closes the CALLER's descriptor (count back to the entry count, the number dead), and a success holds that same number. |
+| H (93-105) | nine refusals later, an identical open paints an identical band. |
+| I (106-123) | ⭐ **the three `memset`s, which nothing in the tree could see before.** Every other caller allocates from the global bump allocator, which hands back fresh zeroed pages, so all three lines were free to delete. This group opens through an arena filled with `0xAB` and then `arena_reset` — the frame-arena shape `lib/alloc.cyr` documents as rewind-and-REUSE — and blits a **6x2** surface, whose scale of 106 leaves `xoff = (640 - 636) / 2 = 2`, i.e. 8 bytes of letterbox per band row that the blit loop never stores to. MEASURED: without `memset(blit)` those bytes read back **171** OUT OF THE FILE (last frame's pixels, on their way to the display); without `memset(vinfo/finfo)` the probe reads `0xABABABAB`, skips every `<= 0` fallback and the open returns **0**. |
+| J (124-131) | what `sd_present_open_fd` does NOT check. A descriptor opened `O_RDONLY` yields a whole presenter, `SADISH_OK` from `sd_present_blit`, and a target file still **0 bytes** long — the trap the header names, asserted so it cannot rot into a guarantee. |
+
+**Mutation testing: 26 single mutations of `src/present.cyr`, 24 killed, 2 the documented survivor
+(the same line twice).** Every one was applied alone, all 30 suites rebuilt and run, and the file
+restored byte-for-byte. Killed: dropping `sd_present_open_fd`'s `fd < 0` guard (#10) and spelling it
+`<= 0` (#49); `O_RDONLY` instead of `O_RDWR` (#30, the band never lands) and `O_CREAT` added (#13);
+bypassing the guard into `_sd_present_probe` (#13); dropping `syscall(3, fd)` from any ONE of the four
+refusal paths (#57 / #60 / #63 / #66, with `oom_test` #84 / #87 / #70 / #74 beside each); deleting
+`memset(blit)` (#118) or `memset(vinfo)` or `memset(finfo)` singly (#109); dropping the `minpitch`
+clamp (#21) or its `bpp / 8` factor (#27); moving the `xres` / `yres` / `bpp` fallbacks (#24 / #21 /
+#26); sizing `vinfo` at 512 B (#78's arena figure alone); storing the fd at the wrong offset (#30);
+never storing the scratch pointer (#28); `sd_present_close` not closing (#46); the RGB565 `r >> 3`
+(`stride_test` #97); and dropping the blit's `xoff` centering (#119 — group I's letterbox again).
+⛔ **The survivor is the point of the whole item, and it is named rather than hidden:** changing
+`sd_present_open`'s `"/dev/fb0"` to `"/dev/fb1"`, or replacing its body with `return 0;`, leaves all
+30 suites green. That one line — the device name and the delegation — is the residue, and it cannot
+be gated by anything but a display.
+
+⚠ **What this does NOT gate, stated the way the suite's own header states it:**
+1. `sd_present_open()` itself, per the survivor above.
+2. The ioctl-ANSWERED direction in `_sd_present_probe`. A regular file answers no ioctl (MEASURED:
+   `FBIOGET_VSCREENINFO` returns ENOTTY, -25), so all four branches there — the three `<= 0`
+   fallbacks and the `pitch < minpitch` clamp — are driven in the FALLBACK direction only. The four
+   `load32` offsets into the ioctl buffers (`xres` +0, `yres` +4, `bits_per_pixel` +24, `line_length`
+   +48) are therefore asserted by NO suite: a wrong offset reads 0 out of a zeroed buffer and lands on
+   the same 640x480x32 the suite checks. Those offsets are the `fb_var_screeninfo` /
+   `fb_fix_screeninfo` ABI and only a framebuffer can gate them.
+3. REACHING `bpp == 16` THROUGH THE PROBE — the ROUTE, not the packing. ⚠ **A first draft of this
+   postscript said the `bpp == 16` branch of `sd_present_blit` was gated by no suite. That was
+   wrong, and it is corrected here rather than quietly dropped:** `programs/stride_test.cyr` checks
+   96-97 build a 16 bpp record by hand (`st_presenter(fd, 30, 22, 16, 64)`) and assert the exact
+   RGB565 word — MEASURED, mutating `(r >> 3)` to `(r >> 2)` fails `stride_test` #97 and nothing
+   else. What no suite can reach is a probe that PRODUCES 16, which needs a 16 bpp device.
+4. A positive number that is not an open descriptor. `sd_present_open_fd(500)` returns a presenter and
+   costs 1,229,384 B (MEASURED); group J asserts the `O_RDONLY` half of that silence but deliberately
+   not this half, because pointing an 819,200-byte write at a number the process does not own is
+   exactly what a test must not do.
+
+⛔ **Rendering did not move.** All 30 suites pass — the 29 of 0.7.2 plus the new one — with every
+existing assertion UNEDITED; agnos's `refagree` prints **BYTE-IDENTICAL on all 200 paths**; rekha (23
+suites) and dhancha (18) pass against this `dist/` with no `undefined function`.

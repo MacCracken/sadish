@@ -1,8 +1,19 @@
-# programs/path_cap_test.cyr — RUN test for 0.7.2's SPLIT PATH CAPACITIES: sd_path_new_cap's two
-# arguments size the two arrays SEPARATELY, and each array doubles alone.
+# programs/path_cap_test.cyr — RUN test for 0.7.2's SPLIT PATH CAPACITIES (sd_path_new_cap's two
+# arguments size the two arrays SEPARATELY, and each array doubles alone) and for 0.8.0's IN-TREE
+# ADOPTION of that call by src/stroke.cyr (group N).
 #
 # Closes the first item of docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md's
-# "Still open" section — *"allocate the verb and point arrays at exactly the given capacity"*.
+# "Still open" section — *"allocate the verb and point arrays at exactly the given capacity"* — and,
+# with group N, the second: *"no in-tree adopter"*.
+#
+# ⛔ GROUP N'S OWN FIGURES (0.8.0, on the allocation seam, MEASURED both ways on this tree):
+#     sd_stroke_seg, per call          4,208 B ->   240 B   in the SAME 7 allocations
+#     sd_stroke_disc, per call         4,400 B ->   568 B   in the SAME 19
+#     closed 8x8 rect stroke          34,432 B -> 3,232 B   in the SAME 104
+#     round stroke of a cubic         73,376 B -> 7,144 B   in the SAME 234
+#     54-glyph label, round-stroked  16,357,904 B -> 1,557,176 B   in the SAME 50,593
+# ⚠ THE ALLOCATION COUNT IS THE POINT OF THE SECOND COLUMN: nothing was batched away and no piece
+# was dropped — the same requests were made, for smaller blocks. The ink is unchanged (#216-#218).
 # 0.7.1 shipped the two-argument call over ONE capacity field, so n_verbs and n_points collapsed to
 # their max and both arrays opened at it; the proposal's own 78,656 B target for the ASCII glyph set
 # was missed by 5,840 B. The word at +40 (`reserved` through 0.7.1, written 0 by every constructor
@@ -63,6 +74,23 @@ fn hook_sizes(n): i64 {
     if (g_calls == 2) { g_sz2 = n; }
     if (g_calls == 3) { g_sz3 = n; }
     return alloc(n);
+}
+
+# hook_sizes, plus the BLOCK the first request came back with. ⭐ That block is the SdPath record of
+# a path built inside a function that does not return it — src/stroke.cyr's sd_stroke_seg and
+# sd_stroke_disc, whose piece path is the first thing they allocate — so group N can read the
+# capacities and the counts straight off the real site instead of off a copy of its geometry.
+var g_rec = 0;
+
+fn hook_capture(n): i64 {
+    g_calls = g_calls + 1;
+    g_bytes = g_bytes + n;
+    if (g_calls == 1) { g_sz1 = n; }
+    if (g_calls == 2) { g_sz2 = n; }
+    if (g_calls == 3) { g_sz3 = n; }
+    var blk = alloc(n);
+    if (g_calls == 1) { g_rec = blk; }
+    return blk;
 }
 
 # Grants its first g_grant allocations and then refuses every one — the only way to tell sadish's
@@ -317,8 +345,9 @@ fn main(): i64 {
     sd_alloc_set(prev);
     check(g_sz2, 64);                                                 # 28 — and the other way round
     check(g_sz3, 8000);                                               # 29
-    # ⭐ sadish's own two known-size sites, measured but NOT adopted here (src/stroke.cyr is out of
-    # scope for this change): sd_stroke_seg is 5 verbs / 4 points and sd_stroke_disc 17 / 16.
+    # ⭐ sadish's own two known-size sites — ADOPTED in 0.8.0 (group N below drives them through
+    # src/stroke.cyr itself): sd_stroke_seg is 5 verbs / 4 points and sd_stroke_disc 17 / 16. These
+    # two checks are the constructor's side of it; group N is the call site's.
     prev = sd_alloc_set(&hook_sizes);
     reset_counts();
     sd_path_new_cap(5, 4);
@@ -716,8 +745,274 @@ fn main(): i64 {
     check(cov_sum(mcv1), cov_sum(mcv2));                              # 169
     check(cov_sum(mcv1) > 0, 1);                                      # 170 — and it drew something
 
+    # ── N) THE IN-TREE ADOPTER: src/stroke.cyr's TWO KNOWN-SIZE SITES ──────────
+    # ⛔⛔ ITEM 2 OF THE PROPOSAL'S "Still open", WHICH IS WHAT 0.8.0 CLOSES: through 0.7.2
+    # sd_path_new_cap had NO caller in src/ at all — only this suite and flatten_bound_test — while
+    # sd_stroke_seg and sd_stroke_disc each bought SD_PATH_CAP = 256 verbs + 256 points (4,096 B of
+    # arrays plus the 48 B record) for a path of five, or of seventeen, slots. Both run per SEGMENT
+    # and per VERTEX of every round stroke, on the CONSUMER's seam.
+    # ⚠ WHY THIS SUITE AND NOT stroke_style_test. The ask is an allocation shape, and the two
+    # instruments it needs are already here: hook_sizes/hook_capture for the per-REQUEST sizes (a
+    # byte total cannot tell 48 + 64 + 64 from a doubling that landed on the same total) and
+    # hook_grant for the refusal path. stroke_style_test owns the stroke's PICTURE and the aggregate
+    # figure, and keeps them: its #13 moved 34,432 -> 3,232 with this change.
+    # ⚠ The stroker's process-lifetime scratch is warmed FIRST, outside every hook — it comes from
+    # the global alloc (raster.cyr's rule), so a cold stroke would put nothing extra on the seam,
+    # but the flatten mid-points of group N4's curve would be measured against a cold run array.
+    var ncv = sd_canvas_new(32, 32);
+    var nrect = sd_path_new();
+    sd_path_moveto(nrect, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(nrect, 12 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(nrect, 12 * SD_ONE, 12 * SD_ONE);
+    sd_path_lineto(nrect, 4 * SD_ONE, 12 * SD_ONE);
+    sd_path_close(nrect);
+    var ncurve = sd_path_new();
+    sd_path_moveto(ncurve, 2 * SD_ONE, 14 * SD_ONE);
+    sd_path_cubicto(ncurve, 2 * SD_ONE, 2 * SD_ONE, 14 * SD_ONE, 2 * SD_ONE, 14 * SD_ONE, 14 * SD_ONE);
+    check(sd_canvas_stroke_path(ncv, nrect, 2 * SD_ONE), SADISH_OK);  # 171 — warm the scratch
+    check(sd_canvas_stroke_path(ncv, ncurve, 2 * SD_ONE), SADISH_OK); # 172
+
+    # N1. ONE sd_stroke_seg CALL, ON THE SEAM. moveto + 3 linetos + close = 5 verbs, 4 points; both
+    # under SD_PATH_CAP_MIN, so each array opens at 8 (64 B) and the four corners are 16 B each.
+    prev = sd_alloc_set(&hook_capture);
+    reset_counts();
+    g_rec = 0;
+    check(sd_stroke_seg(ncv, 2 * SD_ONE, 2 * SD_ONE, 9 * SD_ONE, 5 * SD_ONE, SD_ONE), SADISH_OK); # 173
+    sd_alloc_set(prev);
+    check(g_bytes, 240);                                              # 174 — was 4,208 through 0.7.2
+    check(g_calls, 7);                                                # 175 — ⛔ THE SAME SEVEN
+    check(g_sz1, 48);                                                 # 176 — the record
+    check(g_sz2, 64);                                                 # 177 — 8 verbs (5, floored)
+    check(g_sz3, 64);                                                 # 178 — 8 points (4, floored)
+    # ⚠ AND THE THREE REQUESTS ARE THE WHOLE TOTAL: the measured sizes plus the four 16 B corners
+    # account for every byte, so there is no fourth path allocation (a growth) hiding inside #174.
+    check(g_sz1 + g_sz2 + g_sz3 + 4 * 16, g_bytes);                   # 179
+    # ⛔ AND THE PATH NEVER GREW — read off the record the hook handed sd_stroke_seg, not off a
+    # rebuild of its geometry. A growth would have shown up in #175 as an eighth allocation; these
+    # two pairs say WHY there was none, and they are what fails if the five calls above ever become
+    # six without the (5, 4) moving with them.
+    check(sd_path_verb_cap(g_rec), SD_PATH_CAP_MIN);                  # 180
+    check(sd_path_point_cap(g_rec), SD_PATH_CAP_MIN);                 # 181
+    check(sd_path_verb_count(g_rec), 5);                              # 182 — moveto + 3 linetos + close
+    check(sd_path_point_count(g_rec), 4);                             # 183 — close carries none
+    check(sd_path_verb_count(g_rec) <= sd_path_verb_cap(g_rec), 1);   # 184 — fits, both arrays
+    check(sd_path_point_count(g_rec) <= sd_path_point_cap(g_rec), 1); # 185
+    var n_seg = g_bytes;      # 240 — carried into N3 and N4 so their arithmetic is a RELATION
+    var n_segc = g_calls;     # 7     between measurements, not a restatement of two literals
+
+    # N2. ONE sd_stroke_disc CALL. 16 vertices (moveto + 15 linetos) + close = 17 verbs, 16 points —
+    # ⛔ EXACTLY full in BOTH arrays, the tightest fit in the tree.
+    prev = sd_alloc_set(&hook_capture);
+    reset_counts();
+    g_rec = 0;
+    check(sd_stroke_disc(ncv, 8 * SD_ONE, 8 * SD_ONE, SD_ONE), SADISH_OK);   # 186
+    sd_alloc_set(prev);
+    check(g_bytes, 568);                                              # 187 — was 4,400 through 0.7.2
+    check(g_calls, 19);                                               # 188 — ⛔ THE SAME NINETEEN
+    check(g_sz1, 48);                                                 # 189
+    check(g_sz2, 136);                                                # 190 — 17 verbs, exactly
+    check(g_sz3, 128);                                                # 191 — 16 points, exactly
+    # ⛔ THE SAME "no fourth allocation" RELATION, AND HERE IT BITES: this path is exactly full in
+    # both arrays, so a capacity one slot short adds a growth request that these three sizes do not
+    # cover, and #192 fails even though #189-#191 still look plausible.
+    check(g_sz1 + g_sz2 + g_sz3 + 16 * 16, g_bytes);                  # 192
+    check(sd_path_verb_cap(g_rec), 17);                               # 193
+    check(sd_path_point_cap(g_rec), 16);                              # 194
+    check(sd_path_verb_count(g_rec), 17);                             # 195 — ⛔ count == capacity
+    check(sd_path_point_count(g_rec), 16);                            # 196 — ⛔ in BOTH arrays
+    var n_disc = g_bytes;     # 568 — as n_seg above
+    var n_discc = g_calls;    # 19
+    # ⛔ AND ONE SLOT SHORT PAYS A DOUBLING AND A COPY. The same 17-verb / 16-point shape opened at
+    # (16, 16) doubles its verb array under the close: MEASURED 816 B in 20 allocations against
+    # 568 B in 19 — 248 B and one memcpy for an off-by-one. ⚠ Still well under the 4,400 B the
+    # 256-slot default cost, so this is not "worse than before"; it is what deriving the count off
+    # the code buys over rounding it, and it is why #193-#196 read the capacities back.
+    prev = sd_alloc_set(&hook_sizes);
+    reset_counts();
+    var nq = sd_path_new_cap(16, 16);
+    sd_path_moveto(nq, 0, 0);
+    lineto_run(nq, 15);
+    sd_path_close(nq);
+    sd_alloc_set(prev);
+    check(sd_path_verb_count(nq), 17);                                # 197 — the disc's own shape
+    check(sd_path_point_count(nq), 16);                               # 198
+    check(g_bytes, 816);                                              # 199 — 304 + 256 + a 256 B grow
+    check(g_calls, 20);                                               # 200 — ⛔ the extra allocation
+    check(sd_path_verb_cap(nq), 32);                                  # 201 — it doubled
+    check(g_bytes - n_disc, 248);                                     # 202 — what the off-by-one
+    #                                                                   costs, both sides MEASURED
+
+    # N3. THE REALISTIC STROKE THE CHANGELOG HAS QUOTED SINCE 0.5.5 — the closed 8x8 rect at width 2.
+    # 4 segment rects + 4 vertex discs (the closing segment included, a disc per run point).
+    prev = sd_alloc_set(&hook_sizes);
+    reset_counts();
+    check(sd_canvas_stroke_path(ncv, nrect, 2 * SD_ONE), SADISH_OK);  # 203
+    sd_alloc_set(prev);
+    check(g_bytes, 3232);                                             # 204 — was 34,432 through 0.7.2
+    check(g_calls, 104);                                              # 205 — ⛔ the SAME 104 calls
+    # ⛔ AND THE TOTAL IS ITS PIECES, EVERY TERM MEASURED: n_seg / n_disc came off the single-call
+    # runs above, g_bytes off this whole stroke, so these two say the stroke is exactly 4 rects and
+    # 4 discs with nothing else on the seam — a dropped or an extra piece fails them.
+    check(4 * n_seg + 4 * n_disc, g_bytes);                           # 206 — 4 rects + 4 discs
+    check(4 * n_segc + 4 * n_discc, g_calls);                         # 207 — and the same arithmetic
+    #                                                                   on the allocation count
+    # N4. A ROUND STROKE OF A CURVED PATH — the cubic stroke_style_test measures at 112 B of flatten
+    # mid-points. Its flattening emits 9 run points: 8 segment rects, 9 discs, 7 mid-points.
+    prev = sd_alloc_set(&hook_sizes);
+    reset_counts();
+    check(sd_canvas_stroke_path(ncv, ncurve, 2 * SD_ONE), SADISH_OK); # 208
+    sd_alloc_set(prev);
+    check(g_bytes, 7144);                                             # 209 — was 73,376 through 0.7.2
+    check(g_calls, 234);                                              # 210 — ⛔ unchanged
+    check(8 * n_seg + 9 * n_disc + 7 * 16, g_bytes);                  # 211 — rects + discs + mids
+    check(8 * n_segc + 9 * n_discc + 7, g_calls);                     # 212
+
+    # N5. A dhancha-SHAPED TEXT DRAW: 54 glyph outlines round-stroked at width 1 — the label length
+    # rekha's bench_hotpath measures, against the 54 leading glyphs of this file's own ASCII set.
+    # ⚠ The outlines themselves are built OUTSIDE the hook: this is the DRAW's cost, not the
+    # corpus's, which is what a consumer pays per frame for a label it already holds.
+    var nlab = alloc(54 * 8);
+    var nli = 0;
+    while (nli < 54) {
+        store64(nlab + nli * 8, glyph_into(sd_path_new(), nli));
+        nli = nli + 1;
+    }
+    var nlcv = sd_canvas_new(32, 32);
+    check(sd_canvas_stroke_path(nlcv, load64(nlab + 0), SD_ONE), SADISH_OK);   # 213 — warm the run
+    prev = sd_alloc_set(&hook_sizes);
+    reset_counts();
+    nli = 0;
+    while (nli < 54) {
+        sd_canvas_stroke_path(nlcv, load64(nlab + nli * 8), SD_ONE);
+        nli = nli + 1;
+    }
+    sd_alloc_set(prev);
+    check(g_bytes, 1557176);                                          # 214 — was 16,357,904 (10.5x)
+    check(g_calls, 50593);                                            # 215 — ⛔ the same count
+    # ⇒ 16,357,904 - 1,557,176 = 14,800,728 B off one label's arena per draw. That subtraction is
+    # NOT a check: the 0.7.2 figure is history, not a value this tree can measure, so asserting it
+    # against a literal would be an identity that cannot fail. #214 is the gate.
+
+    # N6. ⛔ AND THE PICTURE DOES NOT MOVE. These three ink totals were MEASURED on 0.7.2 (the
+    # sd_path_new sites) and are unchanged here: capacity is an allocation decision, not a geometry
+    # one. They are absolute constants, so a stroke that quietly lost a piece to a growth failure
+    # would fail them where a self-comparison could not.
+    var nw1 = sd_canvas_new(32, 32);
+    sd_canvas_stroke_path(nw1, nrect, 2 * SD_ONE);
+    check(cov_sum(nw1), 16092);                                       # 216 — the closed 8x8 rect
+    var nw2 = sd_canvas_new(32, 32);
+    sd_canvas_stroke_path(nw2, ncurve, 2 * SD_ONE);
+    check(cov_sum(nw2), 12582);                                       # 217 — the cubic
+    check(cov_sum(nlcv), 21932);                                      # 218 — the 54-glyph label
+
+    # N7. THE REFUSAL PATH THROUGH THE NEW CONSTRUCTOR. sd_path_new_cap answers 0 exactly where
+    # sd_path_new did, and the 0-checks 0.7.2 put in both sites still carry it out as
+    # SADISH_ERR_OOM rather than a store through address 0.
+    # ⛔ THE ALLOCATION COUNT IS PART OF THE ASSERTION: the three requests are the record, the verb
+    # array and the point array, in that order, so K = 0, 1 and 2 refuse a DIFFERENT one each time
+    # and all three have to come back as a return code. (programs/stroke_oom_test.cyr sweeps the
+    # whole stroke; this pins the constructor's own three steps.)
+    prev = sd_alloc_set(&hook_grant);
+    reset_counts();
+    g_grant = 0;
+    check(sd_stroke_seg(ncv, 2 * SD_ONE, 2 * SD_ONE, 9 * SD_ONE, 5 * SD_ONE, SD_ONE),
+      SADISH_ERR_OOM);                                                # 219 — the record refused
+    check(g_calls, 1);                                                # 220
+    reset_counts();
+    g_grant = 1;
+    check(sd_stroke_seg(ncv, 2 * SD_ONE, 2 * SD_ONE, 9 * SD_ONE, 5 * SD_ONE, SD_ONE),
+      SADISH_ERR_OOM);                                                # 221 — the VERB array refused
+    check(g_calls, 2);                                                # 222
+    reset_counts();
+    g_grant = 2;
+    check(sd_stroke_seg(ncv, 2 * SD_ONE, 2 * SD_ONE, 9 * SD_ONE, 5 * SD_ONE, SD_ONE),
+      SADISH_ERR_OOM);                                                # 223 — the POINT array refused
+    check(g_calls, 3);                                                # 224
+    reset_counts();
+    g_grant = 3;
+    check(sd_stroke_seg(ncv, 2 * SD_ONE, 2 * SD_ONE, 9 * SD_ONE, 5 * SD_ONE, SD_ONE),
+      SADISH_ERR_OOM);                                                # 225 — the path is live, the
+    check(g_calls, 4);                                                # 226   first SdPoint is not
+    reset_counts();
+    g_grant = 0;
+    check(sd_stroke_disc(ncv, 8 * SD_ONE, 8 * SD_ONE, SD_ONE), SADISH_ERR_OOM);   # 227 — and the disc
+    check(g_calls, 1);                                                # 228
+    reset_counts();
+    g_grant = 2;
+    check(sd_stroke_disc(ncv, 8 * SD_ONE, 8 * SD_ONE, SD_ONE), SADISH_ERR_OOM);   # 229
+    check(g_calls, 3);                                                # 230
+    # The whole round stroker on a refusing hook: a return code, not a fault, and the scratch is
+    # warm so every allocation it reaches is the seam's.
+    reset_counts();
+    g_grant = 0;
+    check(sd_canvas_stroke_path(ncv, nrect, 2 * SD_ONE), SADISH_ERR_OOM);   # 231
+    sd_alloc_set(prev);
+    check(g_calls, 1);                                                # 232 — stopped at the first
+    # And a healthy stroke after the refusals is byte-identical to a clean one.
+    var nw3 = sd_canvas_new(32, 32);
+    check(sd_canvas_stroke_path(nw3, nrect, 2 * SD_ONE), SADISH_OK);  # 233
+    check(cov_diff(nw3, nw1), 0);                                     # 234
+    check(cov_sum(nw3), 16092);                                       # 235
+
+    # ── N8) THE SEG PATH'S SLACK, AND WHAT ACTUALLY CATCHES AN ADDED CALL ────────
+    # ⛔ THIS GROUP EXISTS BECAUSE THE HEADER OVER sd_stroke_seg USED TO GET IT WRONG. It read "a
+    # fifth lineto added below without moving these arguments would double an array instead (128 B
+    # and a copy)" — a ⛔-voiced claim, in a header `cyrius distlib` copies verbatim into
+    # dist/sadish.cyr. It is FALSE: sd_stroke_seg asks for (5, 4) and SD_PATH_CAP_MIN = 8 floors
+    # BOTH, so the path is built with 3 VERB SLOTS AND 4 POINT SLOTS SPARE and an added lineto costs
+    # one 16 B SdPoint, not a doubling.
+    # ⚠ THE ROWS BELOW ARE sd_stroke_seg's OWN SHAPE AT ITS OWN (5, 4), rebuilt with `extra`
+    # additional linetos, so the boundary is read off the real constructor arguments. They are also
+    # the reason #180/#181 are NOT the checks that fail when the five calls become six: the
+    # capacities do not move until the FOURTH extra lineto. #182/#183 (the counts) are.
+    # +1 lineto: 6 verbs, 5 points — 240 B + one SdPoint, NO growth.
+    prev = sd_alloc_set(&hook_sizes);
+    reset_counts();
+    var n8a = sd_path_new_cap(5, 4);
+    sd_path_moveto(n8a, 0, 0);
+    lineto_run(n8a, 4);
+    sd_path_close(n8a);
+    sd_alloc_set(prev);
+    check(sd_path_verb_count(n8a), 6);                                # 236 — one verb past the site
+    check(sd_path_point_count(n8a), 5);                               # 237
+    check(sd_path_verb_cap(n8a), SD_PATH_CAP_MIN);                    # 238 — ⛔ NOT doubled
+    check(sd_path_point_cap(n8a), SD_PATH_CAP_MIN);                   # 239 — ⛔ nor this one
+    check(g_bytes, n_seg + 16);                                       # 240 — 256 B: one SdPoint more
+    check(g_calls, n_segc + 1);                                       # 241 — 8 calls, not 9
+    # +3 linetos: 8 verbs, 7 points — the verb array EXACTLY full, still no growth.
+    prev = sd_alloc_set(&hook_sizes);
+    reset_counts();
+    var n8b = sd_path_new_cap(5, 4);
+    sd_path_moveto(n8b, 0, 0);
+    lineto_run(n8b, 6);
+    sd_path_close(n8b);
+    sd_alloc_set(prev);
+    check(sd_path_verb_count(n8b), 8);                                # 242 — == SD_PATH_CAP_MIN
+    check(sd_path_point_count(n8b), 7);                               # 243
+    check(sd_path_verb_cap(n8b), SD_PATH_CAP_MIN);                    # 244 — ⛔ still 8
+    check(g_bytes, 288);                                              # 245 — 240 + three SdPoints
+    check(g_calls, 10);                                               # 246 — still no grow request
+    var n8bb = g_bytes;       # 288 — the last size before this site can grow at all
+    # +4 linetos: the NINTH verb, and the first doubling this site can reach.
+    prev = sd_alloc_set(&hook_sizes);
+    reset_counts();
+    var n8c = sd_path_new_cap(5, 4);
+    sd_path_moveto(n8c, 0, 0);
+    lineto_run(n8c, 7);
+    sd_path_close(n8c);
+    sd_alloc_set(prev);
+    check(sd_path_verb_count(n8c), 9);                                # 247 — one past the capacity
+    check(sd_path_verb_cap(n8c), 2 * SD_PATH_CAP_MIN);                # 248 — ⛔ HERE it doubles
+    check(sd_path_point_cap(n8c), SD_PATH_CAP_MIN);                   # 249 — and the points do not
+    check(g_bytes, 432);                                              # 250 — 304 + a 128 B verb array
+    check(g_calls, 12);                                               # 251 — 11 + the one grow
+    check(g_bytes - n8bb - 16, 128);                                  # 252 — ⇒ the step from "exactly
+    #                                                                   full" to "one past" is one
+    #                                                                   SdPoint PLUS one 128 B
+    #                                                                   doubling, both sides measured
+
     if (g_fails == 0) {
-        var ok = "path_cap_test: PASS (split verb/point capacities, per-array growth, 78,656 B)\n";
+        var ok = "path_cap_test: PASS (split capacities, per-array growth, 78,656 B, stroke pieces at exact size)\n";
         syscall(1, 1, ok, strlen(ok));
     } else {
         var bad = "path_cap_test: FAIL\n";
