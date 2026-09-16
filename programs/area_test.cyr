@@ -1186,11 +1186,13 @@ fn main(): i64 {
     check(lit_outside(cze, 15, 1), 0);                                # 139
     check(canary_bad(), 0);                                           # 140
 
-    # ── N) EDGE-LIST OVERFLOW: AREA RUNS BELOW THE CAP, THE DEFAULT LOOP AT IT ──
-    # sd_edge_add drops edges silently at SD_FLATTEN_CAP, leaving a contour open; the area engine
-    # would then streak to the right edge (MEASURED before the guard: 28 of 40 rows lit at x = 79 on
-    # an 80-px canvas). zig_path(cap - 4) is cap - 1 edges; the triangle appended below adds ONE
-    # edge before the list is full and loses its other two.
+    # ── N) EDGE-LIST OVERFLOW: AREA RUNS ON BOTH SIDES OF THE OLD CAP (0.6.1) ──
+    # Through 0.6.0 sd_edge_add dropped edges silently at SD_FLATTEN_CAP, leaving a contour open; the
+    # area engine would then streak to the right edge (MEASURED before the guard: 28 of 40 rows lit at
+    # x = 79 on an 80-px canvas), so an AREA fill that reached the cap ran the default loop. Since
+    # 0.6.1 the list grows and only a FAILED growth truncates it (programs/grow_edges_test.cyr pins
+    # that fallback). zig_path(cap - 4) is cap - 1 edges; the triangle appended below adds two more,
+    # which 0.6.0 turned into one kept edge and one lost.
     var cap = SD_FLATTEN_CAP;
     var p1 = zig_path(cap - 4);
     var n1 = sd_canvas_new(64, 40);
@@ -1205,15 +1207,20 @@ fn main(): i64 {
     sd_path_close(p2);
     var n2 = sd_canvas_new(64, 40);
     fill_mode(n2, p2, SD_FILL_NONZERO, SD_AA_AREA);
-    check(load64(_sd_fill_ectx + 8), cap);                            # 144 — full: possibly truncated
-    check(sd_canvas_coverage_at(n2, 15, 4), 63);                      # 145 — the default loop ran
+    check(load64(_sd_fill_ectx + 8), cap + 1);                        # 144 — past the old cap: grown, whole
+    check(sd_canvas_coverage_at(n2, 15, 4), 76);                      # 145 — AREA ran (0.6.0: 63, the loop)
     check(lit_outside(n2, 41, 40), 0);                                # 146 — no streak past the triangle
+    # its parts, disjoint in x, filled as AREA and unioned: the running sums add exactly, so the
+    # bytes must too (0.6.0 compared the default loop's bytes here)
+    var s2t = tri_path(30 * ONE, 10 * ONE, 40 * ONE, 38 * ONE, 30 * ONE, 38 * ONE);
     var s2c = sd_canvas_new(64, 40);
-    sd_canvas_fill_path(s2c, p2, SD_FILL_NONZERO);
-    check(cov_diff(n2, s2c), 0);                                      # 147 — byte for byte the default
+    fill_mode(s2c, p1, SD_FILL_NONZERO, SD_AA_AREA);
+    sd_canvas_fill_union(s2c, s2t, SD_FILL_NONZERO);
+    check(cov_diff(n2, s2c), 0);                                      # 147 — byte for byte AREA of its parts
     check(sd_canvas_aa(n2), SD_AA_AREA);                              # 148 — the canvas keeps its mode
     fill_mode(n2, p2, SD_FILL_EVEN_ODD, SD_AA_AREA);
-    sd_canvas_fill_path(s2c, p2, SD_FILL_EVEN_ODD);
+    fill_mode(s2c, p1, SD_FILL_EVEN_ODD, SD_AA_AREA);
+    sd_canvas_fill_union(s2c, s2t, SD_FILL_EVEN_ODD);
     check(cov_diff(n2, s2c) + lit_outside(n2, 41, 40), 0);            # 149 — even-odd too
     check(canary_bad(), 0);                                           # 150
 

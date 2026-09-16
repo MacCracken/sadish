@@ -164,18 +164,45 @@ fn sd_polyline_count(pl): i64  { return load64(pl + SD_POLYLINE_COUNT_OFFSET); }
 fn sd_polyline_points(pl): i64 { return load64(pl + SD_POLYLINE_POINTS_OFFSET); }
 
 # ---- flatten internals (adaptive de Casteljau) ------------------
-# Output cap + recursion depth cap. A single curve subdivides to at most
-# 2^depth segments; the flatten output is bounded at SD_FLATTEN_CAP points
-# (excess is dropped — a path that hits this is pathological for v0.3; a
-# growable store is the same TODO(v0.4) as the path backing).
+# Initial capacity + recursion depth cap. A single curve subdivides to at most 2^depth segments
+# (256: every leaf of the recursion emits one point).
+# SD_FLATTEN_CAP is the INITIAL size of every point / edge store the flatten feeds: sd_path_flatten's
+# result, and raster.cyr's fill edge list, crossings and stroker run — all of which GROW past it
+# since 0.6.1 (through 0.6.0 each dropped what did not fit). It is also the FIXED size of the fill's
+# and stroker's per-curve flatten buffers, which one curve's 2^depth points never fill.
 var SD_FLATTEN_CAP       = 8192;
 var SD_FLATTEN_MAX_DEPTH = 8;
 
-# Emit accumulator ctx: +0 points(ptr)  +8 count  +16 cap.
+# The one emit ctx sd_flat_emit may GROW — sd_path_flatten's, through sd_alloc, while it runs (0
+# otherwise). Every other ctx is a fixed per-curve scratch buffer (raster.cyr) that must never be
+# reallocated, least of all on the consumer's hook.
+var _sd_flat_ctx = 0;
+var _sd_flat_trunc = 0;        # 1 if the last sd_path_flatten dropped a point (a growth failed)
+
+# Double the point array of emit ctx `ctx` through sd_alloc, copying its points. Returns 1, or 0 if
+# `ctx` is not growable or the allocation failed (_sd_flat_trunc set; later emits stop trying).
+fn _sd_flat_widen(ctx): i64 {
+    if (ctx != _sd_flat_ctx) { return 0; }
+    if (_sd_flat_trunc != 0) { return 0; }
+    var nc = load64(ctx + 16) * 2;
+    var blk = sd_alloc(nc * 8);
+    if (blk == 0) {
+        _sd_flat_trunc = 1;
+        return 0;
+    }
+    memcpy(blk, load64(ctx + 0), load64(ctx + 8) * 8);
+    store64(ctx + 0, blk);
+    store64(ctx + 16, nc);
+    return 1;
+}
+
+# Emit accumulator ctx: +0 points(ptr)  +8 count  +16 cap. A full ctx grows if it is
+# sd_path_flatten's; otherwise the point is dropped.
 fn sd_flat_emit(ctx, pt): i64 {
     var count = load64(ctx + 8);
-    var cap = load64(ctx + 16);
-    if (count >= cap) { return 0; }
+    if (count >= load64(ctx + 16)) {
+        if (_sd_flat_widen(ctx) == 0) { return 0; }
+    }
     var pts = load64(ctx + 0);
     store64(pts + count * 8, pt);
     store64(ctx + 8, count + 1);
@@ -248,6 +275,11 @@ fn sd_flatten_cubic(ctx, p0, p1, p2, p3, tol, depth): i64 {
 # through as anchors; quad/cubic verbs are adaptively subdivided (de
 # Casteljau) until each segment's deviation from its chord is <= tol.
 # Returns 0 on an empty path (the caller reports EMPTY_PATH).
+# ⭐ Every point is returned (0.6.1; through 0.6.0 the result stopped at SD_FLATTEN_CAP = 8,192).
+# The point array starts at SD_FLATTEN_CAP * 8 B and doubles through sd_alloc — it is the caller's
+# result, on the seam like the polyline — abandoning each smaller block to the allocator: MEASURED
+# 458,752 B of arrays for 20,001 points (65,536 + 131,072 + 262,144), 65,536 B at or under 8,192.
+# ⚠ If a doubling fails the result keeps the points that fit, as 0.6.0 did, and _sd_flat_trunc is set.
 fn sd_path_flatten(path, tol): i64 {
     var n_verbs = load64(path + SD_PATH_NVERBS_OFFSET);
     if (n_verbs == 0) { return 0; }
@@ -260,6 +292,8 @@ fn sd_path_flatten(path, tol): i64 {
     store64(ctx + 0, out);
     store64(ctx + 8, 0);
     store64(ctx + 16, SD_FLATTEN_CAP);
+    _sd_flat_ctx = ctx;
+    _sd_flat_trunc = 0;
 
     # A non-positive tol would never satisfy the flatness test — recurse to
     # the depth cap every time; clamp to >= 1 (1/65536 px).
@@ -301,9 +335,10 @@ fn sd_path_flatten(path, tol): i64 {
         vi = vi + 1;
     }
 
+    _sd_flat_ctx = 0;
     var count = load64(ctx + 8);
     var pl = sd_alloc(SD_POLYLINE_SIZE);
-    store64(pl + SD_POLYLINE_POINTS_OFFSET, out);
+    store64(pl + SD_POLYLINE_POINTS_OFFSET, load64(ctx + 0));   # the CURRENT block, grown or not
     store64(pl + SD_POLYLINE_COUNT_OFFSET, count);
     return pl;
 }

@@ -582,6 +582,34 @@ fn rows_sum(cv, y0, y1): i64 {
     return s;
 }
 
+# Sum of coverage over columns [x0, x1) — rows_sum's twin, for the last-COLUMN checks in group V.
+fn cols_sum(cv, x0, x1): i64 {
+    var s = 0;
+    var x = x0;
+    while (x < x1) {
+        var y = 0;
+        while (y < sd_canvas_height(cv)) {
+            s = s + sd_canvas_coverage_at(cv, x, y);
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    return s;
+}
+
+# An L whose MITER corner sits at the BOTTOM-RIGHT of a 14x14 canvas: (2,13) -> (13,13) -> (13,2).
+# At width 6 (hw 3) the horizontal leg's band is y in [10,16] and x in [-1,13] (a SQUARE cap at the
+# start), the vertical leg's is x in [10,16] and y in [-1,13], and the miter join fills the square
+# [13,16] x [13,16] between them — so on a 14x14 canvas row 13 and column 13 are BOTH solid, the
+# corner pixel (13,13) included. Off a larger canvas the same coordinates draw the same corner.
+fn br_corner(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 2 * SD_ONE, 13 * SD_ONE);
+    sd_path_lineto(p, 13 * SD_ONE, 13 * SD_ONE);
+    sd_path_lineto(p, 13 * SD_ONE, 2 * SD_ONE);
+    return p;
+}
+
 # The polyline `pl` (second subpath starting at point `break1`, 0 for none) as explicit LINETOs.
 fn poly_path(pl, break1): i64 {
     var p = sd_path_new();
@@ -628,7 +656,7 @@ fn main(): i64 {
     check(alloc_used() - g0, 270592);                                  # 3 — one-time, on the global heap
     check(arena_used(g_arena) - a0, 0);                                # 4 — and not one byte on the hook
     # The edge array was the batch scratch's last allocation, so the next global block sits right
-    # behind it: a sentinel group U reads back, to catch a write past the array (a raised limit).
+    # behind it: a sentinel the LAST check reads back, to catch a write past the array (a raised limit).
     var sentinel = alloc(262144);
     var sn = 0;
     while (sn < 262144) {
@@ -1244,9 +1272,10 @@ fn main(): i64 {
     check(cov_sum(dr), 400 * cov_sum(d1));                             # 171
     check(sd_canvas_coverage_at(dr, 77, 77), sd_canvas_coverage_at(d1, 1, 1));   # 172 — the last dot
     check(cov_sum(dsq), 400 * 4 * 255);                                # 173
-    # A limit raised after the first styled stroke is held to the allocation (8,192 edges): 720
-    # ROUND dots (11,520 edges) stroke the same bytes as at the default, and nothing is written past
-    # the edge array. A limit below SD_STROKE_BATCH_MIN is held to it.
+    # A limit raised after the first styled stroke: 720 ROUND dots (11,520 edges) stroke the same
+    # bytes as at the default, and nothing is written past the edge array. (Through 0.6.0 the raised
+    # limit was held to the 8,192-edge allocation; since 0.6.1 the default is no limit and the array
+    # grows.) A limit below SD_STROKE_BATCH_MIN is held to it.
     var dots2 = sd_path_new();
     dq = 0;
     while (dq < 720) {
@@ -1374,7 +1403,7 @@ fn main(): i64 {
     check(tbad, 0);                                                    # 184
     check(tpad, 0);                                                    # 185
 
-    # ── U) THE BRIDGE'S WIDTH; FLAGS THROUGH DE-DUPLICATION; ONE BATCH IS ONE FILL; SENTINEL ────
+    # ── U) THE BRIDGE'S WIDTH; FLAGS THROUGH DE-DUPLICATION; ONE BATCH IS ONE FILL ────
     # Two butt-ended vertical strokes of width 1 in one path: [3.5, 4.5] and [4.5 + g, 5.5 + g] px.
     # Pixel 4 holds both halves and a g-LSB gap. g = 1 is the shared-line truncation the walk
     # bridges: one span, 255. g = 2 is a real gap: two spans, each floored — 8,192 + 8,191 raw per
@@ -1429,6 +1458,38 @@ fn main(): i64 {
     var ukf = stroked(460, 100, knot_tail(700, 700, 0), 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
     var ukr = stroked(460, 100, knot_tail(700, 700, 1), 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
     check(cov_diff(ukf, ukr), 0);                                      # 192
+
+    # ── V) THE CANVAS'S LAST ROW AND LAST COLUMN ────────────────────
+    # ⭐ WHY THIS GROUP EXISTS. _sd_sb_flush walks rows [py, py_end) with `py_end = ymax + 1` clamped
+    # by `if (py_end > h) { py_end = h; }`, and columns with `while (px < w)`. Through 0.6.0 NO
+    # styled stroke in this suite inked row h-1 or column w-1 — group T's corner runs off the TOP
+    # and LEFT, every other shape sits well inside its canvas — so both edges were untested:
+    # MEASURED on the wave-1 tree, `py_end > h` -> `py_end > h - 1` and `px < w` -> `px < w - 1`
+    # each survived all 23 suites. ⚠ Comparing two canvases is not enough on its own: a canvas-wide
+    # clamp drops the same edge from BOTH, so the pair still agrees. The absolute sums below are the
+    # checks that bite; the comparison pins that the corner is the right bytes and not merely ink.
+    # The bottom-right corner on 14x14 against the same corner drawn on 22x22, where it is interior.
+    var ubs = sd_canvas_new(14, 14);
+    var ubp = br_corner();
+    check(sd_canvas_stroke_path_ex(ubs, ubp, W6, SD_CAP_SQUARE, SD_JOIN_MITER, ML4), SADISH_OK);   # 193
+    var ubb = sd_canvas_new(22, 22);
+    sd_canvas_stroke_path_ex(ubb, ubp, W6, SD_CAP_SQUARE, SD_JOIN_MITER, ML4);
+    var ubad = 0;
+    var uby = 0;
+    while (uby < 14) {
+        var ubx = 0;
+        while (ubx < 14) {
+            if (sd_canvas_coverage_at(ubs, ubx, uby) != sd_canvas_coverage_at(ubb, ubx, uby)) { ubad = ubad + 1; }
+            ubx = ubx + 1;
+        }
+        uby = uby + 1;
+    }
+    check(ubad, 0);                                                    # 194
+    # Row 13 is the horizontal band (x = -1..13) plus the miter square at x = 13: 14 solid pixels.
+    check(rows_sum(ubs, 13, 14), 14 * 255);                            # 195
+    # Column 13 is the vertical band (y = -1..13) plus the same miter square: 14 solid pixels.
+    check(cols_sum(ubs, 13, 14), 14 * 255);                            # 196
+    check(sd_canvas_coverage_at(ubs, 13, 13), 255);                    # 197 — the corner pixel itself
     # Nothing in the whole suite wrote past the edge array — group S's raised limit included.
     var sbadb = 0;
     sn = 0;
@@ -1436,7 +1497,7 @@ fn main(): i64 {
         if (load8(sentinel + sn) != 165) { sbadb = sbadb + 1; }
         sn = sn + 1;
     }
-    check(sbadb, 0);                                                   # 193
+    check(sbadb, 0);                                                   # 198
 
     if (g_fails == 0) {
         var ok = "stroke_style_test: PASS (caps, joins, miter limit, degenerates, batches, round byte-identity)\n";

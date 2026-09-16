@@ -27,8 +27,14 @@ output = "build/sadish-smoke"
 # (direct opaque primitives) build on error only; geom.cyr uses error;
 # path.cyr builds on geom; coverage.cyr (the opt-in SD_AA_AREA engine) builds on
 # geom + error; raster.cyr consumes path and dispatches into coverage; stroke.cyr
-# fills through raster (fill_union, the fill + stroker scratch); paint.cyr
-# (gradient paint) composites through raster's SdCanvas. Don't reorder without
+# fills through raster (fill_union, the fill + stroker scratch); dash.cyr cuts
+# stroke.cyr's flattened run into dashes and hands each piece back to it; paint.cyr
+# (gradient paint) composites through raster's SdCanvas; premul.cyr (premultiplied
+# writers for #92 surfaces, the gradient blit included) builds on surface + raster +
+# error AND on paint.cyr, whose _sd_paint_blit_run it wraps — while paint.cyr's blit
+# loops in turn call premul.cyr's _sd_premul_paint_px. ⚠ Since 0.7.0 the two REFERENCE
+# EACH OTHER; Cyrius resolves forward references, so this order compiles, but neither
+# can be dropped from the bundle without the other. Don't reorder without
 # re-running `cyrius distlib` and verifying the concatenated bundle compiles.
 # alloc.cyr is FIRST: the allocation seam (sd_alloc) every other module draws from.
 [lib]
@@ -43,7 +49,9 @@ modules = [
     "src/coverage.cyr",
     "src/raster.cyr",
     "src/stroke.cyr",
+    "src/dash.cyr",
     "src/paint.cyr",
+    "src/premul.cyr",
 ]
 
 [deps]

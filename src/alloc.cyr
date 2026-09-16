@@ -30,10 +30,11 @@
 #     SADISH_ERR_OOM; the callers that do not check never did. No new failure path.
 #   · `sd_alloc_set` returns the PREVIOUS hook so a nested scope unwinds in order; 0 restores the
 #     global allocator. `sd_alloc_get` reads it back.
-#   ⚠ The fill/stroke fixed-capacity scratch in raster.cyr is deliberately NOT on this seam — it
-#     is allocated once for the life of the process from the global `alloc` (see
-#     `_sd_scratch_init`; the SD_AA_AREA accumulator in coverage.cyr likewise). A hook pointing
-#     at an arena that gets reset would otherwise leave the scratch dangling on the second frame.
+#   ⚠ The fill/stroke scratch in raster.cyr is deliberately NOT on this seam — it is allocated
+#     once for the life of the process from the global `alloc` (see `_sd_scratch_init`; the
+#     SD_AA_AREA accumulator in coverage.cyr and the styled-stroke batch in stroke.cyr likewise),
+#     and since 0.6.1 GROWN there too when a path outgrows it. A hook pointing at an arena that
+#     gets reset would otherwise leave the scratch dangling on the second frame.
 #   ⚠ The hook is a process-wide global, like the scratch: sadish has never had a lock anywhere
 #     and is not thread-safe. Set it from the thread that draws.
 

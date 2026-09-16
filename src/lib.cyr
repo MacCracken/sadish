@@ -58,6 +58,19 @@ include "src/raster.cyr"
 # raster.cyr's stroker scratch; fills through sd_canvas_fill_union (round) or
 # its own span walk over raster's fill scratch (styled).
 include "src/stroke.cyr"
-# paint.cyr — gradient paint (linear + radial, multi-stop, pad/repeat/reflect) composited through a
-# canvas's coverage; builds on raster (SdCanvas), surface (colour helpers), error and alloc.
+# dash.cyr — dashed strokes (SVG stroke-dasharray / stroke-dashoffset). Built ON stroke.cyr: it
+# cuts the styled stroker's flattened run into on-dashes and hands each one back to _sd_sb_subpath,
+# so both entry points share one verb walk (_sd_styled_walk calls forward into this file).
+include "src/dash.cyr"
+# paint.cyr — gradient paint (linear, radial + focal radial, multi-stop, pad/repeat/reflect, gradient
+# transforms) composited through a canvas's coverage; builds on raster (SdCanvas), geom (SdMatrix),
+# surface (colour helpers), error and alloc — and, since 0.7.0, on premul.cyr: its blit loops call
+# _sd_premul_paint_px for the premultiplied store.
 include "src/paint.cyr"
+# premul.cyr — premultiplied writers (clear / rect / coverage blit with REAL alpha, and the GRADIENT
+# blit sd_canvas_blit_paint_premul_at) for surfaces agnos composites with gpu_shader_op#92; builds on
+# surface (sd_premul), raster (SdCanvas), error — and on paint.cyr, whose _sd_paint_blit_run it wraps.
+# ⚠ paint.cyr and premul.cyr REFERENCE EACH OTHER (0.7.0: one evaluation, two compositors). Cyrius
+# resolves forward references, so this order still compiles, but neither module can be dropped from
+# the bundle without the other.
+include "src/premul.cyr"

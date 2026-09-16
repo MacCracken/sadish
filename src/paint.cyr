@@ -1,13 +1,16 @@
-# @public — sadish gradient paint: linear + radial, multi-stop, pad / repeat / reflect.
+# @public — sadish gradient paint: linear, radial + focal radial, multi-stop, pad / repeat / reflect,
+# gradient transforms.
 #
 # paint.cyr — an SdGradient is a PAINT: a colour for every point of canvas space. It is built once
-# (constructor + stops + spread) and composited through a canvas's coverage with
+# (constructor + stops + spread [+ matrix]) and composited through a canvas's coverage with
 # sd_canvas_blit_paint_at, which is sd_canvas_blit_at with the solid colour replaced by the paint.
 #
-#   var g = sd_gradient_linear(x0, y0, x1, y1);    # or sd_gradient_radial(cx, cy, r) — all 16.16
+#   var g = sd_gradient_linear(x0, y0, x1, y1);    # or sd_gradient_radial(cx, cy, r),
+#                                                  # or sd_gradient_radial_focal(cx, cy, r, fx, fy) — 16.16
 #   sd_gradient_add_stop(g, 0, sd_rgb(255, 0, 0));
 #   sd_gradient_add_stop(g, SD_ONE, sd_rgb(0, 0, 255));
 #   sd_gradient_set_spread(g, SD_SPREAD_REFLECT);  # default SD_SPREAD_PAD
+#   sd_gradient_set_matrix(g, m);                  # optional: m maps gradient space -> canvas space
 #   sd_canvas_blit_paint_at(cv, surface, g, dx, dy);
 #
 # THE CONTRACT.
@@ -33,6 +36,14 @@
 #     sd_canvas_blit_at's src-over: every pixel with coverage != 0 is written and gets dst alpha 255,
 #     even when that product rounds to 0 (its colour bytes then come back unchanged). ⇒ An opaque
 #     one-stop gradient paints the same bytes as sd_canvas_blit_at with that colour.
+#   · ⭐ THE SAME PAINT, ONTO A PREMULTIPLIED SURFACE: sd_canvas_blit_paint_premul_at(cv, s, g, dx, dy)
+#     in src/premul.cyr (0.7.0) — a gradient panel with anti-aliased corners over a TRANSPARENT
+#     window, which the blit above cannot make (it forces dst alpha 255). It is this file's loop with
+#     the store swapped (`pm`), so the t, the spread and the colour of every pixel are the ones the
+#     contract above defines and the straight blit paints; only the compositing differs, and it is
+#     premul.cyr's, sharing that module's one formula with sd_canvas_blit_premul_at. The STRAIGHT
+#     interpolation above is what it premultiplies, per pixel, after the fact — read the ⭐ note there
+#     for why the ramp itself is not premultiplied instead.
 #   · Zero stops paint NOTHING and return SADISH_OK (SVG: as if the paint were 'none'); one stop is
 #     solid. A zero-length linear axis — |p1 - p0| < 2^-8 px — and a radius r <= 0 paint the colour
 #     at t = 1 everywhere, which is the LAST stop (SVG). ⚠ The 2^-8 px floor is sadish's, not SVG's:
@@ -74,12 +85,76 @@
 #   · Outside the bound the COLOURS may be wrong, but the ramp index is always clamped (PAD) or
 #     masked (REPEAT/REFLECT) into the table: no input reads or writes out of bounds.
 #
+# FOCAL RADIAL — sd_gradient_radial_focal(cx, cy, r, fx, fy): SVG 1.1 <radialGradient> fx / fy (fr = 0).
+#   · t = 0 at the focal point f, t = 1 on the circle (c, r): for a point p, t = |p - f| / |q - f|, q
+#     where the ray from f through p leaves the circle. With d = p - f, e = c - f, A = r^2 - |e|^2 > 0,
+#     t is the positive root of A t^2 + 2 (d·e) t - |d|^2 = 0: t = (sqrt((d·e)^2 + A |d|^2) - d·e) / A.
+#   · ⚠ THE FOCAL CLAMP. A focal point farther than lim = r - ceil(r / 2^10) from the centre — on or
+#     outside the circle, or inside it but within r / 1024 of it — moves onto the segment from c toward
+#     (fx, fy) at distance lim (truncations leave it under 4 raw closer, never further). Why
+#     2^-10 (0.99902 r): ON the circle, t is infinite on the far side of f; just inside it, the side
+#     behind f squeezes t's whole [0, 1] into r - |e|. The clamp caps that squeeze at r / 1024 — the
+#     ramp's own resolution — keeps A >= r^2 (2^-9 - 2^-20) (>= 2r - 1 raw for tiny r) and t <= 2^10 |d| / r.
+#     SVG 1.1 says "set it ON the circle"; renderers pull it a hair inside the same way. The clamped
+#     point is what is stored.
+#   · f == c (after the clamp) paints through sd_gradient_radial's code, byte for byte.
+#   · t is EXACT — floor(t * 2^16) with its fraction flag, as linear and radial — for t < 256: every
+#     pixel inside the circle, and under PAD every pixel (t >= 1 is the last colour, decided exactly by
+#     |p - c|^2 >= r^2). Beyond t = 256 (REPEAT / REFLECT, 256 periods out) floor(t * 2^16) is within
+#     t * 2^-10 + 1 of exact. How: _sd_paint_focal_t.
+#   · MEASURED (256x256 full coverage, the same shape as the figures above, on an idle core): focal PAD
+#     85.1 ns/px, focal REFLECT 89.0 (every pixel takes the root; PAD's outside test skips it). Linear
+#     and radial are untouched at 14.0 and 41.9 — the focal / transformed pixels have their own loop
+#     (_sd_paint_blit_point), so the 0.6.0 loop did not grow a branch. ⚠ Those two are a fresh
+#     head-to-head against a build of 0.6.0's src/ on the same idle core in the same minute, NOT the
+#     14.2 / 44.3 the RAMP section above quotes from 0.6.0's own (loaded) run — ns/px figures compare
+#     within one run on one host, never across them.
+#
+# GRADIENT TRANSFORMS — sd_gradient_set_matrix(g, m): SVG gradientTransform.
+#   · m maps GRADIENT space — where the geometry above is given — to CANVAS space; each pixel centre is
+#     mapped through the inverse. m == 0, or an exactly-identity m, restores the untransformed paint
+#     byte for byte and allocates nothing.
+#   · LINEAR stays a DDA: t is affine in canvas position, so a transformed linear gradient IS a
+#     canvas-space linear gradient, axis P0 = m(p0), V = |v|^2 J^-T v / |J^-T v|^2 (v = p1 - p0, J the
+#     2x2 part of m). Each blit resolves that axis to the nearest raw unit (128-bit intermediates) and
+#     paints it with the exact DDA above.
+#   · RADIAL and FOCAL (ellipses in canvas space) map every pixel centre: q = 2^16 adj(J) (p - (e, f)) /
+#     det, stepped per pixel and per row as quotient + remainder like the linear DDA (no error
+#     accumulates), rounded to the nearest raw unit; then the untransformed t at q.
+#   · ⭐ EXACT where the transform is: translations, quarter-turns and 2^k scales resolve both with no
+#     rounding — a translation-only matrix is byte-identical to moving the geometry, a quarter-turn of a
+#     linear gradient to the rotated axis (asserted in programs/paint_focal_test.cyr).
+#   · ⚠ Otherwise t is exact for the ROUNDED axis / point, which is within 0.71 raw of exact (each
+#     component within 0.5): |Δt| < 2^-16 px (1 + 3 |p - P0| / |V|) / |V| linear, < 2^-16.5 px / r
+#     radial, < 2^-16.5 px / (r - |c - f|) focal (t's gradient is at most 1 / (r - |c - f|)).
+#     MEASURED under rotate(30°) x scale(2) with CORDIC entries, every pixel centre of a 47x47 patch
+#     against exact rationals (a 35 px axis, r = 23.1 px, a focal point 7.3 px off the centre — all
+#     doubled on the canvas): floor(t * 2^16) is never off by more than 1, and is off by 1 at 7
+#     linear, 20 radial and 19 focal pixels of 2,209.
+#   · ⛔ TWO KINDS OF MATRIX MAKE THE GRADIENT PAINT NOTHING, both returning SADISH_ERR_BOUNDS from
+#     set_matrix, for two different reasons. (1) SINGULAR (a*d - b*c == 0) — SVG's own rule: an element
+#     whose gradientTransform is not invertible is not rendered with that paint. (2) ANY ENTRY outside
+#     ±16,384.0 (raw magnitude >= 2^30) — sadish's precision bound, not SVG's: such a matrix may be
+#     perfectly invertible (a translation of 16,384 px is), and it is still refused, because the mapped
+#     products would leave i64. ⇒ A consumer placing a gradient on a large canvas must keep every entry
+#     inside that bound (move the geometry rather than the matrix) and must READ the return code — an
+#     ignored one leaves an invisible paint with no other signal. The next valid matrix (or 0) revives it.
+#   · ⚠ PRECISION BOUND under a transform: the gradient-space image of every painted pixel centre, m(p0),
+#     and m(p0) + V all within ±16,383 px.
+#   · MEASURED, same shape: a transformed linear gradient is 14.0 ns/px — the untransformed figure, the
+#     matrix costing one axis resolve per blit; radial 49.0 (41.9 untransformed) and focal 98.7 (85.1),
+#     the difference being the two per-pixel DDA steps and the rounding.
+#
 # ⚠ ALLOCATION. The gradient object (88 B), its stops (16 B each, doubling from 4, like
 # sd_path_grow) and the ramp (4,100 B) come from sd_alloc — MEASURED 4,256 B for a constructed
-# gradient, all of it on the consumer's hook when one is set. A blit allocates NOTHING, not even on
-# its first call (the ramp is rebuilt in place): MEASURED 0 B on the heap and 0 B on an arena hook,
-# asserted exactly in programs/paint_test.cyr. ⛔ A gradient made under an arena hook dies with that
-# arena's reset, exactly like a path.
+# gradient, all of it on the consumer's hook when one is set. A focal gradient adds a 72 B extension
+# (fx, fy, the matrix): 4,328 B. sd_gradient_set_matrix allocates that same 72 B ONCE — on the first
+# non-identity matrix of a linear or radial gradient — and never again: re-setting a matrix every
+# frame costs 0 B. A blit allocates NOTHING, not even on its first call (the ramp is rebuilt in
+# place): MEASURED 0 B on the heap and 0 B on an arena hook, asserted exactly in
+# programs/paint_test.cyr and (focal, transformed) programs/paint_focal_test.cyr. ⛔ A gradient made
+# under an arena hook dies with that arena's reset, exactly like a path — and so does an extension
+# set_matrix allocated under one.
 # ⚠ SINGLE-THREADED, as the rest of the rasterizer: the lazy ramp rebuild writes into the gradient
 # from inside a blit or sd_gradient_color_at, and the division helpers hand back their second result
 # through a module global.
@@ -87,6 +162,7 @@
 # ---- kinds + spread modes ----------------------------------------
 var SD_GRADIENT_LINEAR = 0;
 var SD_GRADIENT_RADIAL = 1;
+var SD_GRADIENT_FOCAL  = 2;
 var SD_SPREAD_PAD     = 0;
 var SD_SPREAD_REPEAT  = 1;
 var SD_SPREAD_REFLECT = 2;
@@ -96,20 +172,31 @@ var SD_GRADIENT_RAMP_BITS = 10;
 var SD_GRADIENT_RAMP_N    = 1024;
 # Initial stop capacity; sd_gradient_add_stop doubles it on overflow.
 var SD_GRADIENT_STOP_CAP  = 4;
+# The focal clamp: a focal point stays within r - ceil(r / 2^SD_GRADIENT_FOCAL_BITS) of the centre.
+var SD_GRADIENT_FOCAL_BITS = 10;
 
 # ================================================================
 # SdGradient (88 bytes):
-#   +0:  kind      (SD_GRADIENT_LINEAR | SD_GRADIENT_RADIAL)
+#   +0:  kind      (SD_GRADIENT_LINEAR | SD_GRADIENT_RADIAL | SD_GRADIENT_FOCAL)
 #   +8:  spread    (SD_SPREAD_*)
 #   +16: x0 | cx   (16.16)
 #   +24: y0 | cy   (16.16)
 #   +32: x1 | r    (16.16)
 #   +40: y1 | 0    (16.16)
-#   +48: stops     (ptr — cap * 16 B, sorted: +0 offset 16.16, +8 colour as given)
+#   +48: stops     (ptr — capacity * 16 B, sorted: +0 offset 16.16, +8 colour as given; the capacity
+#                   is a function of n_stops: max(SD_GRADIENT_STOP_CAP, the least power of two >= n))
 #   +56: n_stops   (i64)
-#   +64: cap       (i64 — stops the block holds)
+#   +64: ext       (ptr — SdGradientExt, or 0: no focal point, no transform)
 #   +72: ramp      (ptr — (SD_GRADIENT_RAMP_N + 1) * 4 B, 0xAARRGGBB, actual alpha; 0 = marked cell)
 #   +80: dirty     (i64 — 1 = stops changed since the ramp was built)
+# ⚠ +64 held the stop capacity until the extension needed a slot; the capacity is now derived, so the
+# object — and the 4,256 B a gradient costs — did not grow.
+#
+# SdGradientExt (72 bytes) — allocated by sd_gradient_radial_focal, or by the first sd_gradient_set_matrix
+# that is not the identity:
+#   +0:  fx, +8: fy (16.16, AFTER the focal clamp; unused unless kind == SD_GRADIENT_FOCAL)
+#   +16: xform     (SD_GRADIENT_XFORM_NONE | _MATRIX | _BLOCKED)
+#   +24: a, +32: b, +40: c, +48: d, +56: e, +64: f  (the matrix, as SdMatrix; meaningful for _MATRIX)
 # ================================================================
 var SD_GRADIENT_KIND_OFFSET   = 0;
 var SD_GRADIENT_SPREAD_OFFSET = 8;
@@ -119,13 +206,26 @@ var SD_GRADIENT_C_OFFSET      = 32;
 var SD_GRADIENT_D_OFFSET      = 40;
 var SD_GRADIENT_STOPS_OFFSET  = 48;
 var SD_GRADIENT_NSTOPS_OFFSET = 56;
-var SD_GRADIENT_CAP_OFFSET    = 64;
+var SD_GRADIENT_EXT_OFFSET    = 64;
 var SD_GRADIENT_RAMP_OFFSET   = 72;
 var SD_GRADIENT_DIRTY_OFFSET  = 80;
 var SD_GRADIENT_SIZE          = 88;
 
-# The second result of _sd_paint_divq (the remainder) and _sd_paint_radial_t (1 = inexact).
+var SD_GRADIENT_EXT_FX_OFFSET    = 0;
+var SD_GRADIENT_EXT_FY_OFFSET    = 8;
+var SD_GRADIENT_EXT_XFORM_OFFSET = 16;
+var SD_GRADIENT_EXT_M_OFFSET     = 24;
+var SD_GRADIENT_EXT_SIZE         = 72;
+# xform states: no transform; a valid matrix; a matrix the paint cannot honour (paint nothing).
+var SD_GRADIENT_XFORM_NONE    = 0;
+var SD_GRADIENT_XFORM_MATRIX  = 1;
+var SD_GRADIENT_XFORM_BLOCKED = 2;
+
+# The second result of _sd_paint_divq (the remainder), _sd_paint_radial_t and _sd_paint_focal_t
+# (1 = inexact).
 var _sd_paint_rem = 0;
+# The high 64 bits of the last _sd_paint_umul.
+var _sd_paint_hi = 0;
 
 fn _sd_gradient_new(kind, a, b, c, d): i64 {
     var g = sd_alloc(SD_GRADIENT_SIZE);
@@ -142,7 +242,7 @@ fn _sd_gradient_new(kind, a, b, c, d): i64 {
     store64(g + SD_GRADIENT_D_OFFSET, d);
     store64(g + SD_GRADIENT_STOPS_OFFSET, stops);
     store64(g + SD_GRADIENT_NSTOPS_OFFSET, 0);
-    store64(g + SD_GRADIENT_CAP_OFFSET, SD_GRADIENT_STOP_CAP);
+    store64(g + SD_GRADIENT_EXT_OFFSET, 0);
     store64(g + SD_GRADIENT_RAMP_OFFSET, ramp);
     store64(g + SD_GRADIENT_DIRTY_OFFSET, 1);
     return g;
@@ -160,6 +260,142 @@ fn sd_gradient_radial(cx, cy, r): i64 {
     return _sd_gradient_new(SD_GRADIENT_RADIAL, cx, cy, r, 0);
 }
 
+# Store the focal point (fx, fy) of a gradient centred on (cx, cy) with radius r into ext, clamped:
+# an offset from the centre longer than lim = r - ceil(r / 2^SD_GRADIENT_FOCAL_BITS) is scaled to lim,
+# each component truncated toward the centre, so |offset| <= lim always and, inside the precision
+# bound, under 4 raw short of it: the direct path loses under 3 (a ceil'd length plus two truncations),
+# the halving path under 3.5 (its shortfall is lim / |halved offset| + sqrt(2), and the halving leaves
+# a component >= 2^29 against a lim below 2^30). MEASURED worst 3 raw over 120,000 fuzzed clamps —
+# 5 once out-of-bound radii, where the r cap below applies, are fuzzed too (analytic bound 5.5).
+# ⛔ WHETHER the clamp is needed is decided at the OFFSET'S OWN SCALE: a component past lim settles it
+# alone, and when neither is, both are <= lim < 2^31 and the square below is < 2^63. Only then — the
+# clamp already known to be needed, so nothing but the offset's DIRECTION still matters — is an offset
+# with a component of 2^30 raw or more halved (sign-preserving) until it has none, keeping the square
+# under 2^61 and the scaling products under 2^62. Halving FIRST and comparing the shortened length
+# against the full-scale lim silently skips the clamp whenever lim outgrows the halved length (r above
+# ~8,200 px with an offset past 16,384 px), storing a focal point at a fraction of the asked direction.
+# r <= 0 stores (fx, fy) as given — the paint is the last stop anyway.
+fn _sd_gradient_set_focal(ext, cx, cy, r, fx, fy): i64 {
+    var vx = fx - cx;
+    var vy = fy - cy;
+    if (r > 0) {
+        var rr = r;
+        if (rr > 2147483647) { rr = 2147483647; }
+        var lim = rr - ((rr + (1 << SD_GRADIENT_FOCAL_BITS) - 1) >> SD_GRADIENT_FOCAL_BITS);
+        # ⚠ The pre-tests are what make the square below safe: they leave |vx|, |vy| <= lim, and the r
+        # cap holds lim <= 2,145,386,495, whose doubled square is 9,205,366,425,856,770,050 — inside
+        # i64 by 1.8e16. A component compared as a component also survives a square that would wrap.
+        var need = 0;
+        if (vx > lim) { need = 1; }
+        if (vx < 0 - lim) { need = 1; }
+        if (vy > lim) { need = 1; }
+        if (vy < 0 - lim) { need = 1; }
+        if (need == 0) {
+            if (vx * vx + vy * vy > lim * lim) { need = 1; }
+        }
+        if (need != 0) {
+            var big = 1;
+            while (big != 0) {
+                big = 0;
+                if (vx >= 1073741824) { big = 1; }
+                if (vx <= 0 - 1073741824) { big = 1; }
+                if (vy >= 1073741824) { big = 1; }
+                if (vy <= 0 - 1073741824) { big = 1; }
+                if (big != 0) {
+                    vx = sd_asr(vx, 1);
+                    vy = sd_asr(vy, 1);
+                }
+            }
+            # The halving leaves a component >= 2^29 (the last one ran because one was >= 2^30), and a
+            # clamp that is needed has a non-zero offset, so lv > 0 here either way.
+            var lv = vx * vx + vy * vy;
+            var len = _sd_paint_isqrt(lv);
+            if (len * len < lv) { len = len + 1; }
+            vx = (vx * lim) / len;
+            vy = (vy * lim) / len;
+        }
+    }
+    store64(ext + SD_GRADIENT_EXT_FX_OFFSET, cx + vx);
+    store64(ext + SD_GRADIENT_EXT_FY_OFFSET, cy + vy);
+    return 0;
+}
+
+# @public — a FOCAL radial gradient: circle (cx, cy, r), focal point (fx, fy), all 16.16 canvas (or,
+# under a matrix, gradient) coordinates. t = 0 at the focal point and 1 on the circle (SVG 1.1 fx / fy,
+# focal radius 0); a focal point on, outside, or within r / 1024 of the circle is clamped to
+# r - ceil(r / 1024) from the centre along the same direction. No stops yet; spread PAD. Returns the
+# SdGradient ptr, or 0 on OOM (any of its four allocations). Costs 4,328 B through sd_alloc.
+fn sd_gradient_radial_focal(cx, cy, r, fx, fy): i64 {
+    var g = _sd_gradient_new(SD_GRADIENT_FOCAL, cx, cy, r, 0);
+    if (g == 0) { return 0; }
+    var ext = sd_alloc(SD_GRADIENT_EXT_SIZE);
+    if (ext == 0) { return 0; }
+    memset(ext, 0, SD_GRADIENT_EXT_SIZE);
+    _sd_gradient_set_focal(ext, cx, cy, r, fx, fy);
+    store64(g + SD_GRADIENT_EXT_OFFSET, ext);
+    return g;
+}
+
+# @public — set the gradient transform: `m` (an SdMatrix, 16.16) maps GRADIENT space to CANVAS space,
+# as SVG's gradientTransform; the matrix is COPIED, so m may be freed or reused. m == 0 (or an exact
+# identity) removes any transform: the paint is byte-identical to never having had one.
+# Returns SADISH_OK; SADISH_ERR_BOUNDS for g == 0, or for a matrix the paint cannot honour — which is
+# STORED and makes the gradient paint NOTHING until the next valid set_matrix; or SADISH_ERR_OOM when
+# the 72 B extension cannot be allocated (the gradient is unchanged). ⛔ Two different things are
+# refused with that one code: a SINGULAR matrix (a*d - b*c == 0), which is SVG's rule for not rendering
+# the element, and any matrix with an ENTRY outside ±16,384.0 (raw magnitude >= 2^30), which is
+# sadish's precision bound — an invertible matrix such as a translation of 16,384 px is refused too.
+# A caller that ignores the code gets SVG's behaviour for the first and an invisible paint for the
+# second; one that checks it can set 0 or an in-bound matrix to revive the paint.
+# Allocation: 0 B for m == 0 / identity and for a gradient that already has its extension (every focal
+# gradient; any gradient after its first non-identity matrix); otherwise 72 B, once.
+fn sd_gradient_set_matrix(g, m): i64 {
+    if (g == 0) { return SADISH_ERR_BOUNDS; }
+    var ext = load64(g + SD_GRADIENT_EXT_OFFSET);
+    var ident = 0;
+    if (m == 0) {
+        ident = 1;
+    } else {
+        if (load64(m + SD_MAT_A_OFFSET) == SD_ONE) {
+            if (load64(m + SD_MAT_D_OFFSET) == SD_ONE) {
+                if ((load64(m + SD_MAT_B_OFFSET) | load64(m + SD_MAT_C_OFFSET)) == 0) {
+                    if ((load64(m + SD_MAT_E_OFFSET) | load64(m + SD_MAT_F_OFFSET)) == 0) { ident = 1; }
+                }
+            }
+        }
+    }
+    if (ident != 0) {
+        if (ext != 0) { store64(ext + SD_GRADIENT_EXT_XFORM_OFFSET, SD_GRADIENT_XFORM_NONE); }
+        return SADISH_OK;
+    }
+    if (ext == 0) {
+        ext = sd_alloc(SD_GRADIENT_EXT_SIZE);
+        if (ext == 0) { return SADISH_ERR_OOM; }
+        memset(ext, 0, SD_GRADIENT_EXT_SIZE);
+        store64(g + SD_GRADIENT_EXT_OFFSET, ext);
+    }
+    var ok = 1;
+    var i = 0;
+    while (i < 6) {
+        var v = load64(m + i * 8);
+        store64(ext + SD_GRADIENT_EXT_M_OFFSET + i * 8, v);
+        if (v >= 1073741824) { ok = 0; }
+        if (v <= 0 - 1073741824) { ok = 0; }
+        i = i + 1;
+    }
+    if (ok != 0) {
+        var det = load64(m + SD_MAT_A_OFFSET) * load64(m + SD_MAT_D_OFFSET);
+        det = det - load64(m + SD_MAT_B_OFFSET) * load64(m + SD_MAT_C_OFFSET);
+        if (det == 0) { ok = 0; }
+    }
+    if (ok == 0) {
+        store64(ext + SD_GRADIENT_EXT_XFORM_OFFSET, SD_GRADIENT_XFORM_BLOCKED);
+        return SADISH_ERR_BOUNDS;
+    }
+    store64(ext + SD_GRADIENT_EXT_XFORM_OFFSET, SD_GRADIENT_XFORM_MATRIX);
+    return SADISH_OK;
+}
+
 # @public
 fn sd_gradient_stop_count(g): i64 { return load64(g + SD_GRADIENT_NSTOPS_OFFSET); }
 
@@ -174,15 +410,18 @@ fn sd_gradient_add_stop(g, offset, color): i64 {
     if (o > SD_ONE) { o = SD_ONE; }
     var stops = load64(g + SD_GRADIENT_STOPS_OFFSET);
     var n = load64(g + SD_GRADIENT_NSTOPS_OFFSET);
-    var cap = load64(g + SD_GRADIENT_CAP_OFFSET);
-    if (n >= cap) {
-        var ncap = cap * 2;
-        var grown = sd_alloc(ncap * 16);
+    # The block holds max(SD_GRADIENT_STOP_CAP, the least power of two >= n) stops, so it is full
+    # exactly when n is a power of two >= SD_GRADIENT_STOP_CAP — and then doubles, as it always has.
+    var full = 0;
+    if (n >= SD_GRADIENT_STOP_CAP) {
+        if ((n & (n - 1)) == 0) { full = 1; }
+    }
+    if (full != 0) {
+        var grown = sd_alloc(n * 2 * 16);
         if (grown == 0) { return SADISH_ERR_OOM; }
         memcpy(grown, stops, n * 16);
         stops = grown;
         store64(g + SD_GRADIENT_STOPS_OFFSET, stops);
-        store64(g + SD_GRADIENT_CAP_OFFSET, ncap);
     }
     # Shift every stop with a strictly GREATER offset up one slot; equal offsets stay in front.
     var i = n;
@@ -409,20 +648,354 @@ fn _sd_paint_radial_t(d2, r): i64 {
     return t;
 }
 
+# ---- wide arithmetic for the focal root and the transformed axis ----------------------------------
+# The bit length of v: 0 for v <= 0, else floor(log2(v)) + 1.
+fn _sd_paint_bitlen(v): i64 {
+    if (v <= 0) { return 0; }
+    var x = v;
+    var n = 1;
+    if (x >= 4294967296) { x = x >> 32; n = n + 32; }
+    if (x >= 65536) { x = x >> 16; n = n + 16; }
+    if (x >= 256) { x = x >> 8; n = n + 8; }
+    if (x >= 16) { x = x >> 4; n = n + 4; }
+    if (x >= 4) { x = x >> 2; n = n + 2; }
+    if (x >= 2) { n = n + 1; }
+    return n;
+}
+
+# a * b for 0 <= a, b < 2^63 as 128 bits: returns the LOW 64 bits (a bit pattern — negative as an i64
+# when bit 63 is set) and leaves the high 64 in _sd_paint_hi. By 32-bit halves: a0 * b0 < 2^64 wraps
+# into a bit pattern the logical >> reads back; every other partial product is < 2^63.
+fn _sd_paint_umul(a, b): i64 {
+    var a0 = a & 4294967295;
+    var a1 = a >> 32;
+    var b0 = b & 4294967295;
+    var b1 = b >> 32;
+    var p00 = a0 * b0;
+    var p01 = a0 * b1;
+    var p10 = a1 * b0;
+    var mid = (p00 >> 32) + (p01 & 4294967295) + (p10 & 4294967295);
+    _sd_paint_hi = a1 * b1 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+    return (p00 & 4294967295) | ((mid & 4294967295) << 32);
+}
+
+# x < y with both read as UNSIGNED 64-bit patterns (the low halves of 128-bit values).
+fn _sd_paint_ult(x, y): i64 {
+    if ((x ^ (1 << 63)) < (y ^ (1 << 63))) { return 1; }
+    return 0;
+}
+
+# The bit length of the non-negative 128-bit value hi:lo.
+fn _sd_paint_bitlen128(hi, lo): i64 {
+    if (hi != 0) { return 64 + _sd_paint_bitlen(hi); }
+    if (lo < 0) { return 64; }
+    return _sd_paint_bitlen(lo);
+}
+
+# The low 64 bits of hi:lo >> s for 0 < s <= 127, or of lo << -s for s <= 0 (then hi must be 0).
+fn _sd_paint_shr128(hi, lo, s): i64 {
+    if (s <= 0) { return lo << (0 - s); }
+    if (s >= 64) { return hi >> (s - 64); }
+    return (lo >> s) | (hi << (64 - s));
+}
+
+# ---- focal radial ---------------------------------------------------------------------------------
+# Per-blit constants of the focal root (single-threaded, like _sd_paint_rem): e = c - f, and A = r^2 - |e|^2
+# (> 0) twice over — normalized, A = fan * 2^fsn with fan in [2^30, 2^31) (fsn < 0 is an exact left
+# shift), and as the divisor fad = A >> fsd < 2^31 (fsd = 0 keeps a small A exact).
+var _sd_paint_fex = 0;
+var _sd_paint_fey = 0;
+var _sd_paint_fa = 0;
+var _sd_paint_fan = 0;
+var _sd_paint_fsn = 0;
+var _sd_paint_fad = 0;
+var _sd_paint_fsd = 0;
+
+fn _sd_paint_focal_setup(fex, fey, fa): i64 {
+    _sd_paint_fex = fex;
+    _sd_paint_fey = fey;
+    _sd_paint_fa = fa;
+    var na = _sd_paint_bitlen(fa);
+    _sd_paint_fsn = na - 31;
+    _sd_paint_fad = fa;
+    _sd_paint_fsd = 0;
+    if (na >= 31) {
+        _sd_paint_fan = fa >> (na - 31);
+        _sd_paint_fad = _sd_paint_fan;
+        _sd_paint_fsd = na - 31;
+    } else {
+        _sd_paint_fan = fa << (31 - na);
+    }
+    return 0;
+}
+
+# The sign (-1, 0, 1) of h(k) = A k^2 + 2^17 b k - 2^32 l, for 0 <= k < 2^25, EXACTLY, in 128 bits:
+# A k^2 < 2^112, |b| k 2^17 < 2^105, l 2^32 < 2^95 — every sum < 2^113, so each high half is a
+# non-negative i64.
+fn _sd_paint_focal_sign(k, b, l): i64 {
+    var plo = _sd_paint_umul(_sd_paint_fa, k * k);
+    var phi = _sd_paint_hi;
+    var bm = b;
+    if (bm < 0) { bm = 0 - bm; }
+    var mlo = _sd_paint_umul(bm, k << 17);
+    var mhi = _sd_paint_hi;
+    var nlo = l << 32;
+    var nhi = l >> 32;
+    if (b >= 0) {
+        var slo = plo + mlo;
+        phi = phi + mhi;
+        if (_sd_paint_ult(slo, plo) != 0) { phi = phi + 1; }
+        plo = slo;
+    } else {
+        var tlo = nlo + mlo;
+        nhi = nhi + mhi;
+        if (_sd_paint_ult(tlo, nlo) != 0) { nhi = nhi + 1; }
+        nlo = tlo;
+    }
+    if (phi > nhi) { return 1; }
+    if (phi < nhi) { return 0 - 1; }
+    if (plo == nlo) { return 0; }
+    if (_sd_paint_ult(plo, nlo) != 0) { return 0 - 1; }
+    return 1;
+}
+
+# ⭐ floor(t * 2^16) of a focal gradient at d = (dx, dy) = p - f (raw), with _sd_paint_rem = 1 when
+# t * 2^16 is not an integer; the per-blit constants from _sd_paint_focal_setup. With l = |d|^2 and
+# b = d·e (both exact i64 inside the bound), t * 2^16 is the positive root of
+#     h(T) = A T^2 + 2^17 b T - 2^32 l
+# (the quadratic above scaled by T = t * 2^16), so floor(t * 2^16) = the largest T with h(T) <= 0 —
+# but h needs ~113 bits and its direct root ~158, so the root is taken in two steps:
+#   1. ESTIMATE t * 2^24 in i64, as a mantissa and an exponent. S = sqrt(b^2 + A l) comes from those
+#      two products rebuilt from 31-bit normalized factors (exact shifts left, truncating shifts
+#      right: each factor >= 2^30 loses < 2^-30), aligned to one even exponent and rooted to 31 bits.
+#      Then t = l / (b + S) when b >= 0 and t = (S - b) / A when b < 0 — the form with no
+#      cancellation — as one 62-bit / 31-bit hardware division, shifted into place. Relative error
+#      < 2^-28 (four 2^-30 truncations, the root's and the divisor's), plus < 2 units of 2^-24 from the
+#      floors. Nothing overflows for any d within the bound; outside it, and for t * 2^24 >= 2^62,
+#      t * 2^16 saturates at 2^54 — never a trap (every divisor is checked > 0 first).
+#   2. DECIDE. With w = t8 / 2^26 + 3 > the estimate's error, a fraction (in 2^-24) at least w away
+#      from both integers of 2^-16 settles floor(t * 2^16) and inexact. Otherwise the true value is
+#      within 1 of k = round(t * 2^16), and the sign of h(k), exact in 128 bits (_sd_paint_focal_sign),
+#      decides: h(k) > 0 -> k - 1, inexact; == 0 -> k, exact; < 0 -> k, inexact. ~2.4 % of pixels
+#      with t < 1 take this step (6 of 256 fractions).
+# ⇒ EXACT for t < 256 (t * 2^24 < 2^32, where w <= 69 < 128). Past it the estimate alone is used:
+# floor(t * 2^16) within t * 2^-10 + 1, flagged inexact. MEASURED in a Python model of this code over
+# 2.75M random and adversarial cases (focal on / just inside / at the centre, pixels on the circle,
+# behind the focal point, within 4 raw of it, radii 2^1 .. 2^30 raw): 0 mismatches; the worst
+# estimate error was 0.35 w. programs/paint_focal_test.cyr checks it against an independent bignum
+# root.
+fn _sd_paint_focal_t(dx, dy): i64 {
+    var l = dx * dx + dy * dy;
+    if (l == 0) {
+        _sd_paint_rem = 0;
+        return 0;
+    }
+    var sat = 18014398509481984;   # 2^54: t * 2^16 saturates at t = 2^38 (only past the bound)
+    _sd_paint_rem = 1;
+    if (l < 0) { return sat; }
+    var b = dx * _sd_paint_fex + dy * _sd_paint_fey;
+    var bm = b;
+    if (bm < 0) { bm = 0 - bm; }
+    if (bm < 0) { return sat; }
+    # q * 2^ex ~ b^2 + A l, q in [2^60, 2^62).
+    var nl = _sd_paint_bitlen(l);
+    var l1 = 0;
+    if (nl >= 31) { l1 = l >> (nl - 31); } else { l1 = l << (31 - nl); }
+    var e2 = _sd_paint_fsn + nl - 31;
+    var ex = e2;
+    var e1 = 0;
+    var t1 = 0;
+    if (bm != 0) {
+        var nb = _sd_paint_bitlen(bm);
+        var b1 = 0;
+        if (nb >= 31) { b1 = bm >> (nb - 31); } else { b1 = bm << (31 - nb); }
+        t1 = b1 * b1;
+        e1 = 2 * (nb - 31);
+        if (e1 > ex) { ex = e1; }
+    }
+    ex = ex + (ex & 1);
+    var q = 0;
+    if (ex - e2 < 63) { q = (_sd_paint_fan * l1) >> (ex - e2); }
+    if (bm != 0) {
+        if (ex - e1 < 63) { q = q + (t1 >> (ex - e1)); }
+    }
+    if (q >= 4611686018427387904) {
+        q = q >> 2;
+        ex = ex + 2;
+    }
+    if (q < 1152921504606846976) {
+        q = q << 2;
+        ex = ex - 2;
+    }
+    var root = _sd_paint_isqrt(q);   # S ~ root * 2^hs, root in [2^30, 2^31)
+    var hs = sd_asr(ex, 1);
+    if (hs > 31) { return sat; }
+    var quot = 0;
+    var z = 0;
+    if (b >= 0) {
+        # t * 2^24 = l 2^24 / (b + S)
+        var den = 0;
+        var xd = 0;
+        if (hs >= 0) {
+            den = b + (root << hs);
+        } else {
+            if (b >= (1 << (62 + hs))) { return sat; }
+            den = (b << (0 - hs)) + root;
+            xd = hs;
+        }
+        if (den <= 0) { return sat; }
+        var lsh = 62 - nl;
+        var ln = 0;
+        if (nl == 63) { ln = l >> 1; } else { ln = l << lsh; }
+        var nd = _sd_paint_bitlen(den);
+        quot = ln / (den >> (nd - 31));
+        z = 24 - xd - lsh - (nd - 31);
+    } else {
+        # t * 2^24 = (S + |b|) 2^24 / A
+        var num = 0;
+        var xn = 0;
+        if (hs >= 0) {
+            num = bm + (root << hs);
+        } else {
+            if (bm >= (1 << (62 + hs))) { return sat; }
+            num = (bm << (0 - hs)) + root;
+            xn = hs;
+        }
+        if (num <= 0) { return sat; }
+        var nn = _sd_paint_bitlen(num);
+        var nsh = 62 - nn;
+        var nnum = 0;
+        if (nn == 63) { nnum = num >> 1; } else { nnum = num << nsh; }
+        quot = nnum / _sd_paint_fad;
+        z = 24 + xn - nsh - _sd_paint_fsd;
+    }
+    var t8 = 0;
+    if (z >= 0) {
+        if (z >= 62) { return sat; }
+        if (quot >= (1 << (62 - z))) { return sat; }
+        t8 = quot << z;
+    } else {
+        if (z > 0 - 63) { t8 = quot >> (0 - z); }
+    }
+    if (t8 >= 4294967296) { return t8 >> 8; }
+    var fr = t8 & 255;
+    var w = (t8 >> 26) + 3;
+    if (fr >= w) {
+        if (fr + w <= 255) { return t8 >> 8; }
+    }
+    var k = (t8 + 128) >> 8;
+    var sg = _sd_paint_focal_sign(k, b, l);
+    if (sg > 0) { return k - 1; }
+    if (sg == 0) { _sd_paint_rem = 0; }
+    return k;
+}
+
+# ---- transformed linear axis ----------------------------------------------------------------------
+# The canvas-space axis of the linear gradient (x0, y0) + (vx, vy) under ext's matrix (a, b, c, d, e, f):
+# P0 = m(x0, y0) and V = |v|^2 J^-T v / |J^-T v|^2, each component rounded to the nearest raw unit, into
+# _sd_paint_ax / _ay / _avx / _avy. With w = adj(J)^T v (raw^2), V = |v|^2 det w / (2^16 |w|^2): the
+# ratio |v|^2 |det| / |w|^2 of two 128-bit values is taken to 60 fraction bits from their 62-bit
+# mantissas (relative error < 2^-58), times |w| in 128 bits, shifted down with rounding — so V is within
+# 2^-26 raw of exact before the final rounding, and an axis with an exact raw answer gets it.
+# Requires det != 0, entries within ±2^30 raw, |v|^2 >= 2^16 (sd_gradient_set_matrix / the blit ensure it).
+var _sd_paint_ax = 0;
+var _sd_paint_ay = 0;
+var _sd_paint_avx = 0;
+var _sd_paint_avy = 0;
+
+# One component: sign(w) sign(det) round(ratio * |w| / 2^s).
+fn _sd_paint_axis_comp(ratio, w, det, s): i64 {
+    if (s < 1) { return 0; }
+    if (s > 126) { return 0; }
+    var wm = w;
+    if (wm < 0) { wm = 0 - wm; }
+    var lo = _sd_paint_umul(ratio, wm);
+    var hi = _sd_paint_hi;
+    var hlo = 0;
+    if (s <= 64) {
+        hlo = 1 << (s - 1);
+    } else {
+        hi = hi + (1 << (s - 65));
+    }
+    var slo = lo + hlo;
+    if (_sd_paint_ult(slo, lo) != 0) { hi = hi + 1; }
+    var v = _sd_paint_shr128(hi, slo, s);
+    if ((w < 0) != (det < 0)) { v = 0 - v; }
+    return v;
+}
+
+fn _sd_paint_axis(ext, x0, y0, vx, vy): i64 {
+    var a = load64(ext + SD_GRADIENT_EXT_M_OFFSET);
+    var b = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 8);
+    var c = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 16);
+    var d = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 24);
+    var e = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 32);
+    var f = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 40);
+    _sd_paint_ax = sd_asr(a * x0 + c * y0 + 32768, 16) + e;
+    _sd_paint_ay = sd_asr(b * x0 + d * y0 + 32768, 16) + f;
+    var det = a * d - b * c;
+    var wx = d * vx - b * vy;
+    var wy = a * vy - c * vx;
+    var dm = det;
+    if (dm < 0) { dm = 0 - dm; }
+    var nlo = _sd_paint_umul(vx * vx + vy * vy, dm);
+    var nhi = _sd_paint_hi;
+    var wxm = wx;
+    if (wxm < 0) { wxm = 0 - wxm; }
+    var wym = wy;
+    if (wym < 0) { wym = 0 - wym; }
+    var xlo = _sd_paint_umul(wxm, wxm);
+    var xhi = _sd_paint_hi;
+    var ylo = _sd_paint_umul(wym, wym);
+    var whi = xhi + _sd_paint_hi;
+    var wlo = xlo + ylo;
+    if (_sd_paint_ult(wlo, xlo) != 0) { whi = whi + 1; }
+    _sd_paint_avx = 0;
+    _sd_paint_avy = 0;
+    if ((whi | wlo) == 0) { return 0; }
+    var sn = _sd_paint_bitlen128(nhi, nlo) - 62;
+    var sw = _sd_paint_bitlen128(whi, wlo) - 62;
+    var ratio = _sd_paint_divq(_sd_paint_shr128(nhi, nlo, sn), _sd_paint_shr128(whi, wlo, sw), 60);
+    var s = 76 - sn + sw;
+    _sd_paint_avx = _sd_paint_axis_comp(ratio, wx, det, s);
+    _sd_paint_avy = _sd_paint_axis_comp(ratio, wy, det, s);
+    return 0;
+}
+
 # ================================================================
-# sd_canvas_blit_paint_at — composite the canvas coverage onto `surface` with the canvas's (0,0) at
-# surface pixel (dx, dy), the source colour of each pixel coming from gradient `g` sampled at the
-# pixel's centre in CANVAS space. Source alpha = coverage * paint_alpha / 255; src-over as
-# sd_canvas_blit_at: every pixel with coverage != 0 is written, dst alpha byte 255. Clipped to the
-# surface on every side; rows addressed by sd_surface_stride. Returns SADISH_OK (also for a gradient
-# with no stops, which paints nothing), or SADISH_ERR_BOUNDS for a null cv / surface / g.
+# _sd_paint_blit_run — THE gradient blit: composite the canvas coverage onto `surface` with the
+# canvas's (0,0) at surface pixel (dx, dy), the source colour of each pixel coming from gradient `g`
+# sampled at the pixel's centre in CANVAS space. Clipped to the surface on every side; rows addressed
+# by sd_surface_stride. Returns SADISH_OK (also for a gradient with no stops, or one whose matrix is
+# blocked, which paint nothing), or SADISH_ERR_BOUNDS for a null cv / surface / g.
+# A linear gradient under a matrix is resolved to its canvas-space axis here and painted by the same
+# loop; a focal point off the centre, or a matrix on a radial / focal gradient, gives every pixel its
+# own gradient-space point — _sd_paint_blit_point's loop. The loop below is 0.6.0's, with `pm` added.
+#
+# ⭐ `pm` PICKS THE COMPOSITOR, AND NOTHING ELSE (0.7.0). Everything above the store — the linear
+# DDA and its remainders, the radial and focal roots, the transformed point stepping, the spread, the
+# ramp lookup and the marked-cell stop search — is ONE implementation, run identically either way, so
+# no pixel can take a different t or a different colour in one blit than in the other:
+#   pm == 0  sd_canvas_blit_paint_at: source alpha = coverage * paint_alpha / 255 (rounded DOWN to a
+#            byte), then sd_canvas_blit_at's straight src-over — every pixel with coverage != 0 is
+#            written and gets dst alpha 255, even where that product rounds to 0.
+#   pm != 0  sd_canvas_blit_paint_premul_at (src/premul.cyr): the pixel's straight colour is
+#            premultiplied at its own interpolated alpha and composited src-over a PREMULTIPLIED
+#            destination, coverage and alpha kept apart, the dst alpha composited rather than forced.
+# ⛔ Do not specialize one branch without the other, and do not lift the store out of the loop into
+# a per-pixel helper for BOTH: pm == 0's four stores are 0.6.0's bytes verbatim, and paint_test /
+# paint_focal_test pass on them unedited. The premultiplied store is one call because its arithmetic
+# belongs to premul.cyr, which owns the formula and shares it with sd_canvas_blit_premul_at.
 # ================================================================
-# @public
-fn sd_canvas_blit_paint_at(cv, surface, g, dx, dy): i64 {
+fn _sd_paint_blit_run(cv, surface, g, dx, dy, pm): i64 {
     if (cv == 0) { return SADISH_ERR_BOUNDS; }
     if (surface == 0) { return SADISH_ERR_BOUNDS; }
     if (g == 0) { return SADISH_ERR_BOUNDS; }
     if (load64(g + SD_GRADIENT_NSTOPS_OFFSET) == 0) { return SADISH_OK; }
+    var ext = load64(g + SD_GRADIENT_EXT_OFFSET);
+    var xform = SD_GRADIENT_XFORM_NONE;
+    if (ext != 0) { xform = load64(ext + SD_GRADIENT_EXT_XFORM_OFFSET); }
+    if (xform == SD_GRADIENT_XFORM_BLOCKED) { return SADISH_OK; }
     if (load64(g + SD_GRADIENT_DIRTY_OFFSET) != 0) { _sd_gradient_build_ramp(g); }
     var ramp = load64(g + SD_GRADIENT_RAMP_OFFSET);
     var spread = load64(g + SD_GRADIENT_SPREAD_OFFSET);
@@ -467,6 +1040,17 @@ fn sd_canvas_blit_paint_at(cv, surface, g, dx, dy): i64 {
         var ddx = load64(g + SD_GRADIENT_C_OFFSET) - gx;
         var ddy = load64(g + SD_GRADIENT_D_OFFSET) - gy;
         l2 = ddx * ddx + ddy * ddy;
+        if (xform == SD_GRADIENT_XFORM_MATRIX) {
+            # The canvas-space axis. Degenerate if either axis is: |v| or |V| below 2^-8 px.
+            if (l2 >= 65536) {
+                _sd_paint_axis(ext, gx, gy, ddx, ddy);
+                gx = _sd_paint_ax;
+                gy = _sd_paint_ay;
+                ddx = _sd_paint_avx;
+                ddy = _sd_paint_avy;
+                l2 = ddx * ddx + ddy * ddy;
+            }
+        }
         if (l2 >= 65536) {
             mode = 0;
             qx = _sd_paint_divq(ddx, l2, 48);
@@ -481,7 +1065,12 @@ fn sd_canvas_blit_paint_at(cv, surface, g, dx, dy): i64 {
             rr = _sd_paint_rem;
         }
     } else {
-        if (rad > 0) { mode = 1; }
+        if (rad > 0) {
+            mode = 1;
+            var focal = _sd_paint_focal_of(g, ext, gx, gy, rad);
+            if (focal != 0) { return _sd_paint_blit_point(cv, surface, g, dx, dy, 1, pm); }
+            if (xform == SD_GRADIENT_XFORM_MATRIX) { return _sd_paint_blit_point(cv, surface, g, dx, dy, 0, pm); }
+        }
     }
     var solid = load32(ramp + SD_GRADIENT_RAMP_N * 4);
 
@@ -519,24 +1108,28 @@ fn sd_canvas_blit_paint_at(cv, surface, g, dx, dy): i64 {
                     e = load32(ramp + (u16 >> 6) * 4);
                     if (e == 0) { e = _sd_gradient_eval(g, u16); }
                 }
-                var sa = a;
-                var pa = (e >> 24) & 255;
-                if (pa != 255) { sa = (a * pa) / 255; }
-                var sr = (e >> 16) & 255;
-                var sg = (e >> 8) & 255;
-                var sb = e & 255;
                 var off = (y + dy) * pitch + (x + dx) * 4;
-                if (sa == 255) {
-                    store8(spx + off, sb);
-                    store8(spx + off + 1, sg);
-                    store8(spx + off + 2, sr);
-                    store8(spx + off + 3, 255);
+                if (pm != 0) {
+                    _sd_premul_paint_px(spx + off, covbuf + y * covstride + x, e);
                 } else {
-                    var ia = 255 - sa;
-                    store8(spx + off, (sb * sa + load8(spx + off) * ia) / 255);
-                    store8(spx + off + 1, (sg * sa + load8(spx + off + 1) * ia) / 255);
-                    store8(spx + off + 2, (sr * sa + load8(spx + off + 2) * ia) / 255);
-                    store8(spx + off + 3, 255);
+                    var sa = a;
+                    var pa = (e >> 24) & 255;
+                    if (pa != 255) { sa = (a * pa) / 255; }
+                    var sr = (e >> 16) & 255;
+                    var sg = (e >> 8) & 255;
+                    var sb = e & 255;
+                    if (sa == 255) {
+                        store8(spx + off, sb);
+                        store8(spx + off + 1, sg);
+                        store8(spx + off + 2, sr);
+                        store8(spx + off + 3, 255);
+                    } else {
+                        var ia = 255 - sa;
+                        store8(spx + off, (sb * sa + load8(spx + off) * ia) / 255);
+                        store8(spx + off + 1, (sg * sa + load8(spx + off + 1) * ia) / 255);
+                        store8(spx + off + 2, (sr * sa + load8(spx + off + 2) * ia) / 255);
+                        store8(spx + off + 3, 255);
+                    }
                 }
             }
             if (tr >= cx) {
@@ -560,7 +1153,227 @@ fn sd_canvas_blit_paint_at(cv, surface, g, dx, dy): i64 {
     return SADISH_OK;
 }
 
+# 1 when radial-kind `g` (r = rad > 0) paints through the focal root — kind SD_GRADIENT_FOCAL with its
+# (clamped) focal point off the centre — after loading the per-blit focal constants; else 0 (a focal
+# point ON the centre is sd_gradient_radial). A <= 0 cannot happen for a clamped point inside the
+# bound; past it the focal point is ignored rather than dividing by it.
+fn _sd_paint_focal_of(g, ext, gx, gy, rad): i64 {
+    if (load64(g + SD_GRADIENT_KIND_OFFSET) != SD_GRADIENT_FOCAL) { return 0; }
+    var fex = gx - load64(ext + SD_GRADIENT_EXT_FX_OFFSET);
+    var fey = gy - load64(ext + SD_GRADIENT_EXT_FY_OFFSET);
+    if ((fex | fey) == 0) { return 0; }
+    var fa = rad * rad - fex * fex - fey * fey;
+    if (fa <= 0) { return 0; }
+    _sd_paint_focal_setup(fex, fey, fa);
+    return 1;
+}
+
+# sd_canvas_blit_paint_at for a radial or focal gradient (r > 0) whose pixels each need their own
+# gradient-space point q: the pixel centre, or under the matrix q = 2^16 adj(J) (p - (e, f)) / det held
+# as quotient + remainder / det — (mxq, mxr) / (myq, myr) at the row's first pixel, (pxq, pxr) / (pyq,
+# pyr) per pixel step, (rxq, rxr) / (ryq, ryr) per row, the *c = det - remainder carries exactly as
+# the linear DDA's — rounded to nearest where the remainder reaches mh = ceil(det / 2). `focal` = 1:
+# t from the focal root (constants already loaded by _sd_paint_focal_of), under PAD t >= 1 decided
+# by |q - c|^2 >= r^2; 0: the radial t. Clip, stride, spread, ramp and both stores are the loop
+# above's, `pm` included and meaning exactly the same thing there.
+fn _sd_paint_blit_point(cv, surface, g, dx, dy, focal, pm): i64 {
+    var ramp = load64(g + SD_GRADIENT_RAMP_OFFSET);
+    var spread = load64(g + SD_GRADIENT_SPREAD_OFFSET);
+    var ext = load64(g + SD_GRADIENT_EXT_OFFSET);
+    var cw = sd_canvas_width(cv);
+    var ch = sd_canvas_height(cv);
+    var covbuf = sd_canvas_coverage(cv);
+    var covstride = sd_canvas_stride(cv);
+    var sw = sd_surface_width(surface);
+    var sh = sd_surface_height(surface);
+    var spx = sd_surface_pixels(surface);
+    var pitch = sd_surface_stride(surface);
+    var x0 = 0;
+    if (dx < 0) { x0 = 0 - dx; }
+    var y0 = 0;
+    if (dy < 0) { y0 = 0 - dy; }
+    var x1 = cw;
+    if (dx + x1 > sw) { x1 = sw - dx; }
+    var y1 = ch;
+    if (dy + y1 > sh) { y1 = sh - dy; }
+
+    var gx = load64(g + SD_GRADIENT_A_OFFSET);
+    var gy = load64(g + SD_GRADIENT_B_OFFSET);
+    var rad = load64(g + SD_GRADIENT_C_OFFSET);
+    var rad2 = rad * rad;
+    var ffx = 0;
+    var ffy = 0;
+    if (focal != 0) {
+        ffx = load64(ext + SD_GRADIENT_EXT_FX_OFFSET);
+        ffy = load64(ext + SD_GRADIENT_EXT_FY_OFFSET);
+    }
+    var mapped = 0;
+    var mh = 0;
+    var mxq = 0;
+    var mxr = 0;
+    var myq = 0;
+    var myr = 0;
+    var pxq = 0;
+    var pxr = 0;
+    var pxc = 0;
+    var pyq = 0;
+    var pyr = 0;
+    var pyc = 0;
+    var rxq = 0;
+    var rxr = 0;
+    var rxc = 0;
+    var ryq = 0;
+    var ryr = 0;
+    var ryc = 0;
+    if (ext != 0) {
+        if (load64(ext + SD_GRADIENT_EXT_XFORM_OFFSET) == SD_GRADIENT_XFORM_MATRIX) { mapped = 1; }
+    }
+    if (mapped != 0) {
+        var ma = load64(ext + SD_GRADIENT_EXT_M_OFFSET);
+        var mb = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 8);
+        var mc = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 16);
+        var md = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 24);
+        var mdet = ma * md - mb * mc;
+        if (mdet < 0) {
+            # adj(J) / det == (-adj(J)) / |det|: negate the 2x2 so the divisor is positive.
+            mdet = 0 - mdet;
+            ma = 0 - ma;
+            mb = 0 - mb;
+            mc = 0 - mc;
+            md = 0 - md;
+        }
+        mh = mdet - (mdet >> 1);
+        var px0 = (x0 << SD_SHIFT) + (SD_ONE >> 1) - load64(ext + SD_GRADIENT_EXT_M_OFFSET + 32);
+        var py0 = (y0 << SD_SHIFT) + (SD_ONE >> 1) - load64(ext + SD_GRADIENT_EXT_M_OFFSET + 40);
+        mxq = _sd_paint_divq(md * px0 - mc * py0, mdet, 16);
+        mxr = _sd_paint_rem;
+        myq = _sd_paint_divq(ma * py0 - mb * px0, mdet, 16);
+        myr = _sd_paint_rem;
+        pxq = _sd_paint_divq(md, mdet, 32);
+        pxr = _sd_paint_rem;
+        pxc = mdet - pxr;
+        pyq = _sd_paint_divq(0 - mb, mdet, 32);
+        pyr = _sd_paint_rem;
+        pyc = mdet - pyr;
+        rxq = _sd_paint_divq(0 - mc, mdet, 32);
+        rxr = _sd_paint_rem;
+        rxc = mdet - rxr;
+        ryq = _sd_paint_divq(ma, mdet, 32);
+        ryr = _sd_paint_rem;
+        ryc = mdet - ryr;
+    }
+
+    var y = y0;
+    while (y < y1) {
+        var txq = mxq;
+        var txr = mxr;
+        var tyq = myq;
+        var tyr = myr;
+        var x = x0;
+        while (x < x1) {
+            var a = load8(covbuf + y * covstride + x);
+            if (a != 0) {
+                var qpx = (x << SD_SHIFT) + (SD_ONE >> 1);
+                var qpy = (y << SD_SHIFT) + (SD_ONE >> 1);
+                if (mapped != 0) {
+                    qpx = txq;
+                    if (txr >= mh) { qpx = qpx + 1; }
+                    qpy = tyq;
+                    if (tyr >= mh) { qpy = qpy + 1; }
+                }
+                var ocx = qpx - gx;
+                var ocy = qpy - gy;
+                var t16 = SD_ONE;
+                _sd_paint_rem = 0;
+                if (focal == 0) {
+                    t16 = _sd_paint_radial_t(ocx * ocx + ocy * ocy, rad);
+                } else {
+                    var inside = 1;
+                    if (spread == SD_SPREAD_PAD) {
+                        if (ocx * ocx + ocy * ocy >= rad2) { inside = 0; }
+                    }
+                    if (inside != 0) { t16 = _sd_paint_focal_t(qpx - ffx, qpy - ffy); }
+                }
+                var u16 = _sd_gradient_spread(spread, t16, _sd_paint_rem, SD_ONE);
+                var e = load32(ramp + (u16 >> 6) * 4);
+                if (e == 0) { e = _sd_gradient_eval(g, u16); }
+                var off = (y + dy) * pitch + (x + dx) * 4;
+                if (pm != 0) {
+                    _sd_premul_paint_px(spx + off, covbuf + y * covstride + x, e);
+                } else {
+                    var sa = a;
+                    var pa = (e >> 24) & 255;
+                    if (pa != 255) { sa = (a * pa) / 255; }
+                    var sr = (e >> 16) & 255;
+                    var sg = (e >> 8) & 255;
+                    var sb = e & 255;
+                    if (sa == 255) {
+                        store8(spx + off, sb);
+                        store8(spx + off + 1, sg);
+                        store8(spx + off + 2, sr);
+                        store8(spx + off + 3, 255);
+                    } else {
+                        var ia = 255 - sa;
+                        store8(spx + off, (sb * sa + load8(spx + off) * ia) / 255);
+                        store8(spx + off + 1, (sg * sa + load8(spx + off + 1) * ia) / 255);
+                        store8(spx + off + 2, (sr * sa + load8(spx + off + 2) * ia) / 255);
+                        store8(spx + off + 3, 255);
+                    }
+                }
+            }
+            if (mapped != 0) {
+                if (txr >= pxc) {
+                    txr = txr - pxc;
+                    txq = txq + pxq + 1;
+                } else {
+                    txr = txr + pxr;
+                    txq = txq + pxq;
+                }
+                if (tyr >= pyc) {
+                    tyr = tyr - pyc;
+                    tyq = tyq + pyq + 1;
+                } else {
+                    tyr = tyr + pyr;
+                    tyq = tyq + pyq;
+                }
+            }
+            x = x + 1;
+        }
+        if (mapped != 0) {
+            if (mxr >= rxc) {
+                mxr = mxr - rxc;
+                mxq = mxq + rxq + 1;
+            } else {
+                mxr = mxr + rxr;
+                mxq = mxq + rxq;
+            }
+            if (myr >= ryc) {
+                myr = myr - ryc;
+                myq = myq + ryq + 1;
+            } else {
+                myr = myr + ryr;
+                myq = myq + ryq;
+            }
+        }
+        y = y + 1;
+    }
+    return SADISH_OK;
+}
+
+# @public — composite the canvas coverage onto `surface` through the gradient paint `g`, the canvas's
+# (0,0) at surface pixel (dx, dy). Source alpha = coverage * paint_alpha / 255; src-over as
+# sd_canvas_blit_at: every pixel with coverage != 0 is written, dst alpha byte 255. Clipped on every
+# side; rows by sd_surface_stride. Returns SADISH_OK (also for a gradient with no stops, or one whose
+# matrix is blocked, which paint nothing), or SADISH_ERR_BOUNDS for a null cv / surface / g.
+# ⚠ For a surface with REAL alpha — a translucent window agnos composites with #92 — this is the
+# wrong compositor (it forces dst alpha 255): sd_canvas_blit_paint_premul_at in src/premul.cyr paints
+# the same PAINT, pixel for pixel — the same t and the same colour, not the same composited bytes
+# (the two stores round differently; the ⚠ bound is on that function).
+fn sd_canvas_blit_paint_at(cv, surface, g, dx, dy): i64 {
+    return _sd_paint_blit_run(cv, surface, g, dx, dy, 0);
+}
+
 # @public — sd_canvas_blit_paint_at with the canvas at the surface origin.
 fn sd_canvas_blit_paint(cv, surface, g): i64 {
-    return sd_canvas_blit_paint_at(cv, surface, g, 0, 0);
+    return _sd_paint_blit_run(cv, surface, g, 0, 0, 0);
 }

@@ -142,6 +142,76 @@ fn sd_matrix_mul(m, n): i64 {
     return sd_matrix_new(ra, rb, rc, rd, re, rf);
 }
 
+# round(n * 2^k / b) to the nearest integer, halves away from zero, for b != 0 and 0 <= k <= 61.
+# Restoring long division to k + 1 fraction bits, so no intermediate exceeds |b| (a remainder is
+# doubled only when that stays below |b|) — exact as long as the rounded quotient itself fits i64.
+# ⚠ |n| and |b| must be below 2^63 (neither may be the i64 minimum).
+fn _sd_geom_divround(n, b, k): i64 {
+    var num = n;
+    var den = b;
+    if (den < 0) {
+        den = 0 - den;
+        num = 0 - num;
+    }
+    var neg = 0;
+    if (num < 0) {
+        num = 0 - num;
+        neg = 1;
+    }
+    var q = num / den;
+    var rem = num - q * den;
+    var i = 0;
+    while (i <= k) {
+        q = q << 1;
+        if (rem >= den - rem) {
+            rem = rem - (den - rem);
+            q = q + 1;
+        } else {
+            rem = rem + rem;
+        }
+        i = i + 1;
+    }
+    # q = floor(2x) for x = |n| 2^k / |b|; floor(x + 1/2) = (q + 1) >> 1.
+    q = (q + 1) >> 1;
+    if (neg != 0) { return 0 - q; }
+    return q;
+}
+
+# @public — the inverse of affine `m` as a NEW SdMatrix (sd_alloc), or 0 when `m` is SINGULAR
+# (a*d - b*c == 0 in raw units — exactly, no tolerance) or the allocation fails.
+#   · Each entry is the EXACT inverse's entry rounded to the nearest raw unit (2^-16), halves away
+#     from zero: the linear part is adj(m) * 2^32 / det, the translation -m^-1 (e, f) is taken from
+#     the exact rational (c*f - d*e, b*e - a*f) * 2^16 / det, never from the rounded linear part.
+#     So a matrix whose inverse is representable (identity, translations, power-of-two scales,
+#     quarter-turns) inverts EXACTLY.
+#   · ⚠ Composing back is not exact: sd_matrix_mul floors every product. Per entry, with the
+#     16.16 entries of m read as reals, |m * inv(m) - I| < 2 + (|a| + |b| + |c| + |d|) / 2 raw units
+#     (translation included), and |inv(m) * m - I| < 3 + (|a| + |b| + |c| + |d| + |e| + |f|) / 2 —
+#     the inverse's rounding is scaled by the matrix it multiplies. programs/paint_focal_test.cyr
+#     asserts both bounds and the exact cases.
+#   ⚠ PRECISION BOUND: every entry of m within ±32,768.0 (raw magnitude < 2^31), so det and the
+#     translation numerators stay < 2^63. A nearly singular m (|det| tiny) has inverse entries past
+#     i64 — wrong values, never a trap.
+fn sd_matrix_invert(m): i64 {
+    var a = load64(m + SD_MAT_A_OFFSET);
+    var b = load64(m + SD_MAT_B_OFFSET);
+    var c = load64(m + SD_MAT_C_OFFSET);
+    var d = load64(m + SD_MAT_D_OFFSET);
+    var e = load64(m + SD_MAT_E_OFFSET);
+    var f = load64(m + SD_MAT_F_OFFSET);
+    var det = a * d - b * c;
+    if (det == 0) { return 0; }
+    var r = sd_alloc(SD_MATRIX_SIZE);
+    if (r == 0) { return 0; }
+    store64(r + SD_MAT_A_OFFSET, _sd_geom_divround(d, det, 32));
+    store64(r + SD_MAT_B_OFFSET, _sd_geom_divround(0 - b, det, 32));
+    store64(r + SD_MAT_C_OFFSET, _sd_geom_divround(0 - c, det, 32));
+    store64(r + SD_MAT_D_OFFSET, _sd_geom_divround(a, det, 32));
+    store64(r + SD_MAT_E_OFFSET, _sd_geom_divround(c * f - d * e, det, 16));
+    store64(r + SD_MAT_F_OFFSET, _sd_geom_divround(b * e - a * f, det, 16));
+    return r;
+}
+
 # @public — apply an affine transform to a point, returning a new SdPoint.
 # (x, y) -> (a*x + c*y + e,  b*x + d*y + f). All 16.16.
 fn sd_matrix_apply(m, pt): i64 {

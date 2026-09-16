@@ -1,0 +1,2588 @@
+# programs/paint_focal_test.cyr — RUN test for the focal radial gradient and gradient transforms
+# (src/paint.cyr) and sd_matrix_invert (src/geom.cyr):
+#   A. a focal gradient whose focal point is the centre IS sd_gradient_radial, byte for byte;
+#   B. t = 0 exactly at the focal pixel, t = 1 exactly on the circle (at twelve angles);
+#   C. floor(t * 2^16) and its fraction flag against an INDEPENDENT bignum root, directly and through
+#      single-pixel blits;
+#   D. geometry: symmetry about the c-f axis (either axis), monotone rays, REPEAT / REFLECT periods,
+#      and the focal clamp at BOTH scales — small radii, and radii large enough that the offset's own
+#      halving would hide a clamp decided on the shortened length;
+#   E. degenerate geometry and bad arguments;
+#   F. matrix 0 and identity are the untransformed paint, byte for byte, and allocate nothing — and a
+#      matrix that differs from the identity in ONE entry is a real transform;
+#   G. exact transforms (translation, quarter-turn, 2x scale) against the moved geometry, the MEASURED
+#      error of rotate(30°) x scale(2) against exact rationals, and degeneracy on BOTH axes;
+#   H. singular / out-of-range matrices paint nothing;
+#   I. a wrapped surface and clipping on every side under a transform;
+#   J. allocation: exact figures for focal gradients and set_matrix, 0 B blits;
+#   K. OOM: every constructor allocation, stop-block growth, the matrix extension;
+#   L. sd_matrix_invert;
+#   M. the 128-bit helpers against the bignum;
+#   N. the ROUNDING, exactly: under matrices whose inverses are not representable, the paint is exact
+#      for the rounded canvas axis and the nearest-raw gradient-space point — short axes, tiny radii
+#      and two step sequences found by search, where the rounding is decided at its boundary;
+#   O. nothing traps: the focal root over the whole i64 range of garbage, and blits of absurd geometry.
+#
+# ⚠ Coverage is written by hand (memset / store8), as in paint_test: no fill scratch lands in an
+# allocation window and every expected byte is the paint's.
+# ⚠ The bignum (wz_*) is base-2^16 schoolbook on sign + magnitude — no code shared with paint.cyr's
+# 32-bit-halves arithmetic, its normalization, or its Newton root. References are "the largest integer
+# with <polynomial> <= 0", found by binary search, so they need no square root at all.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "paint_focal_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- hooks ---------------------------------------------------------------------------------------
+var g_arena = 0;
+var g_budget = 0;
+
+fn hook_alloc(n): i64 {
+    return arena_alloc(g_arena, n);
+}
+
+var g_fail_at = 0 - 1;
+var g_alloc_i = 0;
+
+# Fails once g_budget allocations have been served — or, with g_fail_at >= 0, fails ONLY the allocation
+# numbered g_fail_at (counting from 0 in g_alloc_i) and serves every other.
+fn hook_budget(n): i64 {
+    if (g_fail_at >= 0) {
+        var i = g_alloc_i;
+        g_alloc_i = i + 1;
+        if (i == g_fail_at) { return 0; }
+        return arena_alloc(g_arena, n);
+    }
+    if (g_budget <= 0) { return 0; }
+    g_budget = g_budget - 1;
+    return arena_alloc(g_arena, n);
+}
+
+# ---- helpers -------------------------------------------------------------------------------------
+var RGB_MASK = 16777215;
+var HALF = 32768;
+
+fn pf_full(w, h): i64 {
+    var cv = sd_canvas_new(w, h);
+    memset(sd_canvas_coverage(cv), 255, w * h);
+    return cv;
+}
+
+# Patterned coverage (some 0, some partial, some full).
+fn pf_cov_pattern(cv, w, h): i64 {
+    var cov = sd_canvas_coverage(cv);
+    var i = 0;
+    while (i < w * h) {
+        store8(cov + i, (i * 37 + 11) & 255);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn pf_fill_pattern(s, n, seed): i64 {
+    var px = sd_surface_pixels(s);
+    var i = 0;
+    while (i < n) {
+        store8(px + i, (i * 7 + seed) & 255);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn pf_diff(pa, pb, n): i64 {
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(pa + i) != load8(pb + i)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn pf_ne(s, x, y, x2, y2): i64 {
+    if (sd_surface_pixel_at(s, x, y) != sd_surface_pixel_at(s, x2, y2)) { return 1; }
+    return 0;
+}
+
+fn pf_zigzag(g): i64 {
+    var j = 0;
+    while (j < 4) {
+        sd_gradient_add_stop(g, j * 16384, sd_rgb(j * 60, 0, 0));
+        sd_gradient_add_stop(g, j * 16384 + 16320, sd_rgb(j * 60, 0, 255));
+        j = j + 1;
+    }
+    sd_gradient_add_stop(g, SD_ONE, sd_rgb(240, 0, 0));
+    return 0;
+}
+
+fn pf_red_blue(g): i64 {
+    sd_gradient_add_stop(g, 0, sd_rgb(255, 0, 0));
+    sd_gradient_add_stop(g, SD_ONE, sd_rgb(0, 0, 255));
+    return 0;
+}
+
+# Blit g onto a fresh patterned surface through cv; returns the surface.
+fn pf_paint(cv, w, h, g): i64 {
+    var s = sd_surface_new(w, h);
+    pf_fill_pattern(s, w * h * 4, 13);
+    sd_canvas_blit_paint(cv, s, g);
+    return s;
+}
+
+# Differing bytes between g1 and g2 painted through cv (w x h) over the same patterned destination.
+fn pf_paint_diff(cv, w, h, g1, g2): i64 {
+    var s1 = pf_paint(cv, w, h, g1);
+    var s2 = pf_paint(cv, w, h, g2);
+    return pf_diff(sd_surface_pixels(s1), sd_surface_pixels(s2), w * h * 4);
+}
+
+var g_seed = 1234567;
+
+fn pf_rnd(m): i64 {
+    g_seed = g_seed * 6364136223846793005 + 1442695040888963407;
+    return ((g_seed >> 33) & 2147483647) % m;
+}
+
+# A random value in [0, 2^bits) for bits up to 62.
+fn pf_rndbits(bits): i64 {
+    var v = (pf_rnd(2147483647) << 31) | pf_rnd(2147483647);
+    if (bits >= 62) { return v; }
+    return v & ((1 << bits) - 1);
+}
+
+# ================================================================================================
+# wz — signed bignums, base 2^16, WZ_NL limbs: slot 0 the sign (0 / 1), slots 1..WZ_NL the magnitude.
+# ================================================================================================
+var WZ_NL = 20;
+var g_wtmp = 0;
+var g_wtmp2 = 0;
+
+fn wz_new(): i64 {
+    var p = alloc((WZ_NL + 1) * 8);
+    memset(p, 0, (WZ_NL + 1) * 8);
+    return p;
+}
+
+fn wz_limb(p, i): i64 { return load64(p + 8 + i * 8); }
+
+fn wz_set(p, v): i64 {
+    memset(p, 0, (WZ_NL + 1) * 8);
+    var m = v;
+    if (v < 0) {
+        store64(p, 1);
+        m = 0 - v;
+    }
+    var i = 0;
+    while (i < 4) {
+        store64(p + 8 + i * 8, (m >> (16 * i)) & 65535);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn wz_copy(d, s): i64 {
+    memcpy(d, s, (WZ_NL + 1) * 8);
+    return 0;
+}
+
+fn wz_len(p): i64 {
+    var n = WZ_NL;
+    while (n > 0) {
+        if (wz_limb(p, n - 1) != 0) { return n; }
+        n = n - 1;
+    }
+    return 0;
+}
+
+fn wz_magcmp(a, b): i64 {
+    var i = WZ_NL - 1;
+    while (i >= 0) {
+        var x = wz_limb(a, i);
+        var y = wz_limb(b, i);
+        if (x > y) { return 1; }
+        if (x < y) { return 0 - 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+# |d| = |a| + |b| (d may alias either).
+fn wz_magadd(d, a, b): i64 {
+    var c = 0;
+    var i = 0;
+    while (i < WZ_NL) {
+        var s = wz_limb(a, i) + wz_limb(b, i) + c;
+        store64(d + 8 + i * 8, s & 65535);
+        c = s >> 16;
+        i = i + 1;
+    }
+    return 0;
+}
+
+# |d| = |a| - |b| for |a| >= |b| (d may alias either).
+fn wz_magsub(d, a, b): i64 {
+    var br = 0;
+    var i = 0;
+    while (i < WZ_NL) {
+        var s = wz_limb(a, i) - wz_limb(b, i) - br;
+        br = 0;
+        if (s < 0) {
+            s = s + 65536;
+            br = 1;
+        }
+        store64(d + 8 + i * 8, s);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn wz_fixzero(p): i64 {
+    if (wz_len(p) == 0) { store64(p, 0); }
+    return 0;
+}
+
+# d = a + b, signed (d may alias either).
+fn wz_add(d, a, b): i64 {
+    var sa = load64(a);
+    var sb = load64(b);
+    if (sa == sb) {
+        wz_magadd(d, a, b);
+        store64(d, sa);
+    } else {
+        if (wz_magcmp(a, b) >= 0) {
+            wz_magsub(d, a, b);
+            store64(d, sa);
+        } else {
+            wz_magsub(d, b, a);
+            store64(d, sb);
+        }
+    }
+    wz_fixzero(d);
+    return 0;
+}
+
+# d = a - b (d may alias a; not b).
+fn wz_sub(d, a, b): i64 {
+    wz_copy(g_wtmp2, b);
+    if (wz_len(b) != 0) { store64(g_wtmp2, 1 - load64(b)); }
+    wz_add(d, a, g_wtmp2);
+    return 0;
+}
+
+# d = a * b (d may alias either — the product is built in g_wtmp).
+fn wz_mul(d, a, b): i64 {
+    memset(g_wtmp, 0, (WZ_NL + 1) * 8);
+    var la = wz_len(a);
+    var lb = wz_len(b);
+    var i = 0;
+    while (i < la) {
+        var ai = wz_limb(a, i);
+        if (ai != 0) {
+            var c = 0;
+            var j = 0;
+            while (j < lb) {
+                if (i + j < WZ_NL) {
+                    var cur = load64(g_wtmp + 8 + (i + j) * 8) + ai * wz_limb(b, j) + c;
+                    store64(g_wtmp + 8 + (i + j) * 8, cur & 65535);
+                    c = cur >> 16;
+                }
+                j = j + 1;
+            }
+            var k = i + lb;
+            while (c != 0) {
+                if (k < WZ_NL) {
+                    var cur2 = load64(g_wtmp + 8 + k * 8) + c;
+                    store64(g_wtmp + 8 + k * 8, cur2 & 65535);
+                    c = cur2 >> 16;
+                } else {
+                    c = 0;
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    var sg = load64(a) ^ load64(b);
+    wz_copy(d, g_wtmp);
+    store64(d, sg);
+    wz_fixzero(d);
+    return 0;
+}
+
+# d = a * 2^k (k >= 0; d may alias a).
+fn wz_shl(d, a, k): i64 {
+    var q = k / 16;
+    var r = k % 16;
+    var sg = load64(a);
+    memset(g_wtmp, 0, (WZ_NL + 1) * 8);
+    var i = 0;
+    while (i < WZ_NL) {
+        var v = wz_limb(a, i) << r;
+        if (i + q < WZ_NL) {
+            store64(g_wtmp + 8 + (i + q) * 8, load64(g_wtmp + 8 + (i + q) * 8) | (v & 65535));
+        }
+        if (i + q + 1 < WZ_NL) {
+            store64(g_wtmp + 8 + (i + q + 1) * 8, load64(g_wtmp + 8 + (i + q + 1) * 8) | (v >> 16));
+        }
+        i = i + 1;
+    }
+    wz_copy(d, g_wtmp);
+    store64(d, sg);
+    wz_fixzero(d);
+    return 0;
+}
+
+# Sign of p: -1, 0, 1.
+fn wz_sign(p): i64 {
+    if (wz_len(p) == 0) { return 0; }
+    if (load64(p) != 0) { return 0 - 1; }
+    return 1;
+}
+
+# The low 64 bits of |p| (for values known to fit).
+fn wz_low64(p): i64 {
+    return wz_limb(p, 0) | (wz_limb(p, 1) << 16) | (wz_limb(p, 2) << 32) | (wz_limb(p, 3) << 48);
+}
+
+var w_a = 0;
+var w_b = 0;
+var w_c = 0;
+var w_d = 0;
+var w_e = 0;
+var w_f = 0;
+var w_t = 0;
+var w_u = 0;
+var w_v = 0;
+var w_x = 0;
+var w_y = 0;
+var w_z = 0;
+var w_A = 0;
+var w_B = 0;
+var w_L = 0;
+var w_dx = 0;
+var w_dy = 0;
+var w_ex = 0;
+var w_ey = 0;
+
+fn wz_init(): i64 {
+    g_wtmp = wz_new();
+    g_wtmp2 = wz_new();
+    w_a = wz_new();
+    w_b = wz_new();
+    w_c = wz_new();
+    w_d = wz_new();
+    w_e = wz_new();
+    w_f = wz_new();
+    w_t = wz_new();
+    w_u = wz_new();
+    w_v = wz_new();
+    w_x = wz_new();
+    w_y = wz_new();
+    w_z = wz_new();
+    w_A = wz_new();
+    w_B = wz_new();
+    w_L = wz_new();
+    w_dx = wz_new();
+    w_dy = wz_new();
+    w_ex = wz_new();
+    w_ey = wz_new();
+    return 0;
+}
+
+# ---- references: "the largest integer X with P(X) <= 0" for a P increasing past its root ---------
+# g_ref_mode picks P; ref_search(lo, hi, hint) returns that X in [lo, hi) — first testing whether
+# `hint` is it (P(hint) <= 0 < P(hint + 1), two evaluations), else by binary search. The hint only
+# saves time: whatever it says, the answer is decided by the bignum's signs. g_ref_frac = 1 unless
+# P(X) == 0 (t * 2^16 an exact integer).
+var g_ref_mode = 0;
+var g_ref_frac = 0;
+
+# The sign of P(X) for the loaded constants:
+#   mode 0 (focal):  A X^2 + w_B X - w_L, with w_B = 2^17 d·e, w_L = 2^32 |d|^2;
+#   mode 1 (radial): (X w_B)^2 - w_L, with w_B = D r, w_L = 2^32 |G|^2;
+#   mode 2 (linear): X w_B - w_L, with w_B = D |v|^2, w_L = 2^16 (Q - D p0)·v.
+fn ref_sign(t): i64 {
+    wz_set(w_t, t);
+    if (g_ref_mode == 0) {
+        wz_mul(w_u, w_t, w_t);
+        wz_mul(w_u, w_u, w_A);
+        wz_mul(w_v, w_B, w_t);
+        wz_add(w_u, w_u, w_v);
+    }
+    if (g_ref_mode == 1) {
+        wz_mul(w_u, w_B, w_t);
+        wz_mul(w_u, w_u, w_u);
+    }
+    if (g_ref_mode == 2) {
+        wz_mul(w_u, w_B, w_t);
+    }
+    wz_sub(w_u, w_u, w_L);
+    return wz_sign(w_u);
+}
+
+fn ref_search(lo0, hi0, hint): i64 {
+    var lo = lo0;
+    var hi = hi0;
+    var found = 0;
+    if (hint >= lo0) {
+        if (hint < hi0 - 1) {
+            if (ref_sign(hint) <= 0) {
+                if (ref_sign(hint + 1) > 0) {
+                    lo = hint;
+                    found = 1;
+                }
+            }
+        }
+    }
+    if (found == 0) {
+        while (hi - lo > 1) {
+            var mid = lo + ((hi - lo) >> 1);
+            if (ref_sign(mid) <= 0) { lo = mid; } else { hi = mid; }
+        }
+    }
+    g_ref_frac = 1;
+    if (ref_sign(lo) == 0) { g_ref_frac = 0; }
+    return lo;
+}
+
+# Focal: with w_dx, w_dy (d = p - f), w_ex, w_ey (e = c - f) and w_A (r^2 - |e|^2 > 0) loaded, the
+# largest T in [0, 2^hb) with A T^2 + 2^17 (d·e) T - 2^32 |d|^2 <= 0: floor(t * 2^16) by the quadratic's
+# sign change.
+fn ref_focal_loaded(hb, hint): i64 {
+    wz_mul(w_x, w_dx, w_ex);
+    wz_mul(w_y, w_dy, w_ey);
+    wz_add(w_B, w_x, w_y);
+    wz_shl(w_B, w_B, 17);
+    wz_mul(w_x, w_dx, w_dx);
+    wz_mul(w_y, w_dy, w_dy);
+    wz_add(w_L, w_x, w_y);
+    wz_shl(w_L, w_L, 32);
+    if (wz_len(w_L) == 0) {
+        g_ref_frac = 0;
+        return 0;
+    }
+    g_ref_mode = 0;
+    return ref_search(0, 1 << hb, hint);
+}
+
+fn ref_focal_i64(dx, dy, ex, ey, a, hint): i64 {
+    wz_set(w_dx, dx);
+    wz_set(w_dy, dy);
+    wz_set(w_ex, ex);
+    wz_set(w_ey, ey);
+    wz_set(w_A, a);
+    return ref_focal_loaded(58, hint);
+}
+
+# ---- mapped references: q = 2^16 U / D, U = adj(J) (p - (e, f)) with the 2x2 negated when det < 0 ----
+# Loads w_dx, w_dy with Q - D * (px0, py0) for a gradient-space point (px0, py0) — the scaled d.
+var g_mD = 0;
+
+fn ref_map_load(m, px, py, ox, oy): i64 {
+    var a = load64(m + SD_MAT_A_OFFSET);
+    var b = load64(m + SD_MAT_B_OFFSET);
+    var c = load64(m + SD_MAT_C_OFFSET);
+    var d = load64(m + SD_MAT_D_OFFSET);
+    var det = a * d - b * c;
+    if (det < 0) {
+        det = 0 - det;
+        a = 0 - a;
+        b = 0 - b;
+        c = 0 - c;
+        d = 0 - d;
+    }
+    g_mD = det;
+    var rx = px - load64(m + SD_MAT_E_OFFSET);
+    var ry = py - load64(m + SD_MAT_F_OFFSET);
+    # w_dx = 2^16 (d rx - c ry) - D ox
+    wz_set(w_x, d);
+    wz_set(w_y, rx);
+    wz_mul(w_dx, w_x, w_y);
+    wz_set(w_x, c);
+    wz_set(w_y, ry);
+    wz_mul(w_x, w_x, w_y);
+    wz_sub(w_dx, w_dx, w_x);
+    wz_shl(w_dx, w_dx, 16);
+    wz_set(w_x, det);
+    wz_set(w_y, ox);
+    wz_mul(w_x, w_x, w_y);
+    wz_sub(w_dx, w_dx, w_x);
+    # w_dy = 2^16 (a ry - b rx) - D oy
+    wz_set(w_x, a);
+    wz_set(w_y, ry);
+    wz_mul(w_dy, w_x, w_y);
+    wz_set(w_x, b);
+    wz_set(w_y, rx);
+    wz_mul(w_x, w_x, w_y);
+    wz_sub(w_dy, w_dy, w_x);
+    wz_shl(w_dy, w_dy, 16);
+    wz_set(w_x, det);
+    wz_set(w_y, oy);
+    wz_mul(w_x, w_x, w_y);
+    wz_sub(w_dy, w_dy, w_x);
+    return 0;
+}
+
+# floor(t * 2^16) of a radial gradient (cx, cy, r) under m at canvas raw point (px, py), exactly: the
+# largest X >= 0 with (X D r)^2 <= 2^32 |Q - D c|^2.
+fn ref_map_radial(m, px, py, cx, cy, r, hint): i64 {
+    ref_map_load(m, px, py, cx, cy);
+    wz_mul(w_x, w_dx, w_dx);
+    wz_mul(w_y, w_dy, w_dy);
+    wz_add(w_L, w_x, w_y);
+    wz_shl(w_L, w_L, 32);
+    wz_set(w_x, g_mD);
+    wz_set(w_y, r);
+    wz_mul(w_B, w_x, w_y);
+    g_ref_mode = 1;
+    return ref_search(0, 1 << 40, hint);
+}
+
+# floor(t * 2^16) of a focal gradient (c, r, f — f already clamped) under m at (px, py): d' = Q - D f,
+# e' = D (c - f), A' = D^2 (r^2 - |c - f|^2) — t is homogeneous of degree 0 in (d, e, sqrt(A)).
+fn ref_map_focal(m, px, py, cx, cy, r, fx, fy, hint): i64 {
+    ref_map_load(m, px, py, fx, fy);
+    var ex = cx - fx;
+    var ey = cy - fy;
+    wz_set(w_x, g_mD);
+    wz_set(w_y, ex);
+    wz_mul(w_ex, w_x, w_y);
+    wz_set(w_y, ey);
+    wz_mul(w_ey, w_x, w_y);
+    wz_mul(w_A, w_x, w_x);
+    wz_set(w_y, r * r - ex * ex - ey * ey);
+    wz_mul(w_A, w_A, w_y);
+    return ref_focal_loaded(40, hint);
+}
+
+# floor(t * 2^16) of a linear gradient (x0, y0) -> (x1, y1) under m at (px, py): the largest X with
+# X D |v|^2 <= 2^16 (Q - D p0) · v.
+fn ref_map_linear(m, px, py, x0, y0, x1, y1, hint): i64 {
+    ref_map_load(m, px, py, x0, y0);
+    var vx = x1 - x0;
+    var vy = y1 - y0;
+    wz_set(w_x, vx);
+    wz_mul(w_x, w_dx, w_x);
+    wz_set(w_y, vy);
+    wz_mul(w_y, w_dy, w_y);
+    wz_add(w_L, w_x, w_y);
+    wz_shl(w_L, w_L, 16);
+    wz_set(w_x, g_mD);
+    wz_set(w_y, vx * vx + vy * vy);
+    wz_mul(w_B, w_x, w_y);
+    g_ref_mode = 2;
+    return ref_search(0 - (1 << 40), 1 << 40, hint);
+}
+
+# floor(a / b) for b > 0 (Cyrius '/' truncates toward zero).
+fn pf_fdiv(a, b): i64 {
+    var q = a / b;
+    if (q * b > a) { q = q - 1; }
+    return q;
+}
+
+# The documented canvas-space axis of linear (x0, y0) + (vx, vy) under m, independently: P0 = m(p0)
+# with each product sum rounded to nearest (halves up), V = |v|^2 det w / (2^16 |w|^2) for
+# w = (d vx - b vy, a vy - c vx), each component rounded to nearest (halves away from zero) by an exact
+# bignum division. Into g_px0, g_py0, g_vx, g_vy.
+var g_px0 = 0;
+var g_py0 = 0;
+var g_vx = 0;
+var g_vy = 0;
+
+fn ref_axis_comp(det, l2v, w): i64 {
+    var dm = det;
+    if (dm < 0) { dm = 0 - dm; }
+    var wm = w;
+    if (wm < 0) { wm = 0 - wm; }
+    wz_set(w_a, l2v);
+    wz_set(w_b, dm);
+    wz_mul(w_c, w_a, w_b);
+    wz_set(w_b, wm);
+    wz_mul(w_c, w_c, w_b);
+    wz_add(w_L, w_c, w_c);
+    wz_add(w_L, w_L, w_z);
+    wz_add(w_B, w_z, w_z);
+    g_ref_mode = 2;
+    var v = ref_search(0, 1 << 40, 0 - 1);
+    if ((w < 0) != (det < 0)) { v = 0 - v; }
+    return v;
+}
+
+fn ref_axis(m, x0, y0, vx, vy): i64 {
+    var a = load64(m + SD_MAT_A_OFFSET);
+    var b = load64(m + SD_MAT_B_OFFSET);
+    var c = load64(m + SD_MAT_C_OFFSET);
+    var d = load64(m + SD_MAT_D_OFFSET);
+    g_px0 = pf_fdiv(a * x0 + c * y0 + 32768, 65536) + load64(m + SD_MAT_E_OFFSET);
+    g_py0 = pf_fdiv(b * x0 + d * y0 + 32768, 65536) + load64(m + SD_MAT_F_OFFSET);
+    var det = a * d - b * c;
+    var wx = d * vx - b * vy;
+    var wy = a * vy - c * vx;
+    # w_z = 2^16 |w|^2
+    wz_set(w_d, wx);
+    wz_mul(w_d, w_d, w_d);
+    wz_set(w_e, wy);
+    wz_mul(w_e, w_e, w_e);
+    wz_add(w_z, w_d, w_e);
+    wz_shl(w_z, w_z, 16);
+    g_vx = ref_axis_comp(det, vx * vx + vy * vy, wx);
+    g_vy = ref_axis_comp(det, vx * vx + vy * vy, wy);
+    return 0;
+}
+
+# ---- single-pixel brackets (as paint_test's pt_bracket) ------------------------------------------
+# Geometry of the gradient pf_make builds: kind g_gk (0 linear, 1 radial, 2 focal), numbers g_g0..g_g4
+# (x0 y0 x1 y1 | cx cy r | cx cy r fx fy), spread g_gsp, matrix g_gm (0 = none).
+var g_gk = 0;
+var g_g0 = 0;
+var g_g1 = 0;
+var g_g2 = 0;
+var g_g3 = 0;
+var g_g4 = 0;
+var g_gsp = 0;
+var g_gm = 0;
+
+fn pf_make(): i64 {
+    var g = 0;
+    if (g_gk == 0) { g = sd_gradient_linear(g_g0, g_g1, g_g2, g_g3); }
+    if (g_gk == 1) { g = sd_gradient_radial(g_g0, g_g1, g_g2); }
+    if (g_gk == 2) { g = sd_gradient_radial_focal(g_g0, g_g1, g_g2, g_g3, g_g4); }
+    sd_gradient_set_spread(g, g_gsp);
+    if (g_gm != 0) { sd_gradient_set_matrix(g, g_gm); }
+    return g;
+}
+
+# Canvas pixel (px, py) — its only covered pixel — painted at (dx, dy) with a hard red|blue stop at o.
+fn pf_hard(cv, s, o, px, py, dx, dy): i64 {
+    arena_reset(g_arena);
+    var g = pf_make();
+    sd_gradient_add_stop(g, o, sd_rgb(255, 0, 0));
+    sd_gradient_add_stop(g, o, sd_rgb(0, 0, 255));
+    sd_canvas_blit_paint_at(cv, s, g, dx, dy);
+    return sd_surface_pixel_at(s, px + dx, py + dy);
+}
+
+fn pf_bracket(cv, s, tp, px, py, dx, dy): i64 {
+    var RED = sd_rgb(255, 0, 0);
+    var BLUE = sd_rgb(0, 0, 255);
+    var bad = 0;
+    if (pf_hard(cv, s, tp, px, py, dx, dy) != BLUE) { bad = bad + 1; }
+    if (tp < 65536) {
+        if (pf_hard(cv, s, tp + 1, px, py, dx, dy) != RED) { bad = bad + 1; }
+    }
+    var cb = (tp >> 6) << 6;
+    if (pf_hard(cv, s, cb, px, py, dx, dy) != BLUE) { bad = bad + 1; }
+    if (cb < 65536) {
+        if (pf_hard(cv, s, cb + 64, px, py, dx, dy) != RED) { bad = bad + 1; }
+    }
+    return bad;
+}
+
+# The spread-mapped floor parameter the blit used for canvas pixel (px, py): the largest stop offset
+# o in [0, 65536] that still paints it BLUE (17 blits, each touching one pixel).
+fn pf_find_t(cv, s, px, py, dx, dy): i64 {
+    var BLUE = sd_rgb(0, 0, 255);
+    var lo = 0;
+    var hi = 65537;
+    while (hi - lo > 1) {
+        var mid = lo + ((hi - lo) >> 1);
+        if (pf_hard(cv, s, mid, px, py, dx, dy) == BLUE) { lo = mid; } else { hi = mid; }
+    }
+    return lo;
+}
+
+fn pf_spread_ref(spread, t, frac): i64 {
+    if (spread == SD_SPREAD_PAD) {
+        if (t < 0) { return 0; }
+        if (t > 65536) { return 65536; }
+        return t;
+    }
+    if (spread == SD_SPREAD_REPEAT) { return t & 65535; }
+    var m = t & 131071;
+    if (m > 65536) { return 131072 - m - frac; }
+    if (m == 65536) {
+        if (frac != 0) { return 65535; }
+    }
+    return m;
+}
+
+# The number of bits of v >= 0 (0 for v == 0), by repeated halving — nothing in common with
+# _sd_paint_bitlen's cascade.
+fn pf_bitlen(v): i64 {
+    var n = 0;
+    var x = v;
+    while (x > 0) {
+        n = n + 1;
+        x = x >> 1;
+    }
+    return n;
+}
+
+# The focal clamp, computed independently: the stored focal point of (cx, cy, r, fx, fy), at ANY offset
+# scale (components within 62 bits). lim = floor(r (1 - 2^-10)), r capped at 2^31 - 1. Whether the
+# offset is longer than lim is settled at the offset's own scale — a component past lim decides it, and
+# otherwise both are <= lim and the squares fit — and the halving that follows (h from the bit lengths,
+# not a loop) only supplies the direction.
+fn pf_clamp_x(cx, cy, r, fx, fy, want_y): i64 {
+    var vx = fx - cx;
+    var vy = fy - cy;
+    if (r > 0) {
+        var rr = r;
+        if (rr > 2147483647) { rr = 2147483647; }
+        var lim = (rr * 1023) / 1024;
+        var over = 0;
+        if (sd_abs(vx) > lim) { over = 1; }
+        if (sd_abs(vy) > lim) { over = 1; }
+        if (over == 0) {
+            if (vx * vx + vy * vy > lim * lim) { over = 1; }
+        }
+        if (over != 0) {
+            var bl = pf_bitlen(sd_abs(vx));
+            var b2 = pf_bitlen(sd_abs(vy));
+            if (b2 > bl) { bl = b2; }
+            var h = 0;
+            if (bl > 30) { h = bl - 30; }
+            var hx = sd_asr(vx, h);
+            var hy = sd_asr(vy, h);
+            var lv = hx * hx + hy * hy;
+            var len = sd_isqrt(lv);
+            if (len * len < lv) { len = len + 1; }
+            vx = (hx * lim) / len;
+            vy = (hy * lim) / len;
+        }
+    }
+    if (want_y != 0) { return cy + vy; }
+    return cx + vx;
+}
+
+# Build sd_gradient_radial_focal(cx, cy, r, fx, fy) and leave the focal point it actually STORED in
+# g_fsx / g_fsy.
+var g_fsx = 0;
+var g_fsy = 0;
+
+fn pf_stored(cx, cy, r, fx, fy): i64 {
+    var g = sd_gradient_radial_focal(cx, cy, r, fx, fy);
+    var e = load64(g + SD_GRADIENT_EXT_OFFSET);
+    g_fsx = load64(e + SD_GRADIENT_EXT_FX_OFFSET);
+    g_fsy = load64(e + SD_GRADIENT_EXT_FY_OFFSET);
+    return 0;
+}
+
+# floor(n / d) rounded to nearest, halves away from zero, for d != 0 (|2n| < 2^63).
+fn pf_rdiv(n, d): i64 {
+    var nn = n;
+    var dd = d;
+    if (dd < 0) {
+        dd = 0 - dd;
+        nn = 0 - nn;
+    }
+    if (nn >= 0) { return (2 * nn + dd) / (2 * dd); }
+    return 0 - ((2 * (0 - nn) + dd) / (2 * dd));
+}
+
+fn pf_mat_eq(m, a, b, c, d, e, f): i64 {
+    var bad = 0;
+    if (load64(m + SD_MAT_A_OFFSET) != a) { bad = bad + 1; }
+    if (load64(m + SD_MAT_B_OFFSET) != b) { bad = bad + 1; }
+    if (load64(m + SD_MAT_C_OFFSET) != c) { bad = bad + 1; }
+    if (load64(m + SD_MAT_D_OFFSET) != d) { bad = bad + 1; }
+    if (load64(m + SD_MAT_E_OFFSET) != e) { bad = bad + 1; }
+    if (load64(m + SD_MAT_F_OFFSET) != f) { bad = bad + 1; }
+    return bad;
+}
+
+# Largest |entry - identity entry| of matrix m, raw.
+fn pf_mat_dev(m): i64 {
+    var w = sd_abs(load64(m + SD_MAT_A_OFFSET) - SD_ONE);
+    var v = sd_abs(load64(m + SD_MAT_B_OFFSET));
+    if (v > w) { w = v; }
+    v = sd_abs(load64(m + SD_MAT_C_OFFSET));
+    if (v > w) { w = v; }
+    v = sd_abs(load64(m + SD_MAT_D_OFFSET) - SD_ONE);
+    if (v > w) { w = v; }
+    v = sd_abs(load64(m + SD_MAT_E_OFFSET));
+    if (v > w) { w = v; }
+    v = sd_abs(load64(m + SD_MAT_F_OFFSET));
+    if (v > w) { w = v; }
+    return w;
+}
+
+# Mismatches of a cw x ch canvas placed at (dx, dy) on a 16x16 surface against ref (the same paint
+# at the origin), outside the rect the background must survive.
+fn pf_placed_mismatches(cv, g, ref, cw, ch, dx, dy, bg): i64 {
+    var s = sd_surface_new(16, 16);
+    sd_clear(s, bg);
+    sd_canvas_blit_paint_at(cv, s, g, dx, dy);
+    var bad = 0;
+    var sy = 0;
+    while (sy < 16) {
+        var sx = 0;
+        while (sx < 16) {
+            var want = bg;
+            var cx = sx - dx;
+            var cy = sy - dy;
+            if (cx >= 0) {
+                if (cx < cw) {
+                    if (cy >= 0) {
+                        if (cy < ch) { want = sd_surface_pixel_at(ref, cx, cy); }
+                    }
+                }
+            }
+            if (sd_surface_pixel_at(s, sx, sy) != want) { bad = bad + 1; }
+            sx = sx + 1;
+        }
+        sy = sy + 1;
+    }
+    return bad;
+}
+
+fn main(): i64 {
+    alloc_init();
+    wz_init();
+    var RED   = sd_rgb(255, 0, 0);
+    var GREEN = sd_rgb(0, 255, 0);
+    var BLUE  = sd_rgb(0, 0, 255);
+    var BLACK = sd_rgb(0, 0, 0);
+    var ONE = SD_ONE;
+    var x = 0;
+    var y = 0;
+    var k = 0;
+    var i = 0;
+
+    # ── A) A FOCAL POINT AT THE CENTRE IS sd_gradient_radial, byte for byte ──
+    # Patterned coverage and destination, three geometries (one centre off the pixel grid, one r with a
+    # fraction, one r of 1 raw), every spread, zigzag stops.
+    var cva = sd_canvas_new(96, 40);
+    pf_cov_pattern(cva, 96, 40);
+    var abad = 0;
+    var ag = 0;
+    while (ag < 3) {
+        var acx = 40 * ONE + 16384;
+        var acy = 17 * ONE + HALF;
+        var ar = 23 * ONE + 49152;
+        if (ag == 1) {
+            acx = 0 - 5 * ONE + 777;
+            acy = 30 * ONE + 3;
+            ar = 71 * ONE + 12345;
+        }
+        if (ag == 2) {
+            acx = 60 * ONE;
+            acy = 20 * ONE;
+            ar = 1;
+        }
+        var asp = 0;
+        while (asp < 3) {
+            var gr = sd_gradient_radial(acx, acy, ar);
+            var gf = sd_gradient_radial_focal(acx, acy, ar, acx, acy);
+            pf_zigzag(gr);
+            pf_zigzag(gf);
+            sd_gradient_set_spread(gr, asp);
+            sd_gradient_set_spread(gf, asp);
+            abad = abad + pf_paint_diff(cva, 96, 40, gr, gf);
+            asp = asp + 1;
+        }
+        ag = ag + 1;
+    }
+    check(abad, 0);                                                     #1
+    # A focal offset the clamp pulls back onto the centre: r = 1 raw leaves lim = 0.
+    var gra = sd_gradient_radial(30 * ONE + HALF, 20 * ONE, 1);
+    var gfa = sd_gradient_radial_focal(30 * ONE + HALF, 20 * ONE, 1, 35 * ONE, 20 * ONE);
+    pf_red_blue(gra);
+    pf_red_blue(gfa);
+    check(load64(load64(gfa + SD_GRADIENT_EXT_OFFSET) + SD_GRADIENT_EXT_FX_OFFSET), 30 * ONE + HALF);   #2
+    check(pf_paint_diff(cva, 96, 40, gra, gfa), 0);                     #3
+    check(load64(gfa + SD_GRADIENT_KIND_OFFSET), SD_GRADIENT_FOCAL);    #4
+    check(load64(gra + SD_GRADIENT_EXT_OFFSET), 0);                     #5 — a plain radial has no extension
+    # A one-stop TRANSLUCENT focal gradient is the same solid paint as a one-stop linear one, mapped or
+    # not: the point loop's coverage x alpha blend is the main loop's.
+    var gta = sd_gradient_radial_focal(20 * ONE, 13 * ONE, 9 * ONE, 15 * ONE, 11 * ONE);
+    var gtl = sd_gradient_linear(0, 0, 40 * ONE, 3 * ONE);
+    sd_gradient_add_stop(gta, 30000, sd_rgba(210, 40, 90, 137));
+    sd_gradient_add_stop(gtl, 30000, sd_rgba(210, 40, 90, 137));
+    check(pf_paint_diff(cva, 96, 40, gta, gtl), 0);                     #6
+    sd_gradient_set_matrix(gta, sd_matrix_rotate(20000));
+    check(pf_paint_diff(cva, 96, 40, gta, gtl), 0);                     #7
+
+    # ── B) EXACT t AT THE FOCAL POINT AND ON THE CIRCLE ──
+    # c = (32.5, 32.5) px, r = 20 px, f = (26.5, 29.5) px — the centre of pixel (26, 29).
+    var cvb = pf_full(64, 64);
+    var sbb = sd_surface_new(64, 64);
+    var bcx = 32 * ONE + HALF;
+    var bcy = 32 * ONE + HALF;
+    var bfx = 26 * ONE + HALF;
+    var bfy = 29 * ONE + HALF;
+    var br = 20 * ONE;
+    # t = 0 exactly at the focal pixel: a stop at 0 paints it blue, one at 2^-16 red (under every spread).
+    var b0bad = 0;
+    var bsp = 0;
+    while (bsp < 3) {
+        var gb0 = sd_gradient_radial_focal(bcx, bcy, br, bfx, bfy);
+        sd_gradient_add_stop(gb0, 1, RED);
+        sd_gradient_add_stop(gb0, 1, BLUE);
+        sd_gradient_set_spread(gb0, bsp);
+        sd_canvas_blit_paint(cvb, sbb, gb0);
+        if (sd_surface_pixel_at(sbb, 26, 29) != RED) { b0bad = b0bad + 1; }
+        if (sd_surface_pixel_at(sbb, 27, 29) != BLUE) { b0bad = b0bad + 1; }
+        if (sd_surface_pixel_at(sbb, 26, 30) != BLUE) { b0bad = b0bad + 1; }
+        var gb1 = sd_gradient_radial_focal(bcx, bcy, br, bfx, bfy);
+        sd_gradient_add_stop(gb1, 0, RED);
+        sd_gradient_add_stop(gb1, 0, BLUE);
+        sd_gradient_set_spread(gb1, bsp);
+        sd_canvas_blit_paint(cvb, sbb, gb1);
+        if (sd_surface_pixel_at(sbb, 26, 29) != BLUE) { b0bad = b0bad + 1; }
+        bsp = bsp + 1;
+    }
+    check(b0bad, 0);                                                    #8
+    # Twelve pixel centres exactly ON the circle: c + (±12, ±16), (±16, ±12), (±20, 0), (0, ±20) px.
+    # Under REFLECT with red@0, red@1, blue@1, t = 1 EXACTLY reads 65536 (blue); t a hair either side
+    # of 1 reads 65535 (red). One pixel toward the centre is red.
+    var gbr = sd_gradient_radial_focal(bcx, bcy, br, bfx, bfy);
+    sd_gradient_add_stop(gbr, 0, RED);
+    sd_gradient_add_stop(gbr, SD_ONE, RED);
+    sd_gradient_add_stop(gbr, SD_ONE, BLUE);
+    sd_gradient_set_spread(gbr, SD_SPREAD_REFLECT);
+    sd_canvas_blit_paint(cvb, sbb, gbr);
+    var onx = alloc(12 * 8);
+    var ony = alloc(12 * 8);
+    var pts = 0;
+    var sx = 0 - 1;
+    while (sx <= 1) {
+        var sy = 0 - 1;
+        while (sy <= 1) {
+            if (sx != 0) {
+                if (sy != 0) {
+                    store64(onx + pts * 8, 12 * sx);
+                    store64(ony + pts * 8, 16 * sy);
+                    pts = pts + 1;
+                    store64(onx + pts * 8, 16 * sx);
+                    store64(ony + pts * 8, 12 * sy);
+                    pts = pts + 1;
+                }
+            }
+            sy = sy + 2;
+        }
+        sx = sx + 2;
+    }
+    store64(onx + 8 * 8, 20);
+    store64(ony + 8 * 8, 0);
+    store64(onx + 9 * 8, 0 - 20);
+    store64(ony + 9 * 8, 0);
+    store64(onx + 10 * 8, 0);
+    store64(ony + 10 * 8, 20);
+    store64(onx + 11 * 8, 0);
+    store64(ony + 11 * 8, 0 - 20);
+    var on_blue = 0;
+    var in_red = 0;
+    k = 0;
+    while (k < 12) {
+        var ox = load64(onx + k * 8);
+        var oy = load64(ony + k * 8);
+        if (sd_surface_pixel_at(sbb, 32 + ox, 32 + oy) == BLUE) { on_blue = on_blue + 1; }
+        var ix = ox - ox / 10;
+        var iy = oy - oy / 10;
+        if (sd_surface_pixel_at(sbb, 32 + ix, 32 + iy) == RED) { in_red = in_red + 1; }
+        k = k + 1;
+    }
+    check(on_blue, 12);                                                 #9 — t == 1 exactly, all twelve
+    check(in_red, 12);                                                  #10
+    # ... and directly: the helper returns 65536 with the fraction flag clear.
+    _sd_paint_focal_setup(bcx - bfx, bcy - bfy, br * br - (bcx - bfx) * (bcx - bfx) - (bcy - bfy) * (bcy - bfy));
+    var hel = 0;
+    k = 0;
+    while (k < 12) {
+        var qx = bcx + load64(onx + k * 8) * ONE - bfx;
+        var qy = bcy + load64(ony + k * 8) * ONE - bfy;
+        if (_sd_paint_focal_t(qx, qy) != 65536) { hel = hel + 1; }
+        if (_sd_paint_rem != 0) { hel = hel + 1; }
+        k = k + 1;
+    }
+    check(hel, 0);                                                      #11
+    # PAD: exactly the centres at >= r are the last stop.
+    var gbp = sd_gradient_radial_focal(bcx, bcy, br, bfx, bfy);
+    pf_red_blue(gbp);
+    sd_canvas_blit_paint(cvb, sbb, gbp);
+    var padbad = 0;
+    y = 0;
+    while (y < 64) {
+        x = 0;
+        while (x < 64) {
+            var ddx = x - 32;
+            var ddy = y - 32;
+            var isblue = 0;
+            if (sd_surface_pixel_at(sbb, x, y) == BLUE) { isblue = 1; }
+            var outside = 0;
+            if (ddx * ddx + ddy * ddy >= 400) { outside = 1; }
+            if (isblue != outside) { padbad = padbad + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    check(padbad, 0);                                                   #12
+    check(sd_surface_pixel_at(sbb, 26, 29), RED);                       #13 — t = 0: the first stop, exactly
+    # A pixel centre exactly one raw^2 INSIDE the circle is still t < 1 — PAD's |p - c|^2 >= r^2 test is
+    # the exact one: r = 2,000,001 raw with the centre 2,000,000 raw left and 2,000 raw above the pixel,
+    # since 2,000,000^2 + 2,000^2 = r^2 - 1.
+    var bcx2 = (20 << 16) + HALF - 2000000;
+    var bcy2 = (30 << 16) + HALF - 2000;
+    var gpin = sd_gradient_radial_focal(bcx2, bcy2, 2000001, bcx2 + 100000, bcy2);
+    sd_gradient_add_stop(gpin, 0, RED);
+    sd_gradient_add_stop(gpin, SD_ONE, RED);
+    sd_gradient_add_stop(gpin, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cvb, sbb, gpin);
+    check(sd_surface_pixel_at(sbb, 20, 30), RED);                       #14 — inside by one raw^2
+    check(sd_surface_pixel_at(sbb, 21, 30), BLUE);                      #15 — a pixel further out: past it
+
+    # ── C) EXACT floor(t * 2^16) AGAINST THE BIGNUM ROOT ──
+    # C1 _sd_paint_focal_t directly: radii 2^1 .. 2^30 raw, focal points anywhere inside the clamp (at
+    # the centre, at the clamp, just inside it), points within 4 raw of f, exactly on the circle (3-4-5),
+    # behind f, and anywhere in the bound.
+    var c1bad = 0;
+    var c1exact = 0;
+    var c1big = 0;
+    var c1ints = 0;
+    k = 0;
+    while (k < 6000) {
+        var rbits = 1 + pf_rnd(30);
+        var rr = pf_rndbits(rbits) + 1;
+        if (rr > 1073676288) { rr = 1073676288; }
+        var lim = rr - ((rr + 1023) >> 10);
+        var fvx = 0;
+        var fvy = 0;
+        var fm = k % 5;
+        if (fm == 1) {
+            fvx = lim;
+        }
+        if (fm == 2) {
+            fvx = pf_rnd(lim + 1) - lim / 2;
+            fvy = pf_rnd(lim + 1) - lim / 2;
+        }
+        if (fm == 3) {
+            fvx = (lim * 3) / 5;
+            fvy = 0 - (lim * 4) / 5;
+        }
+        if (fm == 4) {
+            fvx = 0 - lim / 2;
+            fvy = lim / 2;
+        }
+        var cex = 0 - fvx;
+        var cey = 0 - fvy;
+        var ca = rr * rr - cex * cex - cey * cey;
+        if (ca > 0) {
+            var pm = pf_rnd(6);
+            var qdx = 0;
+            var qdy = 0;
+            if (pm == 0) {
+                qdx = pf_rnd(2147483647) - 1073741823;
+                qdy = pf_rnd(2147483647) - 1073741823;
+            }
+            if (pm == 1) {
+                qdx = pf_rnd(9) - 4;
+                qdy = pf_rnd(9) - 4;
+            }
+            if (pm == 2) {
+                qdx = pf_rndbits(rbits + 1) - rr;
+                qdy = pf_rndbits(rbits + 1) - rr;
+            }
+            if (pm == 3) {
+                # exactly on the circle: c + (3, 4) r / 5 for r a multiple of 5
+                var r5 = rr / 5;
+                qdx = cex + 3 * r5;
+                qdy = cey - 4 * r5;
+                ca = 25 * r5 * r5 - cex * cex - cey * cey;
+                if (ca <= 0) {
+                    qdx = 1;
+                    qdy = 0;
+                    ca = rr * rr - cex * cex - cey * cey;
+                }
+            }
+            if (pm == 4) {
+                # behind the focal point, away from the centre
+                qdx = 0 - (cex * (pf_rnd(300) + 1)) / 100;
+                qdy = 0 - (cey * (pf_rnd(300) + 1)) / 100;
+            }
+            if (pm == 5) {
+                # the exact centre, and points on the c-f axis through it
+                qdx = cex + (cex * pf_rnd(3)) / 2;
+                qdy = cey + (cey * pf_rnd(3)) / 2;
+            }
+            _sd_paint_focal_setup(cex, cey, ca);
+            var tq = _sd_paint_focal_t(qdx, qdy);
+            var tf = _sd_paint_rem;
+            var te = ref_focal_i64(qdx, qdy, cex, cey, ca, tq);
+            if (te < 16777216) {
+                c1exact = c1exact + 1;
+                if (tq != te) { c1bad = c1bad + 1; }
+                if (tf != g_ref_frac) { c1bad = c1bad + 1; }
+                if (g_ref_frac == 0) { c1ints = c1ints + 1; }
+            } else {
+                c1big = c1big + 1;
+                if (sd_abs(tq - te) > (te >> 10) + 1) { c1bad = c1bad + 1; }
+                if (tf != 1) { c1bad = c1bad + 1; }
+            }
+        }
+        k = k + 1;
+    }
+    check(c1bad, 0);                                                    #16
+    check(c1exact > 4500, 1);                                           #17 — the exact range is exercised ...
+    check(c1big > 100, 1);                                              #18 — ... and past t = 256
+    check(c1ints > 800, 1);                                             #19 — t * 2^16 exactly an integer
+    # |d|^2 just under 2^63 — the widest the bound allows (two offsets of 32,760 px), where the
+    # numerator is normalized by a shift RIGHT instead of left; both signs of d·e.
+    var c1r = 536870912;
+    var c1ex = 0 - 178782208;
+    var c1ey = 134086656;
+    var c1a = c1r * c1r - c1ex * c1ex - c1ey * c1ey;
+    _sd_paint_focal_setup(c1ex, c1ey, c1a);
+    var c1w = 0;
+    k = 0;
+    while (k < 4) {
+        var c1dx = 2147000000;
+        var c1dy = 2147000000;
+        if ((k & 1) != 0) { c1dx = 0 - c1dx; }
+        if ((k & 2) != 0) { c1dy = 0 - c1dy; }
+        var c1q = _sd_paint_focal_t(c1dx, c1dy);
+        var c1f = _sd_paint_rem;
+        if (c1q != ref_focal_i64(c1dx, c1dy, c1ex, c1ey, c1a, c1q)) { c1w = c1w + 1; }
+        if (c1f != g_ref_frac) { c1w = c1w + 1; }
+        if (c1dx * c1dx + c1dy * c1dy < 4611686018427387904) { c1w = c1w + 1; }
+        k = k + 1;
+    }
+    check(c1w, 0);                                                      #20 — |d|^2 >= 2^62, both signs of b
+    # C2 through single-pixel blits: 900 focal cases in ±40 px geometry, random spread and clip, bracketed.
+    var cvp = sd_canvas_new(16, 4);
+    var covp = sd_canvas_coverage(cvp);
+    var ssp = sd_surface_new(16, 4);
+    g_arena = arena_new_growable(1048576);
+    sd_alloc_set(&hook_alloc);
+    var c2bad = 0;
+    var c2cases = 0;
+    k = 0;
+    while (k < 900) {
+        var ppx = pf_rnd(16);
+        var ppy = pf_rnd(4);
+        var pdx = 0 - pf_rnd(ppx + 1);
+        var pdy = 0 - pf_rnd(ppy + 1);
+        memset(covp, 0, 16 * 4);
+        store8(covp + ppy * 16 + ppx, 255);
+        g_gk = 2;
+        g_gm = 0;
+        g_gsp = k % 3;
+        g_g0 = pf_rnd(80 * ONE) - 32 * ONE;
+        g_g1 = pf_rnd(80 * ONE) - 38 * ONE;
+        g_g2 = pf_rnd(40 * ONE) + 1;
+        if ((k & 3) == 0) { g_g2 = pf_rnd(4 * ONE) + 1; }
+        g_g3 = g_g0 + pf_rnd(2 * g_g2) - g_g2;
+        g_g4 = g_g1 + pf_rnd(2 * g_g2) - g_g2;
+        if ((k & 7) == 1) {
+            # on the pixel centre itself (t = 0), or far outside (clamped)
+            g_g3 = (ppx << 16) + HALF;
+            g_g4 = (ppy << 16) + HALF;
+        }
+        var sfx = pf_clamp_x(g_g0, g_g1, g_g2, g_g3, g_g4, 0);
+        var sfy = pf_clamp_x(g_g0, g_g1, g_g2, g_g3, g_g4, 1);
+        var cex2 = g_g0 - sfx;
+        var cey2 = g_g1 - sfy;
+        var ca2 = g_g2 * g_g2 - cex2 * cex2 - cey2 * cey2;
+        var cdx = (ppx << 16) + HALF - sfx;
+        var cdy = (ppy << 16) + HALF - sfy;
+        _sd_paint_focal_setup(cex2, cey2, ca2);
+        var te2 = ref_focal_i64(cdx, cdy, cex2, cey2, ca2, _sd_paint_focal_t(cdx, cdy));
+        if (te2 < 16777216) {
+            var tp2 = pf_spread_ref(g_gsp, te2, g_ref_frac);
+            if (g_gsp == SD_SPREAD_PAD) {
+                # PAD decides t >= 1 by |p - c| >= r
+                var ocx2 = (ppx << 16) + HALF - g_g0;
+                var ocy2 = (ppy << 16) + HALF - g_g1;
+                if (ocx2 * ocx2 + ocy2 * ocy2 >= g_g2 * g_g2) { tp2 = 65536; }
+            }
+            c2bad = c2bad + pf_bracket(cvp, ssp, tp2, ppx, ppy, pdx, pdy);
+            c2cases = c2cases + 1;
+        }
+        k = k + 1;
+    }
+    check(c2bad, 0);                                                    #21
+    check(c2cases > 750, 1);                                            #22 — MEASURED 784 with t < 256
+    check(sd_alloc_set(0), &hook_alloc);                                #23
+    arena_reset(g_arena);
+
+    # ── D) GEOMETRY ──
+    # c = (32.5, 32.5) px, r = 16 px, f = (24.5, 32.5) px: A = 256 - 64 = 192 px^2, so along the row
+    # through f the circle is 24 px to the right of f (t = dist / 24) and 8 px to the left (dist / 8).
+    var cvd = pf_full(96, 65);
+    var sdd = sd_surface_new(96, 65);
+    var dcx = 32 * ONE + HALF;
+    var dcy = 32 * ONE + HALF;
+    var dfx = 24 * ONE + HALF;
+    var dr = 16 * ONE;
+    # D1 symmetry about the c-f axis (row 32), every spread, zigzag stops.
+    var symbad = 0;
+    var dsp = 0;
+    while (dsp < 3) {
+        var gsym = sd_gradient_radial_focal(dcx, dcy, dr, dfx, dcy);
+        pf_zigzag(gsym);
+        sd_gradient_set_spread(gsym, dsp);
+        sd_canvas_blit_paint(cvd, sdd, gsym);
+        y = 1;
+        while (y <= 32) {
+            x = 0;
+            while (x < 96) {
+                symbad = symbad + pf_ne(sdd, x, 32 + y, x, 32 - y);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        dsp = dsp + 1;
+    }
+    check(symbad, 0);                                                   #24
+    # D2 monotone along 8 rays from f (red -> blue, PAD): red never rises, blue never falls.
+    var gmono = sd_gradient_radial_focal(dcx, dcy, dr, dfx, dcy);
+    pf_red_blue(gmono);
+    sd_canvas_blit_paint(cvd, sdd, gmono);
+    var monobad = 0;
+    var rise = 0;
+    var ddir = 0;
+    while (ddir < 8) {
+        var stx = 1;
+        var sty = 0;
+        if (ddir == 1) { stx = 0 - 1; }
+        if (ddir == 2) { stx = 0; sty = 1; }
+        if (ddir == 3) { stx = 0; sty = 0 - 1; }
+        if (ddir == 4) { sty = 1; }
+        if (ddir == 5) { sty = 0 - 1; }
+        if (ddir == 6) { stx = 0 - 1; sty = 1; }
+        if (ddir == 7) { stx = 0 - 1; sty = 0 - 1; }
+        var prev = sd_surface_pixel_at(sdd, 24, 32);
+        var step = 1;
+        while (step < 24) {
+            var mx = 24 + stx * step;
+            var my = 32 + sty * step;
+            if (mx >= 0) {
+                if (my >= 0) {
+                    if (my < 65) {
+                        var cur = sd_surface_pixel_at(sdd, mx, my);
+                        if (sd_color_r(cur) > sd_color_r(prev)) { monobad = monobad + 1; }
+                        if (sd_color_b(cur) < sd_color_b(prev)) { monobad = monobad + 1; }
+                        if (cur != prev) { rise = rise + 1; }
+                        prev = cur;
+                    }
+                }
+            }
+            step = step + 1;
+        }
+        ddir = ddir + 1;
+    }
+    check(monobad, 0);                                                  #25
+    check(rise > 100, 1);                                               #26 — the rays do change colour
+    check(sd_surface_pixel_at(sdd, 24, 32), RED);                       #27 — f
+    check(sd_surface_pixel_at(sdd, 16, 32), BLUE);                      #28 — 8 px left: on the circle
+    check(sd_surface_pixel_at(sdd, 17, 32) != BLUE, 1);                 #29
+    # D3 REPEAT: period 24 px right of f, 8 px left; REFLECT: mirror at t = 1 (24 px right) and period 48.
+    var grep = sd_gradient_radial_focal(dcx, dcy, dr, dfx, dcy);
+    pf_zigzag(grep);
+    sd_gradient_set_spread(grep, SD_SPREAD_REPEAT);
+    sd_canvas_blit_paint(cvd, sdd, grep);
+    var perbad = 0;
+    k = 0;
+    while (k < 48) {
+        perbad = perbad + pf_ne(sdd, 24 + k, 32, 48 + k, 32);
+        if (k < 16) { perbad = perbad + pf_ne(sdd, 24 - k, 32, 16 - k, 32); }
+        k = k + 1;
+    }
+    check(perbad, 0);                                                   #30
+    check(sd_surface_pixel_at(sdd, 48, 32), sd_surface_pixel_at(sdd, 24, 32));   #31 — t = 1 wraps to t = 0
+    sd_gradient_set_spread(grep, SD_SPREAD_REFLECT);
+    sd_canvas_blit_paint(cvd, sdd, grep);
+    perbad = 0;
+    k = 0;
+    while (k <= 24) {
+        perbad = perbad + pf_ne(sdd, 24 + k, 32, 72 - k, 32);
+        if (k < 24) { perbad = perbad + pf_ne(sdd, 24 + k, 32, 72 + k, 32); }
+        if (k <= 8) { perbad = perbad + pf_ne(sdd, 24 - k, 32, 8 + k, 32); }
+        k = k + 1;
+    }
+    check(perbad, 0);                                                   #32
+    check(sd_surface_pixel_at(sdd, 23, 32) != sd_surface_pixel_at(sdd, 25, 32), 1);   #33 — not symmetric about f
+    # D4 THE CLAMP. r = 20 px: lim = r - ceil(r / 1024) = 1,309,440 raw.
+    var clim = 20 * ONE - 1280;
+    var gcl0 = sd_gradient_radial_focal(dcx, dcy, 20 * ONE, dcx + clim, dcy);                 # at lim: kept
+    var gcl1 = sd_gradient_radial_focal(dcx, dcy, 20 * ONE, dcx + 40 * ONE, dcy);             # outside
+    var gcl2 = sd_gradient_radial_focal(dcx, dcy, 20 * ONE, dcx + 20 * ONE, dcy);             # ON the circle
+    var gcl3 = sd_gradient_radial_focal(dcx, dcy, 20 * ONE, dcx + clim + 1, dcy);             # 1 raw past lim
+    var gcl4 = sd_gradient_radial_focal(dcx, dcy, 20 * ONE, dcx + 60 * ONE, dcy - 80 * ONE);  # 3-4-5, far
+    var gcl5 = sd_gradient_radial_focal(dcx, dcy, 20 * ONE, dcx + 30000 * ONE, dcy - 40000 * ONE);   # past 2^30
+    var ext1 = load64(gcl1 + SD_GRADIENT_EXT_OFFSET);
+    var clbad = 0;
+    if (load64(load64(gcl0 + SD_GRADIENT_EXT_OFFSET) + SD_GRADIENT_EXT_FX_OFFSET) != dcx + clim) { clbad = clbad + 1; }
+    if (load64(ext1 + SD_GRADIENT_EXT_FX_OFFSET) != dcx + clim) { clbad = clbad + 1; }
+    if (load64(ext1 + SD_GRADIENT_EXT_FY_OFFSET) != dcy) { clbad = clbad + 1; }
+    if (load64(load64(gcl2 + SD_GRADIENT_EXT_OFFSET) + SD_GRADIENT_EXT_FX_OFFSET) != dcx + clim) { clbad = clbad + 1; }
+    if (load64(load64(gcl3 + SD_GRADIENT_EXT_OFFSET) + SD_GRADIENT_EXT_FX_OFFSET) != dcx + clim) { clbad = clbad + 1; }
+    var ext4 = load64(gcl4 + SD_GRADIENT_EXT_OFFSET);
+    if (load64(ext4 + SD_GRADIENT_EXT_FX_OFFSET) != dcx + (clim * 3) / 5) { clbad = clbad + 1; }
+    if (load64(ext4 + SD_GRADIENT_EXT_FY_OFFSET) != dcy - (clim * 4) / 5) { clbad = clbad + 1; }
+    check(clbad, 0);                                                    #34 — 3-4-5 lands exactly on lim
+    var ext5 = load64(gcl5 + SD_GRADIENT_EXT_OFFSET);
+    var c5x = load64(ext5 + SD_GRADIENT_EXT_FX_OFFSET) - dcx;
+    var c5y = load64(ext5 + SD_GRADIENT_EXT_FY_OFFSET) - dcy;
+    var c5l = c5x * c5x + c5y * c5y;
+    check(c5l <= clim * clim, 1);                                       #35 — never past lim ...
+    check(c5l > (clim - 3) * (clim - 3), 1);                            #36 — ... and less than 3 raw short
+    check(sd_abs(c5x * 4 + c5y * 3) <= 8, 1);                           #37 — on the (3, -4) direction
+    # Straight down, past 2^31 raw (50,000 px): only |vy| forces the halving, and the square would wrap.
+    var gcl6 = sd_gradient_radial_focal(dcx, dcy, 20 * ONE, dcx, dcy - 50000 * ONE);
+    var ext6 = load64(gcl6 + SD_GRADIENT_EXT_OFFSET);
+    check(load64(ext6 + SD_GRADIENT_EXT_FX_OFFSET), dcx);               #38 — x unmoved
+    check(load64(ext6 + SD_GRADIENT_EXT_FY_OFFSET), dcy - clim);        #39 — exactly lim below
+    # D5 THE CLAMP AT A LARGE RADIUS — whether the offset is longer than lim must be judged at the
+    # OFFSET'S OWN scale. r = 16,000 px: lim = 1,047,552,000 raw (15,984.375 px), which is longer than
+    # a 2^30 raw offset halved once, so a clamp decided after the halving does not fire at all and
+    # stores the focal point 8,192 px from the centre instead of 15,984.375 — and jumps there from one
+    # raw of input. The centre is placed so that the clamped focal point lands on a pixel centre.
+    var blim = 1047552000;
+    var lbr = 16000 * ONE;
+    var lbcx = 48 * ONE + HALF - blim;
+    var lbcy = 32 * ONE + HALF;
+    var bbad = 0;
+    pf_stored(lbcx, lbcy, lbr, lbcx + 1073741824, lbcy);            # offset exactly 2^30 raw: halved
+    if (g_fsx != lbcx + blim) { bbad = bbad + 1; }
+    if (g_fsy != lbcy) { bbad = bbad + 1; }
+    pf_stored(lbcx, lbcy, lbr, lbcx + 1073741823, lbcy);            # one raw less: not halved
+    if (g_fsx != lbcx + blim) { bbad = bbad + 1; }
+    pf_stored(lbcx, lbcy, lbr, lbcx + 1073741825, lbcy);
+    if (g_fsx != lbcx + blim) { bbad = bbad + 1; }
+    pf_stored(lbcx, lbcy, lbr, lbcx + blim, lbcy);                  # at lim: kept
+    if (g_fsx != lbcx + blim) { bbad = bbad + 1; }
+    pf_stored(lbcx, lbcy, lbr, lbcx + blim - 1, lbcy);              # one raw inside lim: kept
+    if (g_fsx != lbcx + blim - 1) { bbad = bbad + 1; }
+    check(bbad, 0);                                                     #40 — exactly lim, across 2^30
+    # A 3-4-5 direction, once just under 2^30 raw per axis and once far past it: the same point, on lim.
+    var b34 = 0;
+    pf_stored(0, 0, lbr, 12000 * ONE, 0 - 16000 * ONE);         # (786,432,000, -1,048,576,000): no halving
+    var bd1x = g_fsx;
+    var bd1y = g_fsy;
+    pf_stored(0, 0, lbr, 30000 * ONE, 0 - 40000 * ONE);         # the same direction, halved twice
+    if (bd1x != (blim * 3) / 5) { b34 = b34 + 1; }
+    if (bd1y != 0 - (blim * 4) / 5) { b34 = b34 + 1; }
+    if (g_fsx != bd1x) { b34 = b34 + 1; }
+    if (g_fsy != bd1y) { b34 = b34 + 1; }
+    pf_stored(0, 0, lbr, 0, 0 - 50000 * ONE);                   # straight down, past 2^31 raw
+    if (g_fsx != 0) { b34 = b34 + 1; }
+    if (g_fsy != 0 - blim) { b34 = b34 + 1; }
+    check(b34, 0);                                                      #41
+    # A component whose SQUARE wraps i64 (2^32 raw = 65,536 px): only a comparison made at the offset's
+    # own scale — a component against lim, before any product — can see that it is past lim at all.
+    var bwrap = 0;
+    pf_stored(lbcx, lbcy, lbr, lbcx + 4294967296, lbcy);
+    if (g_fsx != lbcx + blim) { bwrap = bwrap + 1; }
+    pf_stored(lbcx, lbcy, lbr, lbcx - 4294967296, lbcy);
+    if (g_fsx != lbcx - blim) { bwrap = bwrap + 1; }
+    pf_stored(lbcx, lbcy, lbr, lbcx, lbcy + 4294967296);
+    if (g_fsy != lbcy + blim) { bwrap = bwrap + 1; }
+    pf_stored(lbcx, lbcy, lbr, lbcx, lbcy - 4294967296);
+    if (g_fsy != lbcy - blim) { bwrap = bwrap + 1; }
+    check(bwrap, 0);                                                    #42
+    # 400 random large-radius offsets against the independent reference, half of them past 2^30 raw.
+    var bcmp = 0;
+    k = 0;
+    while (k < 400) {
+        var brr = pf_rnd(1000000000) + 100000000;              # r = 1,526 .. 16,784 px
+        var bocx = pf_rnd(2000000) - 1000000;
+        var bocy = pf_rnd(2000000) - 1000000;
+        var bovx = pf_rnd(2000000000) - 1000000000;
+        var bovy = pf_rnd(2000000000) - 1000000000;
+        if ((k & 1) == 0) {
+            bovx = bovx * 4;
+            bovy = bovy * 4;
+        }
+        pf_stored(bocx, bocy, brr, bocx + bovx, bocy + bovy);
+        if (g_fsx != pf_clamp_x(bocx, bocy, brr, bocx + bovx, bocy + bovy, 0)) { bcmp = bcmp + 1; }
+        if (g_fsy != pf_clamp_x(bocx, bocy, brr, bocx + bovx, bocy + bovy, 1)) { bcmp = bcmp + 1; }
+        k = k + 1;
+    }
+    check(bcmp, 0);                                                     #43
+    # ... and the pixels: the same paint as the gradient built AT the clamp, with t = 0 on its focal pixel.
+    var gbig = sd_gradient_radial_focal(lbcx, lbcy, lbr, lbcx + 1073741824, lbcy);
+    var gbref = sd_gradient_radial_focal(lbcx, lbcy, lbr, lbcx + blim, lbcy);
+    pf_zigzag(gbig);
+    pf_zigzag(gbref);
+    sd_gradient_set_spread(gbig, SD_SPREAD_REFLECT);
+    sd_gradient_set_spread(gbref, SD_SPREAD_REFLECT);
+    check(pf_paint_diff(cvd, 96, 65, gbig, gbref), 0);                  #44
+    var sbig = pf_paint(cvd, 96, 65, gbig);
+    check(sd_surface_pixel_at(sbig, 48, 32), sd_gradient_color_at(gbig, 0) & RGB_MASK);   #45 — t = 0 at f
+    # D6 A FOCAL POINT OFFSET ONLY IN y is a focal gradient too — the test is (fex | fey), not fex.
+    var gvf = sd_gradient_radial_focal(dcx, dcy, dr, dcx, dcy - 9 * ONE);
+    var gvr = sd_gradient_radial(dcx, dcy, dr);
+    pf_zigzag(gvf);
+    pf_zigzag(gvr);
+    check(pf_paint_diff(cvd, 96, 65, gvf, gvr) > 1000, 1);              #46 — NOT the centred radial (1,090 B)
+    sd_canvas_blit_paint(cvd, sdd, gvf);
+    check(sd_surface_pixel_at(sdd, 32, 23), sd_gradient_color_at(gvf, 0) & RGB_MASK);     #47 — t = 0 at f
+    var vbad = 0;
+    x = 1;
+    while (x <= 32) {
+        y = 0;
+        while (y < 65) {
+            vbad = vbad + pf_ne(sdd, 32 + x, y, 32 - x, y);
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    check(vbad, 0);                                                     #48 — symmetric about x = c.x
+    check(pf_ne(sdd, 32, 22, 32, 42), 1);                               #49 — not about y = c.y
+    pf_zigzag(gcl0);
+    pf_zigzag(gcl1);
+    pf_zigzag(gcl2);
+    sd_gradient_set_spread(gcl0, SD_SPREAD_REFLECT);
+    sd_gradient_set_spread(gcl1, SD_SPREAD_REFLECT);
+    sd_gradient_set_spread(gcl2, SD_SPREAD_REFLECT);
+    check(pf_paint_diff(cvd, 96, 65, gcl0, gcl1), 0);                   #50 — outside == at lim, byte for byte
+    check(pf_paint_diff(cvd, 96, 65, gcl0, gcl2), 0);                   #51 — on the circle likewise
+    # The clamped paint is finite and varies behind f (t reaches ~2^10 there).
+    var scl = pf_paint(cvd, 96, 65, gcl1);
+    check(pf_ne(scl, 60, 32, 70, 32) + pf_ne(scl, 52, 32, 53, 32) > 0, 1);   #52
+
+    # ── E) DEGENERATE GEOMETRY, BAD ARGUMENTS ──
+    var cve = pf_full(8, 8);
+    var se = sd_surface_new(8, 8);
+    var ge0 = sd_gradient_radial_focal(4 * ONE, 4 * ONE, 0, 5 * ONE, 4 * ONE);
+    sd_gradient_add_stop(ge0, 0, RED);
+    sd_gradient_add_stop(ge0, HALF, GREEN);
+    sd_gradient_add_stop(ge0, SD_ONE, BLUE);
+    sd_canvas_blit_paint(cve, se, ge0);
+    check(sd_surface_pixel_at(se, 4, 4), BLUE);                         #53 — r == 0: the last stop
+    var gen = sd_gradient_radial_focal(4 * ONE, 4 * ONE, 0 - ONE, 4 * ONE, 4 * ONE);
+    pf_red_blue(gen);
+    sd_gradient_set_spread(gen, SD_SPREAD_REPEAT);
+    sd_clear(se, BLACK);
+    sd_canvas_blit_paint(cve, se, gen);
+    check(sd_surface_pixel_at(se, 0, 7), BLUE);                         #54 — r < 0 likewise, any spread
+    var gez = sd_gradient_radial_focal(4 * ONE, 4 * ONE, 3 * ONE, 5 * ONE, 4 * ONE);
+    sd_clear(se, GREEN);
+    check(sd_canvas_blit_paint(cve, se, gez), SADISH_OK);               #55 — no stops: nothing
+    check(sd_surface_pixel_at(se, 4, 4), GREEN);                        #56
+    sd_gradient_add_stop(gez, 999, sd_rgb(9, 8, 7));
+    sd_canvas_blit_paint(cve, se, gez);
+    check(sd_surface_pixel_at(se, 7, 0), sd_rgb(9, 8, 7));              #57 — one stop: solid
+    check(sd_gradient_set_matrix(0, 0), SADISH_ERR_BOUNDS);             #58
+
+    # ── F) MATRIX 0 AND IDENTITY ARE THE UNTRANSFORMED PAINT ──
+    var cvf = sd_canvas_new(64, 24);
+    pf_cov_pattern(cvf, 64, 24);
+    var fbad = 0;
+    var fk = 0;
+    while (fk < 3) {
+        var fsp = 0;
+        while (fsp < 3) {
+            var gref = 0;
+            var gtst = 0;
+            if (fk == 0) {
+                gref = sd_gradient_linear(3 * ONE + 999, 2 * ONE, 51 * ONE + 7, 19 * ONE + 3);
+                gtst = sd_gradient_linear(3 * ONE + 999, 2 * ONE, 51 * ONE + 7, 19 * ONE + 3);
+            }
+            if (fk == 1) {
+                gref = sd_gradient_radial(30 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3);
+                gtst = sd_gradient_radial(30 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3);
+            }
+            if (fk == 2) {
+                gref = sd_gradient_radial_focal(30 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3, 25 * ONE, 9 * ONE);
+                gtst = sd_gradient_radial_focal(30 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3, 25 * ONE, 9 * ONE);
+            }
+            pf_zigzag(gref);
+            pf_zigzag(gtst);
+            sd_gradient_set_spread(gref, fsp);
+            sd_gradient_set_spread(gtst, fsp);
+            if (sd_gradient_set_matrix(gtst, 0) != SADISH_OK) { fbad = fbad + 1; }
+            fbad = fbad + pf_paint_diff(cvf, 64, 24, gref, gtst);
+            if (sd_gradient_set_matrix(gtst, sd_matrix_identity()) != SADISH_OK) { fbad = fbad + 1; }
+            fbad = fbad + pf_paint_diff(cvf, 64, 24, gref, gtst);
+            # a real matrix, then 0: restored
+            sd_gradient_set_matrix(gtst, sd_matrix_translate(3 * ONE, ONE));
+            if (pf_paint_diff(cvf, 64, 24, gref, gtst) == 0) { fbad = fbad + 1; }
+            sd_gradient_set_matrix(gtst, 0);
+            fbad = fbad + pf_paint_diff(cvf, 64, 24, gref, gtst);
+            # a real matrix, then identity: restored
+            sd_gradient_set_matrix(gtst, sd_matrix_scale(2 * ONE, ONE));
+            sd_gradient_set_matrix(gtst, sd_matrix_identity());
+            fbad = fbad + pf_paint_diff(cvf, 64, 24, gref, gtst);
+            fsp = fsp + 1;
+        }
+        fk = fk + 1;
+    }
+    check(fbad, 0);                                                     #59
+    # F2 THE IDENTITY TEST READS ALL SIX ENTRIES. A matrix that differs from the identity in ONE entry
+    # only is a real transform: diag(1, 2) moves d alone, diag(2, 1) moves a alone, and a unit shear
+    # moves b or c alone. Each must change the paint — and the two scales must match the gradient whose
+    # geometry is scaled on that axis (a linear gradient ALONG the scaled axis is exactly equivalent).
+    var idbad = 0;
+    var mdd2 = sd_matrix_new(ONE, 0, 0, 2 * ONE, 0, 0);
+    var maa2 = sd_matrix_new(2 * ONE, 0, 0, ONE, 0, 0);
+    var mshb = sd_matrix_new(ONE, ONE, 0, ONE, 0, 0);
+    var mshc = sd_matrix_new(ONE, 0, ONE, ONE, 0, 0);
+    var giv0 = sd_gradient_linear(3 * ONE, 2 * ONE, 3 * ONE, 20 * ONE);        # a vertical axis
+    var giv1 = sd_gradient_linear(3 * ONE, 2 * ONE, 3 * ONE, 20 * ONE);
+    var giv2 = sd_gradient_linear(3 * ONE, 4 * ONE, 3 * ONE, 40 * ONE);        # the same, y doubled
+    var gih0 = sd_gradient_linear(2 * ONE, 5 * ONE, 40 * ONE, 5 * ONE);        # a horizontal axis
+    var gih1 = sd_gradient_linear(2 * ONE, 5 * ONE, 40 * ONE, 5 * ONE);
+    var gih2 = sd_gradient_linear(4 * ONE, 5 * ONE, 80 * ONE, 5 * ONE);        # the same, x doubled
+    pf_zigzag(giv0);
+    pf_zigzag(giv1);
+    pf_zigzag(giv2);
+    pf_zigzag(gih0);
+    pf_zigzag(gih1);
+    pf_zigzag(gih2);
+    sd_gradient_set_matrix(giv1, mdd2);
+    sd_gradient_set_matrix(gih1, maa2);
+    if (pf_paint_diff(cvf, 64, 24, giv1, giv0) == 0) { idbad = idbad + 1; }
+    if (pf_paint_diff(cvf, 64, 24, gih1, gih0) == 0) { idbad = idbad + 1; }
+    idbad = idbad + pf_paint_diff(cvf, 64, 24, giv1, giv2);
+    idbad = idbad + pf_paint_diff(cvf, 64, 24, gih1, gih2);
+    var gish = sd_gradient_radial(30 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3);
+    var gisr = sd_gradient_radial(30 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3);
+    pf_zigzag(gish);
+    pf_zigzag(gisr);
+    sd_gradient_set_matrix(gish, mshb);
+    if (pf_paint_diff(cvf, 64, 24, gish, gisr) == 0) { idbad = idbad + 1; }
+    sd_gradient_set_matrix(gish, mshc);
+    if (pf_paint_diff(cvf, 64, 24, gish, gisr) == 0) { idbad = idbad + 1; }
+    sd_gradient_set_matrix(gish, mdd2);
+    if (pf_paint_diff(cvf, 64, 24, gish, gisr) == 0) { idbad = idbad + 1; }
+    sd_gradient_set_matrix(gish, maa2);
+    if (pf_paint_diff(cvf, 64, 24, gish, gisr) == 0) { idbad = idbad + 1; }
+    sd_gradient_set_matrix(gish, 0);
+    idbad = idbad + pf_paint_diff(cvf, 64, 24, gish, gisr);
+    check(idbad, 0);                                                    #60
+
+    # ── G) EXACT TRANSFORMS ──
+    var cvg = sd_canvas_new(64, 48);
+    pf_cov_pattern(cvg, 64, 48);
+    # G1 translation (fractional) == the geometry moved, all kinds, all spreads.
+    var tx = 5 * ONE + 24117;
+    var ty = 0 - 3 * ONE - 7209;
+    var mt = sd_matrix_translate(tx, ty);
+    var g1bad = 0;
+    var gsp = 0;
+    while (gsp < 3) {
+        var gl1 = sd_gradient_linear(3 * ONE + 999, 2 * ONE, 51 * ONE + 7, 19 * ONE + 3);
+        var gl2 = sd_gradient_linear(3 * ONE + 999 + tx, 2 * ONE + ty, 51 * ONE + 7 + tx, 19 * ONE + 3 + ty);
+        var gr1 = sd_gradient_radial(30 * ONE + 5, 21 * ONE + 7, 17 * ONE + 3);
+        var gr2 = sd_gradient_radial(30 * ONE + 5 + tx, 21 * ONE + 7 + ty, 17 * ONE + 3);
+        var gf1 = sd_gradient_radial_focal(30 * ONE + 5, 21 * ONE + 7, 17 * ONE + 3, 22 * ONE + 3, 25 * ONE);
+        var gf2 = sd_gradient_radial_focal(30 * ONE + 5 + tx, 21 * ONE + 7 + ty, 17 * ONE + 3,
+            22 * ONE + 3 + tx, 25 * ONE + ty);
+        pf_zigzag(gl1);
+        pf_zigzag(gl2);
+        pf_zigzag(gr1);
+        pf_zigzag(gr2);
+        pf_zigzag(gf1);
+        pf_zigzag(gf2);
+        sd_gradient_set_spread(gl1, gsp);
+        sd_gradient_set_spread(gl2, gsp);
+        sd_gradient_set_spread(gr1, gsp);
+        sd_gradient_set_spread(gr2, gsp);
+        sd_gradient_set_spread(gf1, gsp);
+        sd_gradient_set_spread(gf2, gsp);
+        if (sd_gradient_set_matrix(gl1, mt) != SADISH_OK) { g1bad = g1bad + 1; }
+        sd_gradient_set_matrix(gr1, mt);
+        sd_gradient_set_matrix(gf1, mt);
+        g1bad = g1bad + pf_paint_diff(cvg, 64, 48, gl1, gl2);
+        g1bad = g1bad + pf_paint_diff(cvg, 64, 48, gr1, gr2);
+        g1bad = g1bad + pf_paint_diff(cvg, 64, 48, gf1, gf2);
+        gsp = gsp + 1;
+    }
+    check(g1bad, 0);                                                    #61
+    # G2 a quarter-turn (x, y) -> (-y + tx, x + ty) == the rotated geometry.
+    var mq = sd_matrix_new(0, ONE, 0 - ONE, 0, 40 * ONE + 3, 0 - 2 * ONE);
+    var g2bad = 0;
+    gsp = 0;
+    while (gsp < 3) {
+        var ql1 = sd_gradient_linear(3 * ONE + 999, 2 * ONE, 25 * ONE + 7, 29 * ONE + 3);
+        var ql2 = sd_gradient_linear(0 - 2 * ONE + 40 * ONE + 3, 3 * ONE + 999 - 2 * ONE,
+            0 - (29 * ONE + 3) + 40 * ONE + 3, 25 * ONE + 7 - 2 * ONE);
+        var qr1 = sd_gradient_radial(10 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3);
+        var qr2 = sd_gradient_radial(0 - (11 * ONE + 7) + 40 * ONE + 3, 10 * ONE + 5 - 2 * ONE, 17 * ONE + 3);
+        var qf1 = sd_gradient_radial_focal(10 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3, 3 * ONE, 14 * ONE + 11);
+        var qf2 = sd_gradient_radial_focal(0 - (11 * ONE + 7) + 40 * ONE + 3, 10 * ONE + 5 - 2 * ONE, 17 * ONE + 3,
+            0 - (14 * ONE + 11) + 40 * ONE + 3, 3 * ONE - 2 * ONE);
+        pf_zigzag(ql1);
+        pf_zigzag(ql2);
+        pf_zigzag(qr1);
+        pf_zigzag(qr2);
+        pf_zigzag(qf1);
+        pf_zigzag(qf2);
+        sd_gradient_set_spread(ql1, gsp);
+        sd_gradient_set_spread(ql2, gsp);
+        sd_gradient_set_spread(qr1, gsp);
+        sd_gradient_set_spread(qr2, gsp);
+        sd_gradient_set_spread(qf1, gsp);
+        sd_gradient_set_spread(qf2, gsp);
+        sd_gradient_set_matrix(ql1, mq);
+        sd_gradient_set_matrix(qr1, mq);
+        sd_gradient_set_matrix(qf1, mq);
+        g2bad = g2bad + pf_paint_diff(cvg, 64, 48, ql1, ql2);
+        g2bad = g2bad + pf_paint_diff(cvg, 64, 48, qr1, qr2);
+        g2bad = g2bad + pf_paint_diff(cvg, 64, 48, qf1, qf2);
+        gsp = gsp + 1;
+    }
+    check(g2bad, 0);                                                    #62
+    # G3 scale 2 == the doubled geometry (radii multiples of 1024 raw, so the clamp scales too).
+    var m2 = sd_matrix_scale(2 * ONE, 2 * ONE);
+    var g3bad = 0;
+    gsp = 0;
+    while (gsp < 3) {
+        var sl1 = sd_gradient_linear(ONE + 999, 2 * ONE, 25 * ONE + 7, 19 * ONE + 3);
+        var sl2 = sd_gradient_linear(2 * ONE + 1998, 4 * ONE, 50 * ONE + 14, 38 * ONE + 6);
+        var sr1 = sd_gradient_radial(15 * ONE + 5, 11 * ONE + 7, 10 * ONE + 1024);
+        var sr2 = sd_gradient_radial(30 * ONE + 10, 22 * ONE + 14, 20 * ONE + 2048);
+        var sf1 = sd_gradient_radial_focal(15 * ONE + 5, 11 * ONE + 7, 10 * ONE + 1024, 10 * ONE + 3, 6 * ONE);
+        var sf2 = sd_gradient_radial_focal(30 * ONE + 10, 22 * ONE + 14, 20 * ONE + 2048, 20 * ONE + 6, 12 * ONE);
+        pf_zigzag(sl1);
+        pf_zigzag(sl2);
+        pf_zigzag(sr1);
+        pf_zigzag(sr2);
+        pf_zigzag(sf1);
+        pf_zigzag(sf2);
+        sd_gradient_set_spread(sl1, gsp);
+        sd_gradient_set_spread(sl2, gsp);
+        sd_gradient_set_spread(sr1, gsp);
+        sd_gradient_set_spread(sr2, gsp);
+        sd_gradient_set_spread(sf1, gsp);
+        sd_gradient_set_spread(sf2, gsp);
+        sd_gradient_set_matrix(sl1, m2);
+        sd_gradient_set_matrix(sr1, m2);
+        sd_gradient_set_matrix(sf1, m2);
+        g3bad = g3bad + pf_paint_diff(cvg, 64, 48, sl1, sl2);
+        g3bad = g3bad + pf_paint_diff(cvg, 64, 48, sr1, sr2);
+        g3bad = g3bad + pf_paint_diff(cvg, 64, 48, sf1, sf2);
+        gsp = gsp + 1;
+    }
+    check(g3bad, 0);                                                    #63
+    # G4 a mirror (det < 0) == the mirrored geometry: (x, y) -> (-x + 60, y).
+    var mm = sd_matrix_new(0 - ONE, 0, 0, ONE, 60 * ONE, 0);
+    var mr1 = sd_gradient_radial_focal(15 * ONE + 5, 21 * ONE + 7, 13 * ONE + 3, 10 * ONE + 3, 16 * ONE);
+    var mr2 = sd_gradient_radial_focal(45 * ONE - 5, 21 * ONE + 7, 13 * ONE + 3, 50 * ONE - 3, 16 * ONE);
+    var ml1 = sd_gradient_linear(ONE + 999, 2 * ONE, 25 * ONE + 7, 19 * ONE + 3);
+    var ml2 = sd_gradient_linear(59 * ONE - 999, 2 * ONE, 35 * ONE - 7, 19 * ONE + 3);
+    pf_zigzag(mr1);
+    pf_zigzag(mr2);
+    pf_zigzag(ml1);
+    pf_zigzag(ml2);
+    sd_gradient_set_matrix(mr1, mm);
+    sd_gradient_set_matrix(ml1, mm);
+    check(pf_paint_diff(cvg, 64, 48, mr1, mr2) + pf_paint_diff(cvg, 64, 48, ml1, ml2), 0);   #64
+    # G5 MEASURED: rotate(30°) x scale(2), translated — CORDIC entries, so nothing is representable.
+    # Every 3rd pixel of a 48x48 canvas, the blit's floor(t * 2^16) found by stop search, against the
+    # exact rational reference. PAD, t inside (0, 1).
+    var mrs = sd_matrix_mul(sd_matrix_rotate(34315), sd_matrix_scale(2 * ONE, 2 * ONE));
+    var mrot = sd_matrix_mul(sd_matrix_translate(9 * ONE + 1234, 4 * ONE), mrs);
+    var cv1 = sd_canvas_new(48, 48);
+    var s1 = sd_surface_new(1, 1);
+    g_arena = arena_new_growable(1048576);
+    sd_alloc_set(&hook_alloc);
+    var lin_max = 0;
+    var lin_mis = 0;
+    var rad_max = 0;
+    var rad_mis = 0;
+    var foc_max = 0;
+    var foc_mis = 0;
+    var gcases = 0;
+    g_gm = mrot;
+    g_gsp = SD_SPREAD_PAD;
+    y = 1;
+    while (y < 48) {
+        x = 1;
+        while (x < 48) {
+            memset(sd_canvas_coverage(cv1), 0, 48 * 48);
+            store8(sd_canvas_coverage(cv1) + y * 48 + x, 255);
+            var cpx = (x << 16) + HALF;
+            var cpy = (y << 16) + HALF;
+            # linear (-6.3, -2.1) -> (19.7, 21.4) px in gradient space
+            g_gk = 0;
+            g_g0 = 0 - 412876;
+            g_g1 = 0 - 137625;
+            g_g2 = 1291059;
+            g_g3 = 1402470;
+            var bl = pf_find_t(cv1, s1, x, y, 0 - x, 0 - y);
+            var tl = ref_map_linear(mrot, cpx, cpy, g_g0, g_g1, g_g2, g_g3, bl);
+            if (tl > 0) {
+                if (tl < 65536) {
+                    var dl = sd_abs(bl - tl);
+                    if (dl > lin_max) { lin_max = dl; }
+                    if (dl != 0) { lin_mis = lin_mis + 1; }
+                    gcases = gcases + 1;
+                }
+            }
+            # radial c = (7.25, 9.5) px, r = 23.1 px
+            g_gk = 1;
+            g_g0 = 475136;
+            g_g1 = 622592;
+            g_g2 = 1513882;
+            var brr = pf_find_t(cv1, s1, x, y, 0 - x, 0 - y);
+            var trr = ref_map_radial(mrot, cpx, cpy, g_g0, g_g1, g_g2, brr);
+            if (trr < 65536) {
+                var drr = sd_abs(brr - trr);
+                if (drr > rad_max) { rad_max = drr; }
+                if (drr != 0) { rad_mis = rad_mis + 1; }
+            }
+            # focal: the same circle, focal point (1.5, 14) px (inside the clamp)
+            g_gk = 2;
+            g_g3 = 98304;
+            g_g4 = 917504;
+            var bff = pf_find_t(cv1, s1, x, y, 0 - x, 0 - y);
+            var tff = ref_map_focal(mrot, cpx, cpy, g_g0, g_g1, g_g2, g_g3, g_g4, bff);
+            if (tff < 65536) {
+                var dff = sd_abs(bff - tff);
+                if (dff > foc_max) { foc_max = dff; }
+                if (dff != 0) { foc_mis = foc_mis + 1; }
+            }
+            x = x + 3;
+        }
+        y = y + 3;
+    }
+    g_gm = 0;
+    check(sd_alloc_set(0), &hook_alloc);                                #65
+    arena_reset(g_arena);
+    check(gcases > 150, 1);                                             #66
+    check(lin_max <= 1, 1);                                             #67 — MEASURED below
+    check(rad_max <= 1, 1);                                             #68
+    check(foc_max <= 1, 1);                                             #69
+    var mres = "paint_focal_test: MEASURED rotate(30)xscale(2) |dT| max lin/rad/focal ";
+    syscall(1, 1, mres, strlen(mres));
+    fmt_int_fd(1, lin_max);
+    syscall(1, 1, "/", 1);
+    fmt_int_fd(1, rad_max);
+    syscall(1, 1, "/", 1);
+    fmt_int_fd(1, foc_max);
+    syscall(1, 1, ", pixels off by one ", 20);
+    fmt_int_fd(1, lin_mis);
+    syscall(1, 1, "/", 1);
+    fmt_int_fd(1, rad_mis);
+    syscall(1, 1, "/", 1);
+    fmt_int_fd(1, foc_mis);
+    syscall(1, 1, " of ", 4);
+    fmt_int_fd(1, gcases);
+    syscall(1, 1, "\n", 1);
+    # G6 a transformed axis that collapses below 2^-8 px paints the last stop (as an untransformed one).
+    var gdeg = sd_gradient_linear(0, 0, 40 * ONE, 0);
+    sd_gradient_add_stop(gdeg, 0, RED);
+    sd_gradient_add_stop(gdeg, SD_ONE, BLUE);
+    sd_gradient_set_matrix(gdeg, sd_matrix_scale(1024, 1024));          # 1/64: the axis is 0.625 px
+    var sdeg = sd_surface_new(64, 48);
+    var cvdeg = pf_full(64, 48);
+    sd_canvas_blit_paint(cvdeg, sdeg, gdeg);
+    check(sd_surface_pixel_at(sdeg, 0, 0) != BLUE, 1);                  #70 — 0.625 px is still an axis
+    sd_gradient_set_matrix(gdeg, sd_matrix_scale(4, 4));               # 2^-14: 160 raw < 256 — degenerate
+    sd_canvas_blit_paint(cvdeg, sdeg, gdeg);
+    var ndeg = 0;
+    i = 0;
+    while (i < 64 * 48) {
+        if (sd_surface_pixel_at(sdeg, i % 64, i / 64) != BLUE) { ndeg = ndeg + 1; }
+        i = i + 1;
+    }
+    check(ndeg, 0);                                                     #71
+    # G7 DEGENERACY IS TESTED ON BOTH AXES: a GRADIENT-space axis below 2^-8 px is degenerate however
+    # much the matrix magnifies it (|v| is tested before the canvas axis is resolved at all).
+    var gtiny = sd_gradient_linear(0, 0, 100, 0);                       # 100 raw: 2^-9.4 px
+    sd_gradient_add_stop(gtiny, 0, RED);
+    sd_gradient_add_stop(gtiny, SD_ONE, BLUE);
+    sd_gradient_set_matrix(gtiny, sd_matrix_scale(1024 * ONE, 1024 * ONE));
+    sd_canvas_blit_paint(cvdeg, sdeg, gtiny);
+    var ntiny = 0;
+    i = 0;
+    while (i < 64 * 48) {
+        if (sd_surface_pixel_at(sdeg, i % 64, i / 64) != BLUE) { ntiny = ntiny + 1; }
+        i = i + 1;
+    }
+    check(ntiny, 0);                                                    #72 — magnified, still the last stop
+    var gtin2 = sd_gradient_linear(0, 0, 256, 0);                       # exactly 2^-8 px: a real axis
+    sd_gradient_add_stop(gtin2, 0, RED);
+    sd_gradient_add_stop(gtin2, SD_ONE, BLUE);
+    sd_gradient_set_matrix(gtin2, sd_matrix_scale(1024 * ONE, 1024 * ONE));
+    sd_canvas_blit_paint(cvdeg, sdeg, gtin2);
+    check(sd_surface_pixel_at(sdeg, 0, 0) != BLUE, 1);                  #73
+
+    # ── H) A MATRIX THE PAINT CANNOT HONOUR PAINTS NOTHING ──
+    var cvh = sd_canvas_new(64, 24);
+    pf_cov_pattern(cvh, 64, 24);
+    var msing = sd_matrix_new(ONE, 2 * ONE, 2 * ONE, 4 * ONE, 5, 6);
+    var mzero = sd_matrix_new(0, 0, 0, 0, 0, 0);
+    var mbig = sd_matrix_new(1073741824, 0, 0, ONE, 0, 0);
+    var mbigt = sd_matrix_translate(0, 0 - 1073741824);
+    var mmin = sd_matrix_new(ONE, 0, 1 << 63, ONE, 0, 0);
+    var mok = sd_matrix_new(1073741823, 0, 0, ONE, 0, 1073741823);
+    var mident = sd_matrix_identity();
+    var hbad = 0;
+    var hret = 0;
+    var hk = 0;
+    while (hk < 3) {
+        var hg = 0;
+        if (hk == 0) { hg = sd_gradient_linear(3 * ONE, 2 * ONE, 51 * ONE, 19 * ONE); }
+        if (hk == 1) { hg = sd_gradient_radial(30 * ONE, 11 * ONE, 17 * ONE); }
+        if (hk == 2) { hg = sd_gradient_radial_focal(30 * ONE, 11 * ONE, 17 * ONE, 25 * ONE, 9 * ONE); }
+        pf_zigzag(hg);
+        var href = pf_paint(cvh, 64, 24, hg);
+        var hpat = sd_surface_new(64, 24);
+        pf_fill_pattern(hpat, 64 * 24 * 4, 13);
+        var hc0 = sd_gradient_color_at(hg, 23456);
+        hret = hret + sd_gradient_set_matrix(hg, msing);               # BOUNDS = 3 each
+        var hs = pf_paint(cvh, 64, 24, hg);
+        hbad = hbad + pf_diff(sd_surface_pixels(hs), sd_surface_pixels(hpat), 64 * 24 * 4);
+        if (sd_canvas_blit_paint(cvh, hs, hg) != SADISH_OK) { hbad = hbad + 1; }
+        if (sd_gradient_color_at(hg, 23456) != hc0) { hbad = hbad + 1; }
+        if (sd_gradient_set_matrix(hg, 0) != SADISH_OK) { hbad = hbad + 1; }
+        hs = pf_paint(cvh, 64, 24, hg);
+        hbad = hbad + pf_diff(sd_surface_pixels(hs), sd_surface_pixels(href), 64 * 24 * 4);
+        hret = hret + sd_gradient_set_matrix(hg, mzero);
+        hret = hret + sd_gradient_set_matrix(hg, mbig);
+        hret = hret + sd_gradient_set_matrix(hg, mbigt);
+        hret = hret + sd_gradient_set_matrix(hg, mmin);
+        hs = pf_paint(cvh, 64, 24, hg);
+        hbad = hbad + pf_diff(sd_surface_pixels(hs), sd_surface_pixels(hpat), 64 * 24 * 4);
+        if (sd_gradient_set_matrix(hg, mok) != SADISH_OK) { hbad = hbad + 1; }   # 2^30 - 1 raw: honoured
+        if (sd_gradient_set_matrix(hg, mident) != SADISH_OK) { hbad = hbad + 1; }
+        hs = pf_paint(cvh, 64, 24, hg);
+        hbad = hbad + pf_diff(sd_surface_pixels(hs), sd_surface_pixels(href), 64 * 24 * 4);
+        hk = hk + 1;
+    }
+    check(hbad, 0);                                                     #74
+    check(hret, 15 * SADISH_ERR_BOUNDS);                                #75 — every bad matrix, every kind
+    check(sd_matrix_invert(msing), 0);                                  #76
+    check(sd_matrix_invert(mzero), 0);                                  #77
+    # The two refusals are different things: mbigt is a perfectly INVERTIBLE translation, refused only
+    # by sadish's ±16,384.0 entry bound, where msing / mzero have no inverse at all.
+    check(sd_matrix_invert(mbigt) != 0, 1);                             #78
+    check(pf_mat_eq(sd_matrix_invert(mbigt), ONE, 0, 0, ONE, 0, 1073741824), 0);   #79
+
+    # ── I) CLIPPING ON EVERY SIDE AND A WRAPPED SURFACE, UNDER A TRANSFORM ──
+    # An 8x8 canvas, a reference blit at the origin, placements straddling every edge: the mapped
+    # point's start at a clipped (x0, y0) must equal the one stepped there from (0, 0).
+    var cvi = pf_full(8, 8);
+    var mis = sd_matrix_mul(sd_matrix_rotate(0 - 51472), sd_matrix_scale(ONE + 20000, ONE - 9000));
+    var mi = sd_matrix_mul(sd_matrix_translate(3 * ONE + 777, 0 - ONE), mis);
+    var ibad = 0;
+    var ik = 0;
+    while (ik < 3) {
+        var ig = 0;
+        if (ik == 0) { ig = sd_gradient_linear(0, 0, 5 * ONE, 3 * ONE); }
+        if (ik == 1) { ig = sd_gradient_radial(2 * ONE, 3 * ONE, 4 * ONE + 5); }
+        if (ik == 2) { ig = sd_gradient_radial_focal(2 * ONE, 3 * ONE, 4 * ONE + 5, ONE, 2 * ONE); }
+        pf_zigzag(ig);
+        sd_gradient_set_spread(ig, SD_SPREAD_REFLECT);
+        sd_gradient_set_matrix(ig, mi);
+        var iref = sd_surface_new(8, 8);
+        sd_canvas_blit_paint(cvi, iref, ig);
+        var BG = sd_rgb(3, 3, 3);
+        ibad = ibad + pf_placed_mismatches(cvi, ig, iref, 8, 8, 5, 3, BG);
+        ibad = ibad + pf_placed_mismatches(cvi, ig, iref, 8, 8, 0 - 3, 4, BG);
+        ibad = ibad + pf_placed_mismatches(cvi, ig, iref, 8, 8, 12, 4, BG);
+        ibad = ibad + pf_placed_mismatches(cvi, ig, iref, 8, 8, 4, 0 - 5, BG);
+        ibad = ibad + pf_placed_mismatches(cvi, ig, iref, 8, 8, 4, 13, BG);
+        ibad = ibad + pf_placed_mismatches(cvi, ig, iref, 8, 8, 0 - 3, 0 - 3, BG);
+        ibad = ibad + pf_placed_mismatches(cvi, ig, iref, 8, 8, 13, 13, BG);
+        ibad = ibad + pf_placed_mismatches(cvi, ig, iref, 8, 8, 0 - 7, 15, BG);
+        ibad = ibad + pf_placed_mismatches(cvi, ig, iref, 8, 8, 100, 0 - 100, BG);
+        # the reference itself varies in x and y
+        if (pf_ne(iref, 0, 0, 1, 0) + pf_ne(iref, 0, 0, 0, 1) != 2) { ibad = ibad + 1; }
+        ik = ik + 1;
+    }
+    check(ibad, 0);                                                     #80
+    # A 32-byte header over a buffer with a 32 px pitch (stride 128 != 32), window at column 4 of row 1;
+    # translucent mapped focal paint; one uncovered pixel.
+    var pitch = 32 * 4;
+    var nbuf = pitch * 10;
+    var buf = alloc(nbuf);
+    var pristine = alloc(nbuf);
+    i = 0;
+    while (i < nbuf) {
+        store8(buf + i, (i * 11 + 5) & 255);
+        i = i + 1;
+    }
+    memcpy(pristine, buf, nbuf);
+    var win = buf + pitch + 4 * 4;
+    var ws = alloc(32);
+    store64(ws + 0, 8);
+    store64(ws + 8, 8);
+    store64(ws + 16, win);
+    store64(ws + 24, pitch);
+    var refj = sd_surface_new(8, 8);
+    y = 0;
+    while (y < 8) {
+        memcpy(sd_surface_pixels(refj) + y * 32, win + y * pitch, 32);
+        y = y + 1;
+    }
+    var gj = sd_gradient_radial_focal(4 * ONE, 3 * ONE, 5 * ONE, 2 * ONE, 3 * ONE);
+    sd_gradient_add_stop(gj, 0, sd_rgba(255, 0, 0, 200));
+    sd_gradient_add_stop(gj, SD_ONE, sd_rgba(0, 0, 255, 150));
+    sd_gradient_set_spread(gj, SD_SPREAD_REPEAT);
+    sd_gradient_set_matrix(gj, mi);
+    var cvj = pf_full(8, 8);
+    store8(sd_canvas_coverage(cvj) + 2 * 8 + 3, 0);
+    check(sd_canvas_blit_paint_at(cvj, ws, gj, 1, 1), SADISH_OK);       #81
+    sd_canvas_blit_paint_at(cvj, refj, gj, 1, 1);
+    var jbad = 0;
+    var jpainted = 0;
+    var bo = 0;
+    while (bo < nbuf) {
+        var want = load8(pristine + bo);
+        var rowb = bo / pitch;
+        var colb = (bo % pitch) / 4;
+        if (rowb >= 1) {
+            if (rowb < 9) {
+                if (colb >= 4) {
+                    if (colb < 12) {
+                        want = load8(sd_surface_pixels(refj) + ((rowb - 1) * 8 + (colb - 4)) * 4 + bo % 4);
+                    }
+                }
+            }
+        }
+        if (load8(buf + bo) != want) { jbad = jbad + 1; }
+        if (load8(buf + bo) != load8(pristine + bo)) { jpainted = jpainted + 1; }
+        bo = bo + 1;
+    }
+    check(jbad, 0);                                                     #82 — window == packed ref; rest pristine
+    check(jpainted > 150, 1);                                           #83
+    check(pf_diff(win + 3 * pitch + 4 * 4, pristine + pitch + 16 + 3 * pitch + 4 * 4, 4), 0);   #84 — uncovered
+
+    # ── J) ALLOCATION: exact figures, 0 B blits ──
+    var cvl = pf_full(32, 32);
+    var sl = sd_surface_new(32, 32);
+    var mrl = sd_matrix_mul(sd_matrix_rotate(20000), sd_matrix_scale(ONE + 5000, ONE));
+    var mrl2 = sd_matrix_translate(ONE, 2 * ONE);
+    var mid2 = sd_matrix_identity();
+    g_arena = arena_new_growable(1048576);
+    check(sd_alloc_set(&hook_alloc), 0);                                #85
+    var heap0 = alloc_used();
+    var ar0 = arena_used(g_arena);
+    var gaf = sd_gradient_radial_focal(16 * ONE, 16 * ONE, 12 * ONE, 12 * ONE, 13 * ONE);
+    check(arena_used(g_arena) - ar0, 88 + 64 + 4104 + 72);              #86 — 4,328 B: the gradient + 72 B extension
+    check(alloc_used() - heap0, 0);                                     #87
+    var gal = sd_gradient_linear(ONE, 2 * ONE, 30 * ONE, 9 * ONE);
+    var gar = sd_gradient_radial(15 * ONE, 17 * ONE, 13 * ONE);
+    pf_red_blue(gaf);
+    pf_red_blue(gal);
+    pf_zigzag(gar);
+    ar0 = arena_used(g_arena);
+    sd_gradient_set_matrix(gal, 0);
+    sd_gradient_set_matrix(gal, mid2);
+    check(arena_used(g_arena) - ar0, 0);                                #88 — 0 / identity: nothing
+    check(load64(gal + SD_GRADIENT_EXT_OFFSET), 0);                     #89
+    sd_gradient_set_matrix(gal, mrl);
+    check(arena_used(g_arena) - ar0, 72);                               #90 — the first real matrix: 72 B
+    sd_gradient_set_matrix(gal, mrl2);
+    sd_gradient_set_matrix(gal, 0);
+    sd_gradient_set_matrix(gal, mrl);
+    sd_gradient_set_matrix(gaf, mrl2);
+    sd_gradient_set_matrix(gaf, mrl);
+    sd_gradient_set_matrix(gar, mrl);
+    check(arena_used(g_arena) - ar0, 144);                              #91 — then never again (gar's own 72)
+    check(alloc_used() - heap0, 0);                                     #92
+    # every blit — first ones with the ramp dirty — 0 B on the arena and on the heap
+    ar0 = arena_used(g_arena);
+    heap0 = alloc_used();
+    var gab = sd_gradient_linear(0, 0, 9 * ONE, 0);                     # (built before the window closes: 4,256 B)
+    sd_gradient_add_stop(gab, 0, RED);
+    sd_gradient_set_matrix(gab, msing);                                 # blocked (72 B)
+    ar0 = arena_used(g_arena);
+    k = 0;
+    while (k < 12) {
+        sd_gradient_set_spread(gaf, k % 3);
+        sd_gradient_set_spread(gal, k % 3);
+        sd_gradient_set_spread(gar, k % 3);
+        sd_canvas_blit_paint_at(cvl, sl, gaf, k - 3, 2 - k);
+        sd_canvas_blit_paint_at(cvl, sl, gal, 0 - k, k);
+        sd_canvas_blit_paint_at(cvl, sl, gar, k, 0);
+        sd_canvas_blit_paint(cvl, sl, gab);
+        if (k == 6) {
+            sd_gradient_set_matrix(gaf, 0);                             # untransformed focal
+            sd_gradient_add_stop(gar, 7000, GREEN);                     # dirty again; 10th stop: no growth
+        }
+        k = k + 1;
+    }
+    check(arena_used(g_arena) - ar0, 0);                                #93 — 48 blits: 0 B on the arena
+    check(alloc_used() - heap0, 0);                                     #94 — and on the heap
+    check(sd_surface_pixel_at(sl, 20, 20) != 0, 1);                     #95 — they painted
+    check(sd_alloc_set(0), &hook_alloc);                                #96
+    arena_reset(g_arena);
+    heap0 = alloc_used();
+    var gnf = sd_gradient_radial_focal(5 * ONE, 5 * ONE, 30 * ONE, 0, 0);
+    check(alloc_used() - heap0, 4328);                                  #97 — no hook: the same on the heap
+    var gnl = sd_gradient_radial(5 * ONE, 5 * ONE, 30 * ONE);
+    heap0 = alloc_used();
+    sd_gradient_set_matrix(gnl, mrl);
+    sd_gradient_set_matrix(gnl, mrl2);
+    check(alloc_used() - heap0, 72);                                    #98
+    pf_red_blue(gnf);
+    heap0 = alloc_used();
+    sd_canvas_blit_paint(cvl, sl, gnf);
+    sd_gradient_set_matrix(gnf, mrl);
+    sd_canvas_blit_paint(cvl, sl, gnf);
+    check(alloc_used() - heap0, 0);                                     #99
+
+    # ── K) OUT OF MEMORY: every allocation of every constructor, stop growth, the extension ──
+    var sk1 = sd_surface_new(32, 32);
+    var sk2 = sd_surface_new(32, 32);
+    var mkr = sd_matrix_rotate(12345);
+    g_arena = arena_new_growable(1048576);
+    sd_alloc_set(&hook_budget);
+    var oom = 0;
+    var bgt = 0;
+    while (bgt < 3) {
+        g_budget = bgt;
+        if (sd_gradient_linear(0, 0, ONE, 0) != 0) { oom = oom + 1; }
+        g_budget = bgt;
+        if (sd_gradient_radial(0, 0, ONE) != 0) { oom = oom + 1; }
+        bgt = bgt + 1;
+    }
+    bgt = 0;
+    while (bgt < 4) {
+        g_budget = bgt;
+        if (sd_gradient_radial_focal(0, 0, ONE, 5, 5) != 0) { oom = oom + 1; }
+        bgt = bgt + 1;
+    }
+    # ... and each allocation failing ALONE (the ones after it would succeed).
+    bgt = 0;
+    while (bgt < 4) {
+        g_fail_at = bgt;
+        g_alloc_i = 0;
+        if (bgt < 3) {
+            if (sd_gradient_linear(0, 0, ONE, 0) != 0) { oom = oom + 1; }
+            g_alloc_i = 0;
+            if (sd_gradient_radial(0, 0, ONE) != 0) { oom = oom + 1; }
+            g_alloc_i = 0;
+        }
+        if (sd_gradient_radial_focal(0, 0, ONE, 5, 5) != 0) { oom = oom + 1; }
+        bgt = bgt + 1;
+    }
+    g_fail_at = 0 - 1;
+    check(oom, 0);                                                     #100 — the object, stops, ramp, extension: each
+    g_budget = 3;
+    check(sd_gradient_linear(0, 0, ONE, 0) != 0, 1);                   #101
+    g_budget = 3;
+    check(sd_gradient_radial(0, 0, ONE) != 0, 1);                      #102
+    g_budget = 4;
+    var gko = sd_gradient_radial_focal(16 * ONE, 16 * ONE, 14 * ONE, 12 * ONE, 13 * ONE);
+    check(gko != 0, 1);                                                #103
+    check(g_budget, 0);                                                #104 — and it used exactly four
+    # stop growth: 4 stops fit; the 5th needs the block doubled
+    sd_gradient_add_stop(gko, 0, RED);
+    sd_gradient_add_stop(gko, 20000, GREEN);
+    sd_gradient_add_stop(gko, 40000, sd_rgba(0, 0, 255, 100));
+    check(sd_gradient_add_stop(gko, SD_ONE, BLUE), SADISH_OK);         #105 — no allocation needed
+    sd_gradient_set_spread(gko, SD_SPREAD_REFLECT);
+    pf_fill_pattern(sk1, 32 * 32 * 4, 9);
+    pf_fill_pattern(sk2, 32 * 32 * 4, 9);
+    sd_canvas_blit_paint(cvl, sk1, gko);
+    var ck0 = sd_gradient_color_at(gko, 30000);
+    check(sd_gradient_add_stop(gko, 50000, GREEN), SADISH_ERR_OOM);    #106
+    check(sd_gradient_stop_count(gko), 4);                             #107
+    sd_canvas_blit_paint(cvl, sk2, gko);
+    check(pf_diff(sd_surface_pixels(sk1), sd_surface_pixels(sk2), 32 * 32 * 4), 0);  #108 — the paint is unchanged
+    check(sd_gradient_color_at(gko, 30000), ck0);                      #109
+    g_budget = 1;
+    check(sd_gradient_add_stop(gko, 50000, GREEN), SADISH_OK);         #110
+    check(sd_gradient_stop_count(gko), 5);                             #111
+    # set_matrix: the extension of a plain gradient
+    g_budget = 3;
+    var gkr = sd_gradient_radial(10 * ONE, 12 * ONE, 9 * ONE);
+    pf_zigzag(gkr);
+    pf_fill_pattern(sk1, 32 * 32 * 4, 9);
+    pf_fill_pattern(sk2, 32 * 32 * 4, 9);
+    sd_canvas_blit_paint(cvl, sk1, gkr);
+    g_budget = 0;
+    check(sd_gradient_set_matrix(gkr, mkr), SADISH_ERR_OOM);           #112
+    check(load64(gkr + SD_GRADIENT_EXT_OFFSET), 0);                    #113
+    sd_canvas_blit_paint(cvl, sk2, gkr);
+    check(pf_diff(sd_surface_pixels(sk1), sd_surface_pixels(sk2), 32 * 32 * 4), 0);  #114 — unchanged
+    check(sd_gradient_set_matrix(gkr, msing), SADISH_ERR_OOM);          #115 — even a singular one: nothing stored
+    sd_canvas_blit_paint(cvl, sk2, gkr);
+    check(pf_diff(sd_surface_pixels(sk1), sd_surface_pixels(sk2), 32 * 32 * 4), 0);   #116
+    check(sd_gradient_set_matrix(gkr, 0), SADISH_OK);                   #117 — identity needs no memory
+    g_budget = 1;
+    check(sd_gradient_set_matrix(gkr, mkr), SADISH_OK);                 #118
+    sd_canvas_blit_paint(cvl, sk2, gkr);
+    check(pf_diff(sd_surface_pixels(sk1), sd_surface_pixels(sk2), 32 * 32 * 4) > 0, 1);   #119
+    g_budget = 0;
+    check(sd_matrix_invert(mkr), 0);                                    #120 — invert: 0 on OOM
+    check(sd_alloc_set(0), &hook_budget);                               #121
+    # An extension an arena hands back after a reset still holds its last user's bytes: a focal gradient
+    # must not inherit that gradient's transform.
+    var cvz = pf_full(16, 16);
+    var szf = sd_surface_new(16, 16);
+    var szr = sd_surface_new(16, 16);
+    var gzr = sd_gradient_radial_focal(8 * ONE, 8 * ONE, 6 * ONE, 6 * ONE, 7 * ONE);
+    pf_red_blue(gzr);
+    sd_canvas_blit_paint(cvz, szr, gzr);
+    g_arena = arena_new_growable(1048576);
+    sd_alloc_set(&hook_alloc);
+    var gz0 = sd_gradient_linear(0, 0, ONE, 0);
+    sd_gradient_set_matrix(gz0, mkr);
+    var ext0 = load64(gz0 + SD_GRADIENT_EXT_OFFSET);
+    arena_reset(g_arena);
+    var gz1 = sd_gradient_radial_focal(8 * ONE, 8 * ONE, 6 * ONE, 6 * ONE, 7 * ONE);
+    sd_alloc_set(0);
+    check(load64(gz1 + SD_GRADIENT_EXT_OFFSET), ext0);                  #122 — the same 72 B, reused
+    pf_red_blue(gz1);
+    sd_canvas_blit_paint(cvz, szf, gz1);
+    check(pf_diff(sd_surface_pixels(szf), sd_surface_pixels(szr), 16 * 16 * 4), 0);   #123
+
+    # ── L) sd_matrix_invert ──
+    var lbad = 0;
+    lbad = lbad + pf_mat_eq(sd_matrix_invert(sd_matrix_identity()), ONE, 0, 0, ONE, 0, 0);
+    var ltr = sd_matrix_invert(sd_matrix_translate(5 * ONE + HALF, 0 - 3 * ONE - 16384));
+    lbad = lbad + pf_mat_eq(ltr, ONE, 0, 0, ONE, 0 - 5 * ONE - HALF, 3 * ONE + 16384);
+    lbad = lbad + pf_mat_eq(sd_matrix_invert(sd_matrix_scale(2 * ONE, 4 * ONE)), HALF, 0, 0, 16384, 0, 0);
+    lbad = lbad + pf_mat_eq(sd_matrix_invert(sd_matrix_scale(3 * ONE, ONE)), 21845, 0, 0, ONE, 0, 0);
+    lbad = lbad + pf_mat_eq(sd_matrix_invert(sd_matrix_scale(0 - 3 * ONE, ONE)), 0 - 21845, 0, 0, ONE, 0, 0);
+    # (x, y) -> (-y + 7, x + 2) inverts to (x, y) -> (y - 2, -x + 7)
+    var lqt = sd_matrix_invert(sd_matrix_new(0, ONE, 0 - ONE, 0, 7 * ONE, 2 * ONE));
+    lbad = lbad + pf_mat_eq(lqt, 0, 0 - ONE, ONE, 0, 0 - 2 * ONE, 7 * ONE);
+    # scale 2 with a 1 / 3 raw translation: the inverse translation is exactly -0.5 / -1.5 raw, and
+    # halves round AWAY from zero.
+    var ltm = sd_matrix_new(2 * ONE, 0, 0, 2 * ONE, 1, 3);
+    lbad = lbad + pf_mat_eq(sd_matrix_invert(ltm), HALF, 0, 0, HALF, 0 - 1, 0 - 2);
+    check(lbad, 0);                                                     #124 — the representable inverses, exactly
+    # rotate(30°) and a skew: every entry the exact inverse rounded to nearest (independent i64 formula)
+    var lrot = sd_matrix_mul(sd_matrix_translate(9 * ONE + 1234, 4 * ONE), sd_matrix_rotate(34315));
+    var lsk = sd_matrix_mul(sd_matrix_translate(0 - 100 * ONE, 3 * ONE), sd_matrix_skew(19660, 0 - 7000));
+    var lr = 0;
+    var lmax1 = 0;
+    var lmax2 = 0;
+    var lviol = 0;
+    k = 0;
+    while (k < 402) {
+        var lm = lrot;
+        if (k == 1) { lm = lsk; }
+        if (k >= 2) {
+            var r0 = pf_rnd(16 * ONE) - 8 * ONE;
+            var r1 = pf_rnd(16 * ONE) - 8 * ONE;
+            var r2 = pf_rnd(16 * ONE) - 8 * ONE;
+            var r3 = pf_rnd(16 * ONE) - 8 * ONE;
+            lm = sd_matrix_new(r0, r1, r2, r3, pf_rnd(512 * ONE) - 256 * ONE, pf_rnd(512 * ONE) - 256 * ONE);
+        }
+        var la = load64(lm + SD_MAT_A_OFFSET);
+        var lb = load64(lm + SD_MAT_B_OFFSET);
+        var lc = load64(lm + SD_MAT_C_OFFSET);
+        var ld = load64(lm + SD_MAT_D_OFFSET);
+        var le = load64(lm + SD_MAT_E_OFFSET);
+        var lf = load64(lm + SD_MAT_F_OFFSET);
+        var ldet = la * ld - lb * lc;
+        if (sd_abs(ldet) > 4294967296) {
+            var linv = sd_matrix_invert(lm);
+            var ie = pf_rdiv((lc * lf - ld * le) << 16, ldet);
+            var jf = pf_rdiv((lb * le - la * lf) << 16, ldet);
+            var ia = pf_rdiv(ld << 32, ldet);
+            var ib = pf_rdiv((0 - lb) << 32, ldet);
+            var ic = pf_rdiv((0 - lc) << 32, ldet);
+            lr = lr + pf_mat_eq(linv, ia, ib, ic, pf_rdiv(la << 32, ldet), ie, jf);
+            var lsum = sd_abs(la) + sd_abs(lb) + sd_abs(lc) + sd_abs(ld);
+            var dev1 = pf_mat_dev(sd_matrix_mul(lm, linv));
+            var dev2 = pf_mat_dev(sd_matrix_mul(linv, lm));
+            if (dev1 * 131072 >= 2 * 131072 + lsum) { lviol = lviol + 1; }
+            if (dev2 * 131072 >= 3 * 131072 + lsum + sd_abs(le) + sd_abs(lf)) { lviol = lviol + 1; }
+            if (dev1 > lmax1) { lmax1 = dev1; }
+            if (dev2 > lmax2) { lmax2 = dev2; }
+        }
+        k = k + 1;
+    }
+    check(lr, 0);                                                       #125
+    check(lviol, 0);                                                    #126 — both composition bounds hold
+    check(lmax1 > 0, 1);                                                #127 — and composing is not exact
+    # the exact inverses invert back exactly
+    var lq = sd_matrix_new(0, ONE, 0 - ONE, 0, 7 * ONE, 2 * ONE);
+    var lqq = sd_matrix_invert(sd_matrix_invert(lq));
+    check(pf_mat_eq(lqq, 0, ONE, 0 - ONE, 0, 7 * ONE, 2 * ONE), 0);     #128
+
+    # ── M) THE 128-BIT HELPERS AGAINST THE BIGNUM ──
+    var mbad = 0;
+    k = 0;
+    while (k < 3000) {
+        var ua = pf_rndbits(1 + pf_rnd(63));
+        var ub = pf_rndbits(1 + pf_rnd(63));
+        if (k == 0) {
+            ua = 9223372036854775807;
+            ub = 9223372036854775807;
+        }
+        if (k == 1) {
+            ua = 4294967295;
+            ub = 4294967295;
+        }
+        if (k == 2) {
+            ua = 9223372036854775807;
+            ub = 4294967297;
+        }
+        var ulo = _sd_paint_umul(ua, ub);
+        var uhi = _sd_paint_hi;
+        wz_set(w_a, ua);
+        wz_set(w_b, ub);
+        wz_mul(w_c, w_a, w_b);
+        var wlo = wz_limb(w_c, 0) | (wz_limb(w_c, 1) << 16) | (wz_limb(w_c, 2) << 32) | (wz_limb(w_c, 3) << 48);
+        var whi = wz_limb(w_c, 4) | (wz_limb(w_c, 5) << 16) | (wz_limb(w_c, 6) << 32) | (wz_limb(w_c, 7) << 48);
+        if (ulo != wlo) { mbad = mbad + 1; }
+        if (uhi != whi) { mbad = mbad + 1; }
+        k = k + 1;
+    }
+    check(mbad, 0);                                                     #129 — _sd_paint_umul
+    var sbad = 0;
+    var szero = 0;
+    k = 0;
+    while (k < 4000) {
+        var sk = pf_rndbits(pf_rnd(26));
+        var sA = pf_rndbits(1 + pf_rnd(61)) + 1;
+        var sbv = pf_rndbits(pf_rnd(63));
+        if ((k & 1) != 0) { sbv = 0 - sbv; }
+        var sl0 = pf_rndbits(pf_rnd(63));
+        if ((k % 4) == 2) {
+            # an exact zero: A = 2^32 a, b = 2^15 b', l = a k^2 + b' k (when that is >= 0 and fits)
+            var za = pf_rndbits(pf_rnd(20)) + 1;
+            var zb = pf_rndbits(pf_rnd(20)) - pf_rndbits(pf_rnd(20));
+            sk = pf_rndbits(pf_rnd(18));
+            sA = za << 32;
+            sbv = zb << 15;
+            sl0 = za * sk * sk + zb * sk;
+            if (sl0 < 0) { sl0 = 0; }
+        }
+        _sd_paint_focal_setup(1, 0, sA);
+        var sgot = _sd_paint_focal_sign(sk, sbv, sl0);
+        wz_set(w_A, sA);
+        wz_set(w_t, sk);
+        wz_mul(w_u, w_t, w_t);
+        wz_mul(w_u, w_u, w_A);
+        wz_set(w_B, sbv);
+        wz_shl(w_B, w_B, 17);
+        wz_mul(w_v, w_B, w_t);
+        wz_add(w_u, w_u, w_v);
+        wz_set(w_L, sl0);
+        wz_shl(w_L, w_L, 32);
+        wz_sub(w_u, w_u, w_L);
+        if (sgot != wz_sign(w_u)) { sbad = sbad + 1; }
+        if (wz_sign(w_u) == 0) { szero = szero + 1; }
+        k = k + 1;
+    }
+    check(sbad, 0);                                                     #130 — _sd_paint_focal_sign
+    check(szero > 400, 1);                                              #131 — exact zeros exercised
+    var bl_bad = 0;
+    if (_sd_paint_bitlen(0) != 0) { bl_bad = bl_bad + 1; }
+    if (_sd_paint_bitlen(0 - 5) != 0) { bl_bad = bl_bad + 1; }
+    if (_sd_paint_bitlen(9223372036854775807) != 63) { bl_bad = bl_bad + 1; }
+    k = 0;
+    while (k < 63) {
+        if (_sd_paint_bitlen(1 << k) != k + 1) { bl_bad = bl_bad + 1; }
+        if (k > 0) {
+            if (_sd_paint_bitlen((1 << k) - 1) != k) { bl_bad = bl_bad + 1; }
+        }
+        k = k + 1;
+    }
+    if (_sd_paint_bitlen128(1, 0) != 65) { bl_bad = bl_bad + 1; }
+    if (_sd_paint_bitlen128(0, 1 << 63) != 64) { bl_bad = bl_bad + 1; }
+    if (_sd_paint_shr128(5, 1 << 63, 64) != 5) { bl_bad = bl_bad + 1; }
+    if (_sd_paint_shr128(5, 1 << 63, 63) != 11) { bl_bad = bl_bad + 1; }
+    if (_sd_paint_shr128(0, 3, 0 - 60) != (3 << 60)) { bl_bad = bl_bad + 1; }
+    if (_sd_paint_ult(0 - 1, 1) != 0) { bl_bad = bl_bad + 1; }
+    if (_sd_paint_ult(1, 0 - 1) != 1) { bl_bad = bl_bad + 1; }
+    check(bl_bad, 0);                                                   #132
+
+    # ── N) THE ROUNDING, EXACTLY: under matrices whose inverses are not representable the paint is
+    # exact for the ROUNDED canvas axis (linear) and for the NEAREST-raw gradient-space point (radial,
+    # focal). Short axes and tiny radii make one raw unit worth hundreds of 2^-16 in t, so floor
+    # instead of nearest, or a sloppy ratio, lands on the wrong stop. Single pixels, random clips. ──
+    var mn0 = sd_matrix_mul(sd_matrix_translate(ONE + 19660, 0 - 45875), sd_matrix_scale(3 * ONE, 5 * ONE));
+    var mn1s = sd_matrix_mul(sd_matrix_rotate(26214), sd_matrix_scale(85196, 52429));
+    var mn1 = sd_matrix_mul(sd_matrix_translate(2 * ONE, ONE), mn1s);
+    var mn2 = sd_matrix_mul(sd_matrix_translate(0 - 3 * ONE, 7 * ONE), sd_matrix_skew(22000, 0 - 9000));
+    # 128x across, 1/128 down: for an axis along gradient x, |V| is 2^14 times |w| / 2^16, which takes
+    # the axis rounding through its OTHER shift path — 64 or less, where the half lands in the low word
+    # and can carry into the high one.
+    var mn3s = sd_matrix_mul(sd_matrix_rotate(9000), sd_matrix_scale(128 * ONE, 512));
+    var mn3 = sd_matrix_mul(sd_matrix_translate(5 * ONE, 0 - 2 * ONE), mn3s);
+    g_arena = arena_new_growable(1048576);
+    sd_alloc_set(&hook_alloc);
+    var nbad = 0;
+    var nlin = 0;
+    var nrad = 0;
+    var nfoc = 0;
+    k = 0;
+    while (k < 450) {
+        var nm = mn0;
+        if ((k / 4) % 4 == 1) { nm = mn1; }
+        if ((k / 4) % 4 == 2) { nm = mn2; }
+        if ((k / 4) % 4 == 3) { nm = mn3; }
+        var npx = pf_rnd(16);
+        var npy = pf_rnd(4);
+        var ndx = 0 - pf_rnd(npx + 1);
+        var ndy = 0 - pf_rnd(npy + 1);
+        memset(covp, 0, 16 * 4);
+        store8(covp + npy * 16 + npx, 255);
+        var ncx = (npx << 16) + HALF;
+        var ncy = (npy << 16) + HALF;
+        # the pixel's gradient-space point, rounded to nearest (independently, in i64)
+        var na = load64(nm + SD_MAT_A_OFFSET);
+        var nb = load64(nm + SD_MAT_B_OFFSET);
+        var nc = load64(nm + SD_MAT_C_OFFSET);
+        var nd = load64(nm + SD_MAT_D_OFFSET);
+        var ndet = na * nd - nb * nc;
+        if (ndet < 0) {
+            ndet = 0 - ndet;
+            na = 0 - na;
+            nb = 0 - nb;
+            nc = 0 - nc;
+            nd = 0 - nd;
+        }
+        var nrx = ncx - load64(nm + SD_MAT_E_OFFSET);
+        var nry = ncy - load64(nm + SD_MAT_F_OFFSET);
+        var nQx = (nd * nrx - nc * nry) << 16;
+        var nQy = (na * nry - nb * nrx) << 16;
+        var nqx = pf_fdiv(2 * nQx + ndet, 2 * ndet);
+        var nqy = pf_fdiv(2 * nQy + ndet, 2 * ndet);
+        g_gm = nm;
+        g_gsp = pf_rnd(3);
+        var nkind = k % 4;
+        var ntp = 0 - 1;
+        if (nkind <= 1) {
+            # N1 linear: p0 within 2 px of q, |v| in [1, 4] px
+            g_gk = 0;
+            g_g0 = nqx + pf_rnd(4 * ONE) - 2 * ONE;
+            g_g1 = nqy + pf_rnd(4 * ONE) - 2 * ONE;
+            var nvx = pf_rnd(8 * ONE) - 4 * ONE;
+            var nvy = pf_rnd(8 * ONE) - 4 * ONE;
+            # under mn3, half the axes run along gradient x, where the ratio is 2^14
+            if ((k / 4) % 4 == 3) {
+                if ((k & 1) == 0) { nvy = 0; }
+            }
+            if (nvx * nvx + nvy * nvy >= 4294967296) {
+                g_g2 = g_g0 + nvx;
+                g_g3 = g_g1 + nvy;
+                ref_axis(nm, g_g0, g_g1, nvx, nvy);
+                var nl2 = g_vx * g_vx + g_vy * g_vy;
+                if (nl2 >= 65536) {
+                    # floor(2^16 (p - P0)·V / |V|^2) — in the bignum: the product alone can pass 2^63,
+                    # which is why the blit's DDA divides it in halves rather than forming it.
+                    wz_set(w_a, (ncx - g_px0) * g_vx + (ncy - g_py0) * g_vy);
+                    wz_shl(w_L, w_a, 16);
+                    wz_set(w_B, nl2);
+                    g_ref_mode = 2;
+                    var nT = ref_search(0 - (1 << 40), 1 << 40, 0 - 1);
+                    ntp = pf_spread_ref(g_gsp, nT, g_ref_frac);
+                    nlin = nlin + 1;
+                }
+            }
+        }
+        if (nkind == 2) {
+            # N2 radial: r of 50 .. 400 raw, the centre within 300 raw of q
+            g_gk = 1;
+            g_g0 = nqx + pf_rnd(601) - 300;
+            g_g1 = nqy + pf_rnd(601) - 300;
+            g_g2 = 50 + pf_rnd(351);
+            var nT2 = ref_focal_i64(nqx - g_g0, nqy - g_g1, 0, 0, g_g2 * g_g2, 0 - 1);
+            ntp = pf_spread_ref(g_gsp, nT2, g_ref_frac);
+            nrad = nrad + 1;
+        }
+        if (nkind == 3) {
+            # N3 focal: r of 3000 .. 9000 raw, the centre within 2000 raw of q, f within the clamp
+            g_gk = 2;
+            g_g0 = nqx + pf_rnd(4001) - 2000;
+            g_g1 = nqy + pf_rnd(4001) - 2000;
+            g_g2 = 3000 + pf_rnd(6001);
+            g_g3 = g_g0 + pf_rnd(g_g2) - g_g2 / 2;
+            g_g4 = g_g1 + pf_rnd(g_g2) - g_g2 / 2;
+            var nfx = pf_clamp_x(g_g0, g_g1, g_g2, g_g3, g_g4, 0);
+            var nfy = pf_clamp_x(g_g0, g_g1, g_g2, g_g3, g_g4, 1);
+            var nex = g_g0 - nfx;
+            var ney = g_g1 - nfy;
+            var nA = g_g2 * g_g2 - nex * nex - ney * ney;
+            var nT3 = ref_focal_i64(nqx - nfx, nqy - nfy, nex, ney, nA, 0 - 1);
+            if (nT3 < 16777216) {
+                ntp = pf_spread_ref(g_gsp, nT3, g_ref_frac);
+                if (g_gsp == SD_SPREAD_PAD) {
+                    var nox = nqx - g_g0;
+                    var noy = nqy - g_g1;
+                    if (nox * nox + noy * noy >= g_g2 * g_g2) { ntp = 65536; }
+                }
+                nfoc = nfoc + 1;
+            }
+        }
+        if (ntp >= 0) { nbad = nbad + pf_bracket(cvp, ssp, ntp, npx, npy, ndx, ndy); }
+        k = k + 1;
+    }
+    # A matrix that shrinks x by 16 and y by 65,536: the axis ratio is 2^12 (so the axis rounding takes
+    # its low-word path, where the half can carry into the high word) while |V| is an eighth of a pixel,
+    # where one raw unit of V is 2^-13 of the axis and moves t by several 2^-16. Linear only — the
+    # gradient-space image of a pixel is 65,536 px away, past the bound for a radial.
+    var mn4 = sd_matrix_mul(sd_matrix_translate(3 * ONE, 0 - ONE), sd_matrix_scale(4096, 1));
+    var nthin = 0;
+    var nthinc = 0;
+    k = 0;
+    while (k < 60) {
+        var qpx2 = pf_rnd(16);
+        var qpy2 = pf_rnd(4);
+        memset(covp, 0, 16 * 4);
+        store8(covp + qpy2 * 16 + qpx2, 255);
+        g_gk = 0;
+        g_gm = mn4;
+        g_gsp = k % 3;
+        # the pixel's gradient-space x, rounded: q = 2^16 (p - 3) / 4096 (the 2x2 is diagonal)
+        var qcx2 = (qpx2 << 16) + HALF;
+        var qx2 = pf_fdiv(2 * (((qcx2 - 3 * ONE) * 1) << 16) + 4096, 2 * 4096);
+        g_g0 = qx2 + pf_rnd(8 * ONE) - 4 * ONE;
+        g_g1 = pf_rnd(4 * ONE);
+        var nvx2 = pf_rnd(6 * ONE) + ONE;
+        if ((k & 1) != 0) { nvx2 = 0 - nvx2; }
+        g_g2 = g_g0 + nvx2;
+        g_g3 = g_g1;
+        ref_axis(mn4, g_g0, g_g1, nvx2, 0);
+        var nl22 = g_vx * g_vx + g_vy * g_vy;
+        if (nl22 >= 65536) {
+            wz_set(w_a, (qcx2 - g_px0) * g_vx + ((qpy2 << 16) + HALF - g_py0) * g_vy);
+            wz_shl(w_L, w_a, 16);
+            wz_set(w_B, nl22);
+            g_ref_mode = 2;
+            var nT2 = ref_search(0 - (1 << 40), 1 << 40, 0 - 1);
+            nthin = nthin + pf_bracket(cvp, ssp, pf_spread_ref(g_gsp, nT2, g_ref_frac), qpx2, qpy2, 0, 0);
+            nthinc = nthinc + 1;
+        }
+        k = k + 1;
+    }
+    g_gm = 0;
+    check(nthin, 0);                                                     #133
+    check(nthinc > 50, 1);                                               #134
+    # Two mapped cases found by searching the step sequence, where the nearest-raw rounding of q is
+    # decided at the boundary: a remainder of exactly ceil(det/2) (rounds UP, y) and, with an odd det,
+    # one of exactly (det - 1)/2 (rounds DOWN, x). r = 1000 raw makes one raw unit 65 in t * 2^16.
+    var ntie = 0;
+    k = 0;
+    while (k < 2) {
+        var tm = sd_matrix_new(313, 345, 336, 581, 41254, 0 - 25689);
+        var tx0 = 1;
+        var ty0 = 0;
+        var tpx = 15;
+        var tpy = 3;
+        var toffx = 0;
+        var toffy = 300;
+        if (k == 1) {
+            tm = sd_matrix_new(792, 0 - 127, 0 - 333, 301, 0 - 31947, 6325);
+            tx0 = 0;
+            tpx = 5;
+            toffx = 300;
+            toffy = 0;
+        }
+        memset(covp, 0, 16 * 4);
+        store8(covp + tpy * 16 + tpx, 255);
+        var ta = load64(tm + SD_MAT_A_OFFSET);
+        var tb = load64(tm + SD_MAT_B_OFFSET);
+        var tc = load64(tm + SD_MAT_C_OFFSET);
+        var td = load64(tm + SD_MAT_D_OFFSET);
+        var tdet = ta * td - tb * tc;
+        var trx = (tpx << 16) + HALF - load64(tm + SD_MAT_E_OFFSET);
+        var trry = (tpy << 16) + HALF - load64(tm + SD_MAT_F_OFFSET);
+        var tqx = pf_fdiv(2 * ((td * trx - tc * trry) << 16) + tdet, 2 * tdet);
+        var tqy = pf_fdiv(2 * ((ta * trry - tb * trx) << 16) + tdet, 2 * tdet);
+        g_gk = 1;
+        g_gm = tm;
+        g_gsp = SD_SPREAD_PAD;
+        g_g0 = tqx + toffx;
+        g_g1 = tqy + toffy;
+        g_g2 = 1000;
+        var tT = ref_focal_i64(tqx - g_g0, tqy - g_g1, 0, 0, g_g2 * g_g2, 0 - 1);
+        ntie = ntie + pf_bracket(cvp, ssp, tT, tpx, tpy, 0 - tx0, 0 - ty0);
+        k = k + 1;
+    }
+    g_gm = 0;
+    check(ntie, 0);                                                     #135
+    check(nbad, 0);                                                     #136
+    check(nlin > 150, 1);                                               #137
+    check(nrad > 80, 1);                                                #138
+    check(nfoc > 80, 1);                                                #139
+    check(sd_alloc_set(0), &hook_alloc);                                #140
+
+    # ── O) NO INPUT TRAPS ──
+    # Out past the precision bound the COLOURS are undefined — the ramp index is not, and nothing
+    # divides by zero or shifts by a negative count. The focal root with garbage constants over the
+    # whole i64 range of offsets, then blits of gradients whose geometry, radii and matrices are
+    # absurd (a matrix of det = 1 raw^2 maps a pixel 2^48 raw away).
+    var obad = 0;
+    var ocount = 0;
+    k = 0;
+    while (k < 4000) {
+        var oA = pf_rndbits(1 + pf_rnd(62)) + 1;
+        var oex = pf_rndbits(pf_rnd(63));
+        var oey = pf_rndbits(pf_rnd(63));
+        if ((k & 1) != 0) { oex = 0 - oex; }
+        if ((k & 2) != 0) { oey = 0 - oey; }
+        var odx = pf_rndbits(pf_rnd(63));
+        var ody = pf_rndbits(pf_rnd(63));
+        if ((k & 4) != 0) { odx = 0 - odx; }
+        if ((k & 8) != 0) { ody = 0 - ody; }
+        if (k == 0) {
+            odx = 1 << 63;
+            ody = 1 << 63;
+            oex = 1 << 63;
+        }
+        if (k == 1) {
+            oA = 1;
+            odx = 9223372036854775807;
+            ody = 9223372036854775807;
+        }
+        _sd_paint_focal_setup(oex, oey, oA);
+        var ot = _sd_paint_focal_t(odx, ody);
+        var ou = _sd_gradient_spread(k % 3, ot, _sd_paint_rem, SD_ONE);
+        if (ou < 0) { obad = obad + 1; }
+        if (ou > 65536) { obad = obad + 1; }
+        ocount = ocount + 1;
+        k = k + 1;
+    }
+    check(obad, 0);                                                     #141
+    check(ocount, 4000);                                                #142 — every call returned
+    var cvo = pf_full(12, 9);
+    var so = sd_surface_new(12, 9);
+    var mo1 = sd_matrix_new(1073741823, 1073741823, 1073741823, 1073741822, 1073741823, 0 - 1073741823);
+    var mo2 = sd_matrix_new(1, 0, 0, 1, 0, 0);
+    var ocalls = 0;
+    k = 0;
+    while (k < 90) {
+        var go = 0;
+        var oa = pf_rndbits(40) - 549755813888;
+        var ob = pf_rndbits(40) - 549755813888;
+        var oc = pf_rndbits(40) - 549755813888;
+        if (k % 3 == 0) { go = sd_gradient_linear(oa, ob, oc, pf_rndbits(40)); }
+        if (k % 3 == 1) { go = sd_gradient_radial(oa, ob, oc); }
+        if (k % 3 == 2) { go = sd_gradient_radial_focal(oa, ob, oc, pf_rndbits(40), 0 - pf_rndbits(40)); }
+        pf_zigzag(go);
+        sd_gradient_set_spread(go, k % 3);
+        if ((k & 4) != 0) { sd_gradient_set_matrix(go, mo1); }
+        if ((k & 8) != 0) { sd_gradient_set_matrix(go, mo2); }
+        if (sd_canvas_blit_paint(cvo, so, go) != SADISH_OK) { obad = obad + 1; }
+        ocalls = ocalls + 1;
+        k = k + 1;
+    }
+    check(obad, 0);                                                     #143
+    check(ocalls, 90);                                                  #144 — every blit returned
+
+    if (g_fails == 0) {
+        var ok = "paint_focal_test: PASS (focal radial, transforms, invert, OOM, 0 B blits)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "paint_focal_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

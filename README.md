@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.6.0
+Version: 0.7.0
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -62,10 +62,30 @@ toolkit are all **consumers**, not re-implementations.
     4-sub-scanline engine is unchanged.
   - **Stride-correct surfaces** — every primitive, blit, the PPM writer and the
     presenter address rows by `sd_surface_stride`.
-- **next (candidates):** stroke dashes; two-point/focal radial gradients and
-  gradient transforms; a growable edge list (lift `SD_FLATTEN_CAP`); a
-  premultiplied coverage blit for agnos `gpu_shader_op` #92; the clip-mask pitch
-  (`docs/development/issues/2026-09-15-…`).
+- **v0.7.0 — dashes, focal gradients, real alpha (shipped).** All five 0.6.0
+  candidates, byte-identical for everything a 0.6.0 caller does (refagree 200/200):
+  - **Dashed strokes** — `sd_canvas_stroke_path_dash` (SVG `stroke-dasharray` /
+    `stroke-dashoffset`) over the styled stroker (`src/dash.cyr`).
+  - **Focal radial gradients + gradient transforms** — `sd_gradient_radial_focal`,
+    `sd_gradient_set_matrix`, plus `sd_matrix_invert` (`src/paint.cyr`, `src/geom.cyr`).
+  - **Premultiplied writers** — transparent/translucent clears, rects, coverage
+    blits and gradient paint with REAL alpha, for `SETU_SURF_PREMULTIPLIED`
+    surfaces agnos composites with `gpu_shader_op` #92 (`src/premul.cyr`).
+  - **`SD_FLATTEN_CAP` stops being a cliff** — the edge list, crossings, stroke
+    run, curve flags, styled batch and `sd_path_flatten` all GROW instead of
+    silently truncating; a 20,000-gon disc filled 24.5 % of its ink in 0.6.0 and
+    99.997 % now. ⚠ The trade: growth is process-lifetime on an allocator with no
+    `free()`, so it is BOUNDED by default — `sd_grow_limit_set` /
+    `sd_grow_limit_get`, `SD_GROW_LIMIT_DEFAULT` = 8 MiB a request; over it a fill
+    degrades and RECORDS the truncation rather than growing without limit.
+  - **Clip-mask pitch** — a mask is a packed `w*h` block on a canvas of any stride,
+    stated in the layout comment and gated by `programs/clip_pitch_test.cyr`.
+- **next (0.7.1 — filed by rekha, not started):** bound the work `sd_path_flatten`
+  does past its output (MEASURED on 0.7.0: 83,623,976 B and 3.13 M allocations for
+  one hostile 4,096-quad flatten); check every `sd_alloc` result in path
+  construction, so a hook that refuses returns cleanly instead of faulting; and
+  `sd_path_new_cap` for known-size paths. See `docs/development/issues/2026-09-15-*`
+  and `docs/development/proposals/2026-09-15-*`.
 
 ## Place in the stack
 
@@ -100,7 +120,7 @@ as the hook around a text draw and blits through `sd_canvas_blit_at`), crab
 dhancha also carry a `path = "../sadish"` dev override). The complete 2D vector
 core — fill, stroke, gradient, affine transforms, clip, and analytic AA — is
 live as of **v0.4.0**; styled strokes, gradient paint and exact 2-axis coverage
-as of **v0.6.0**.
+as of **v0.6.0**; dashes, focal gradients and premultiplied output as of **v0.7.0**.
 
 ## Dependencies
 
@@ -120,7 +140,8 @@ cyrius build programs/smoke.cyr build/sadish-smoke    # link-check
 
 # RUN tests (each self-checks and exits non-zero on failure)
 for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present blend alloc \
-         stride stroke_style paint area integration; do
+         stride stroke_style paint area integration grow_edges paint_focal premul \
+         dash clip_pitch paint_premul; do
   cyrius build "programs/${t}_test.cyr" "build/${t}_test" && "./build/${t}_test"
 done
 ```

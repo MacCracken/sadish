@@ -10,7 +10,7 @@
 #      the walk quantizes it to 63; the miter's outer corner pixel reads 0.1 px^2 = 25;
 #   C. that dispatch honours the clip mask and MAX-combines with existing coverage;
 #   D. gradient paint through AREA coverage onto a WRAPPED surface equals sd_canvas_blit_at;
-#   E. sadish_version() == 600.
+#   E. sadish_version() == 700.
 # Exit code = failed checks; each failure prints its check number.
 
 include "src/lib.cyr"
@@ -167,7 +167,7 @@ fn main(): i64 {
     check(sd_surface_pixel_at(ws, 8, 5), sd_rgb(20, 140, 230));        # 32 — the band, at the stride
 
     # ---- E. version probe -----------------------------------------------------------------------
-    check(sadish_version(), 600);                                      # 33
+    check(sadish_version(), 700);                                      # 33
 
     if (g_fails == 0) {
         var ok = "integration_test: PASS (AREA styled strokes, clip/MAX, paint on wrapped, first-use alloc)\n";

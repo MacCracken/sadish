@@ -1,0 +1,1319 @@
+# programs/paint_premul_test.cyr — RUN test for GRADIENT PAINT onto a PREMULTIPLIED surface:
+# sd_canvas_blit_paint_premul_at / sd_canvas_blit_paint_premul (src/premul.cyr), painted by
+# src/paint.cyr's loop under `pm` (one evaluation, two compositors).
+#
+# ⭐ WHY A NEW SUITE rather than more of programs/premul_test.cyr. That suite owns the SOLID
+# premultiplied writers and was already 129 checks; everything here needs the gradient rigs the paint
+# suites have and it has none — stop tables, spreads, focal points, gradient transforms, and the
+# PROBE gradients group C builds. What DID go into premul_test is exactly what the brief asks for:
+# its invariant sweep, extended to the gradient path over its own pair grid (group M there, which
+# reuses its ref_px / valid_pm / pg_bad verbatim because a ONE-STOP gradient is a uniform colour).
+# The varying-colour invariant sweep is group F below.
+#
+# ⭐ THE PROBE IDEA, which most of this suite rests on. A pixel's paint colour depends only on the
+# gradient and the pixel's CANVAS position — never on coverage or on the destination. So for any
+# gradient spec this suite builds two more gradients with the SAME offsets, spread, geometry and
+# matrix, differing only in their stop colours:
+#   · the COLOUR probe — every stop opaque, same RGB   -> its straight full-coverage blit stores the
+#     exact interpolated RGB of every pixel (an opaque source at coverage 255 stores its own bytes);
+#   · the ALPHA probe  — every stop opaque sd_rgb(a, a, a), a = the real stop's sd_alpha_of   -> its
+#     blit stores the exact interpolated STRAIGHT alpha, because _sd_gradient_lerp runs the alpha
+#     lane through the same expression as a colour lane.
+# Together they give an INDEPENDENT (r, g, b, a) for every pixel, from which the reference below
+# computes the expected premultiplied pixel with its own arithmetic — the kernel's cov_ref_px,
+# written from agnos gpu.cyr, not from src/premul.cyr. A premul blit that stepped t differently, or
+# read a different ramp cell, or premultiplied at the wrong moment, misses it.
+#
+# Group by group:
+#   A. wiring: return codes, the no-ops (no stops / blocked matrix), and 0 B per blit — the FIRST
+#      blit of the process, and every kind under an arena hook.
+#   B. ⛔ OPAQUE EQUIVALENCE against sd_canvas_blit_paint_at: at full coverage every one of the 12
+#      specs paints byte-identical pixels; and at EVERY coverage over an opaque destination the two
+#      differ exactly by the straight blit's truncation (premul - straight is 0 or +1 per lane, +1
+#      iff m mod 255 >= 128) — which pins the shared evaluation at partial coverage too.
+#   C. the per-pixel reference above, for all 12 specs x 3 destinations x 3 coverage rigs.
+#   D. opaque -> transparent over a TRANSPARENT clear: out_a is the interpolated stop alpha x
+#      coverage, rounded once, and out_c <= out_a everywhere.
+#   E. an anti-aliased PATH edge x stop alpha, pixel by pixel.
+#   F. ⛔ out_c <= out_a swept over ALL 32,896 valid (d_c, d_a) destinations under a varying-alpha
+#      gradient and a coverage ramp, for four specs.
+#   G. a WRAPPED surface (stride != width*4) with sentinel padding and guard rows.
+#   H. clipping on every side, negative and overflowing offsets, a canvas larger than the surface.
+#   I. every spread and every kind at least once — covered by B/C/F's 12 specs, asserted as a count.
+#   J. a ONE-STOP gradient paints sd_canvas_blit_premul_at's bytes exactly, at every alpha.
+#   K. ⛔ the alpha traps: a stop alpha byte of 0 is OPAQUE (the legacy rule, inherited), the faintest
+#      expressible stop, where the straight blit's rounded source alpha reaches 0 and this one does
+#      not, and the MEASURED premultiply-after-interpolation claim from src/premul.cyr's header.
+#   L. ⛔ the DIVERGENCE BOUND against sd_canvas_blit_paint_at, as numbers rather than as prose:
+#      B's "byte-identical at full coverage" is the OPAQUE gradient's promise ONLY, and with a
+#      translucent stop the signed difference reaches ±2 (±1 at full coverage). Both extremes are
+#      pinned as witnesses and the bound is swept over 1,560,600 lane inputs.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "paint_premul_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+var g_arena = 0;
+
+fn hook_alloc(n): i64 {
+    return arena_alloc(g_arena, n);
+}
+
+# ---- references, written from the kernel's formulas (agnos gpu.cyr), not from src/premul.cyr ------
+# cov_ref_px, one channel: premultiplied colour `pc`, its alpha `ca`, coverage `cv`, destination `dc`.
+fn ref_cov(pc, ca, cv, dc): i64 {
+    var num = pc * cv * 255 + dc * (65025 - ca * cv);
+    return (num * 2 + 65025) / 130050;
+}
+
+# The whole pixel for a PAINT colour `e` (0xAARRGGBB with the ACTUAL alpha) at coverage `cv` over the
+# premultiplied destination `dst`. The premultiply is written out by hand as floor(c * a / 255), and
+# it happens HERE — after the interpolation that produced `e`, exactly as the blit does it.
+fn ref_paint_px(dst, e, cv): i64 {
+    if (cv == 0) { return dst; }
+    var al = (e >> 24) & 255;
+    if (al == 0) { return dst; }
+    var b = ref_cov(((e & 255) * al) / 255, al, cv, dst & 255);
+    var gn = ref_cov((((e >> 8) & 255) * al) / 255, al, cv, (dst >> 8) & 255);
+    var r = ref_cov((((e >> 16) & 255) * al) / 255, al, cv, (dst >> 16) & 255);
+    var ao = ref_cov(al, al, cv, (dst >> 24) & 255);
+    return (ao << 24) | (r << 16) | (gn << 8) | b;
+}
+
+# 1 when every colour byte of 0xAARRGGBB `p` is <= its alpha byte.
+fn valid_pm(p): i64 {
+    var al = (p >> 24) & 255;
+    if ((p & 255) > al) { return 0; }
+    if (((p >> 8) & 255) > al) { return 0; }
+    if (((p >> 16) & 255) > al) { return 0; }
+    return 1;
+}
+
+var g_invalid = 0;
+
+# ---- surfaces and canvases -----------------------------------------------------------------------
+# A w*h canvas whose every pixel has full coverage.
+fn pp_full(w, h): i64 {
+    var cv = sd_canvas_new(w, h);
+    memset(sd_canvas_coverage(cv), 255, w * h);
+    return cv;
+}
+
+# Coverage rig `k` on canvas `cv`: 0 full, 1 a ramp with zeros in it, 2 the AA fill of a path.
+fn pp_cov(cv, k): i64 {
+    var w = sd_canvas_width(cv);
+    var h = sd_canvas_height(cv);
+    if (k == 0) {
+        memset(sd_canvas_coverage(cv), 255, w * h);
+        return 0;
+    }
+    if (k == 1) {
+        var y = 0;
+        while (y < h) {
+            var x = 0;
+            while (x < w) {
+                var v = (x * 17 + y * 43 + 5) & 255;
+                if (((x + y) % 7) == 0) { v = 0; }
+                if (((x * 3 + y) % 11) == 0) { v = 255; }
+                store8(sd_canvas_coverage(cv) + y * sd_canvas_stride(cv) + x, v);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        return 0;
+    }
+    sd_canvas_clear(cv);
+    var p = sd_path_new();
+    sd_path_moveto(p, 2 * SD_ONE + 21845, 1 * SD_ONE + 32768);
+    sd_path_lineto(p, (w - 2) * SD_ONE - 13107, 3 * SD_ONE);
+    sd_path_lineto(p, (w - 4) * SD_ONE, (h - 1) * SD_ONE - 26214);
+    sd_path_lineto(p, 4 * SD_ONE + 40000, (h - 3) * SD_ONE);
+    sd_path_close(p);
+    sd_canvas_fill_path(cv, p, SD_FILL_NONZERO);
+    return 0;
+}
+
+# A VALID premultiplied destination pixel for (x, y): 0 transparent, 1 opaque patterned, 2 a mixed
+# premultiplied pattern (every lane clamped to its alpha, so the destination itself is always valid).
+fn dpat(k, x, y): i64 {
+    if (k == 0) { return 0; }
+    if (k == 1) {
+        return 0xFF000000 | (((x * 7 + y * 3) & 255) << 16) | (((x * 11 + 9) & 255) << 8) | ((y * 5 + x) & 255);
+    }
+    var al = (x * 13 + y * 29 + 7) & 255;
+    var b = (x * 3) & 255;
+    if (b > al) { b = al; }
+    var gn = (y * 19 + 4) & 255;
+    if (gn > al) { gn = al; }
+    var r = al - b;
+    return (al << 24) | (r << 16) | (gn << 8) | b;
+}
+
+# Fill surface `s` with destination pattern `k`, addressed by the surface's own stride.
+fn fill_dst(s, k): i64 {
+    var w = sd_surface_width(s);
+    var h = sd_surface_height(s);
+    var px = sd_surface_pixels(s);
+    var st = sd_surface_stride(s);
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            store32(px + y * st + x * 4, dpat(k, x, y));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Copy every pixel of `src` (read at its stride) into `dst` (written at ITS stride, and at least as
+# large): a snapshot of a destination before a blit, which may be smaller than the snapshot surface.
+fn surf_copy(dst, src): i64 {
+    var w = sd_surface_width(src);
+    var h = sd_surface_height(src);
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            store32(sd_surface_pixels(dst) + y * sd_surface_stride(dst) + x * 4, sd_surface_rgba_at(src, x, y));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Pixels (all four bytes) that differ between two surfaces of equal size, read at their strides.
+fn surf_diff(s1, s2): i64 {
+    var d = 0;
+    var y = 0;
+    while (y < sd_surface_height(s1)) {
+        var x = 0;
+        while (x < sd_surface_width(s1)) {
+            if (sd_surface_rgba_at(s1, x, y) != sd_surface_rgba_at(s2, x, y)) { d = d + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return d;
+}
+
+# ---- the gradient spec, and the two probes -------------------------------------------------------
+var ST_MAX = 16;
+var st_off = 0;
+var st_col = 0;
+var ST_N = 0;
+
+fn st_reset(): i64 {
+    ST_N = 0;
+    return 0;
+}
+
+fn st_add(o, c): i64 {
+    store64(st_off + ST_N * 8, o);
+    store64(st_col + ST_N * 8, c);
+    ST_N = ST_N + 1;
+    return 0;
+}
+
+# The current geometry: kind (0 linear, 1 radial, 2 focal), four 16.16 parameters, focal point,
+# spread, and an optional SdMatrix.
+var GK = 0;
+var GP0 = 0;
+var GP1 = 0;
+var GP2 = 0;
+var GP3 = 0;
+var GFX = 0;
+var GFY = 0;
+var GSPREAD = 0;
+var GMAT = 0;
+
+# Build the current spec. `mode`: 0 the gradient itself, 1 the COLOUR probe (every stop opaque, same
+# RGB), 2 the ALPHA probe (every stop opaque sd_rgb(a, a, a), a = sd_alpha_of of the real stop).
+fn mk(mode): i64 {
+    var gr = 0;
+    if (GK == 0) { gr = sd_gradient_linear(GP0, GP1, GP2, GP3); }
+    if (GK == 1) { gr = sd_gradient_radial(GP0, GP1, GP2); }
+    if (GK == 2) { gr = sd_gradient_radial_focal(GP0, GP1, GP2, GFX, GFY); }
+    var i = 0;
+    while (i < ST_N) {
+        var c = load64(st_col + i * 8);
+        if (mode == 1) { c = sd_rgb(sd_color_r(c), sd_color_g(c), sd_color_b(c)); }
+        if (mode == 2) {
+            var al = sd_alpha_of(c);
+            c = sd_rgb(al, al, al);
+        }
+        sd_gradient_add_stop(gr, load64(st_off + i * 8), c);
+        i = i + 1;
+    }
+    sd_gradient_set_spread(gr, GSPREAD);
+    if (GMAT != 0) { sd_gradient_set_matrix(gr, GMAT); }
+    return gr;
+}
+
+# The reference surfaces for the current spec, at the CANVAS size: the exact RGB of every canvas
+# pixel and the exact straight alpha of every canvas pixel, both from the STRAIGHT blit at full
+# coverage (an opaque source at coverage 255 stores its own bytes — src/paint.cyr's contract).
+var g_refc = 0;
+var g_refa = 0;
+
+fn build_refs(w, h): i64 {
+    var cvf = pp_full(w, h);
+    g_refc = sd_surface_new(w, h);
+    g_refa = sd_surface_new(w, h);
+    sd_canvas_blit_paint(cvf, g_refc, mk(1));
+    sd_canvas_blit_paint(cvf, g_refa, mk(2));
+    return 0;
+}
+
+# The paint colour of canvas pixel (x, y) under the current spec: 0xAARRGGBB, ACTUAL alpha.
+fn ref_e(x, y): i64 {
+    var al = sd_surface_rgba_at(g_refa, x, y) & 255;
+    return (al << 24) | (sd_surface_rgba_at(g_refc, x, y) & 16777215);
+}
+
+# ⭐ THE CHECK. Surface `s` after sd_canvas_blit_paint_premul_at(cv, s, <spec>, dx, dy), against the
+# destination it had (packed snapshot `dsnap`) and the probes: every pixel of the surface, inside the
+# blit window and out, must be ref_paint_px of its own destination, paint colour and coverage.
+# Counts differing pixels; invalid premultiplied results go into g_invalid.
+fn pm_check(s, dsnap, cv, dx, dy): i64 {
+    var bad = 0;
+    var w = sd_surface_width(s);
+    var h = sd_surface_height(s);
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var want = sd_surface_rgba_at(dsnap, x, y);
+            var cov = sd_canvas_coverage_at(cv, x - dx, y - dy);
+            if (cov != 0) { want = ref_paint_px(want, ref_e(x - dx, y - dy), cov); }
+            var got = sd_surface_rgba_at(s, x, y);
+            if (got != want) { bad = bad + 1; }
+            if (valid_pm(got) == 0) { g_invalid = g_invalid + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return bad;
+}
+
+# One spec x one coverage rig x one destination, end to end: fill, snapshot, blit, check.
+fn run_case(s, dsnap, cv, dx, dy, dk): i64 {
+    fill_dst(s, dk);
+    surf_copy(dsnap, s);
+    var r = sd_canvas_blit_paint_premul_at(cv, s, mk(0), dx, dy);
+    if (r != SADISH_OK) { return 1000000; }
+    return pm_check(s, dsnap, cv, dx, dy);
+}
+
+# ---- the 12 specs: every kind, every spread, transformed, and both degenerate geometries ---------
+var SPECS = 12;
+var g_mrot = 0;
+var g_mscale = 0;
+var g_mshear = 0;
+
+# Stops shared by every spec: opaque red, a translucent yellow-green, a hard pair at 0.55 (so a ramp
+# cell is MARKED and its pixels take the stop search), and a nearly transparent blue at 1.
+fn spec_stops(): i64 {
+    st_reset();
+    st_add(0, sd_rgb(255, 16, 0));
+    st_add(SD_ONE / 4, sd_rgba(200, 255, 64, 160));
+    st_add((SD_ONE * 55) / 100, sd_rgba(0, 200, 200, 90));
+    st_add((SD_ONE * 55) / 100, sd_rgba(250, 250, 10, 220));
+    st_add((SD_ONE * 7) / 8, sd_rgba(16, 32, 48, 40));
+    st_add(SD_ONE, sd_rgba(0, 0, 255, 1));
+    return 0;
+}
+
+fn spec(i): i64 {
+    spec_stops();
+    GK = 0;
+    GP0 = 0;
+    GP1 = 0;
+    GP2 = 0;
+    GP3 = 0;
+    GFX = 0;
+    GFY = 0;
+    GSPREAD = SD_SPREAD_PAD;
+    GMAT = 0;
+    if (i == 0) {                               # linear PAD, fractional non-axis-aligned axis
+        GP0 = 2 * SD_ONE + 32768;
+        GP1 = 1 * SD_ONE + 32768;
+        GP2 = 29 * SD_ONE + 16384;
+        GP3 = 21 * SD_ONE + 49152;
+        return 0;
+    }
+    if (i == 1) {                               # linear REPEAT, short axis (many periods)
+        GP0 = 4 * SD_ONE;
+        GP1 = 4 * SD_ONE;
+        GP2 = 12 * SD_ONE + 9000;
+        GP3 = 9 * SD_ONE;
+        GSPREAD = SD_SPREAD_REPEAT;
+        return 0;
+    }
+    if (i == 2) {                               # linear REFLECT, the same short axis
+        GP0 = 4 * SD_ONE;
+        GP1 = 4 * SD_ONE;
+        GP2 = 12 * SD_ONE + 9000;
+        GP3 = 9 * SD_ONE;
+        GSPREAD = SD_SPREAD_REFLECT;
+        return 0;
+    }
+    if (i == 3) {                               # radial PAD
+        GK = 1;
+        GP0 = 16 * SD_ONE + 32768;
+        GP1 = 12 * SD_ONE + 16384;
+        GP2 = 11 * SD_ONE + 49152;
+        return 0;
+    }
+    if (i == 4) {                               # radial REPEAT, small radius
+        GK = 1;
+        GP0 = 14 * SD_ONE;
+        GP1 = 11 * SD_ONE + 32768;
+        GP2 = 5 * SD_ONE + 32768;
+        GSPREAD = SD_SPREAD_REPEAT;
+        return 0;
+    }
+    if (i == 5) {                               # focal radial PAD
+        GK = 2;
+        GP0 = 16 * SD_ONE;
+        GP1 = 12 * SD_ONE;
+        GP2 = 13 * SD_ONE;
+        GFX = 10 * SD_ONE + 32768;
+        GFY = 8 * SD_ONE + 16384;
+        return 0;
+    }
+    if (i == 6) {                               # focal radial REFLECT
+        GK = 2;
+        GP0 = 16 * SD_ONE;
+        GP1 = 12 * SD_ONE;
+        GP2 = 7 * SD_ONE;
+        GFX = 19 * SD_ONE;
+        GFY = 14 * SD_ONE + 32768;
+        GSPREAD = SD_SPREAD_REFLECT;
+        return 0;
+    }
+    if (i == 7) {                               # linear PAD under rotate(30) x scale(2)
+        GP0 = 2 * SD_ONE;
+        GP1 = 2 * SD_ONE;
+        GP2 = 14 * SD_ONE;
+        GP3 = 5 * SD_ONE;
+        GMAT = g_mrot;
+        return 0;
+    }
+    if (i == 8) {                               # radial PAD under a shear
+        GK = 1;
+        GP0 = 13 * SD_ONE;
+        GP1 = 10 * SD_ONE;
+        GP2 = 13 * SD_ONE + 32768;
+        GMAT = g_mshear;
+        return 0;
+    }
+    if (i == 9) {                               # focal REPEAT under scale(2)
+        GK = 2;
+        GP0 = 8 * SD_ONE;
+        GP1 = 6 * SD_ONE;
+        GP2 = 5 * SD_ONE;
+        GFX = 6 * SD_ONE + 32768;
+        GFY = 5 * SD_ONE;
+        GSPREAD = SD_SPREAD_REPEAT;
+        GMAT = g_mscale;
+        return 0;
+    }
+    if (i == 10) {                              # DEGENERATE linear axis: the last stop, everywhere
+        GP0 = 5 * SD_ONE;
+        GP1 = 5 * SD_ONE;
+        GP2 = 5 * SD_ONE;
+        GP3 = 5 * SD_ONE;
+        return 0;
+    }
+    GK = 1;                                     # 11: r = 0 — likewise the last stop
+    GP0 = 7 * SD_ONE;
+    GP1 = 7 * SD_ONE;
+    GP2 = 0;
+    return 0;
+}
+
+# ---- group B: against sd_canvas_blit_paint_at -----------------------------------------------------
+# At FULL coverage an OPAQUE gradient over ANY destination must paint byte-identical pixels through
+# the two blits (straight stores (b, g, r, 255); premul's k == 65025 stores P at a = 255, the same
+# four bytes). Differing pixels, over an opaque destination.
+fn eq_full(w, h, dk): i64 {
+    var cv = pp_full(w, h);
+    var s1 = sd_surface_new(w, h);
+    var s2 = sd_surface_new(w, h);
+    fill_dst(s1, dk);
+    fill_dst(s2, dk);
+    sd_canvas_blit_paint(cv, s1, mk(1));
+    sd_canvas_blit_paint_premul(cv, s2, mk(1));
+    return surf_diff(s1, s2);
+}
+
+# Distinct pixel values in the straight blit of the colour probe at full coverage — a spec that
+# paints one flat colour would make eq_full vacuous. Counted as "pixels differing from pixel (0,0)".
+fn eq_variety(w, h): i64 {
+    var cv = pp_full(w, h);
+    var s1 = sd_surface_new(w, h);
+    sd_canvas_blit_paint(cv, s1, mk(1));
+    var v0 = sd_surface_rgba_at(s1, 0, 0);
+    var n = 0;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            if (sd_surface_rgba_at(s1, x, y) != v0) { n = n + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return n;
+}
+
+# ⭐ At EVERY coverage, opaque gradient over an OPAQUE destination, per lane:
+#   m = c*cov + d*(255 - cov),  straight = floor(m / 255),  premul = floor((2m + 255) / 510)
+#          ⇒ premul - straight is 0 or +1, and +1 exactly when m mod 255 >= 128
+# (src/premul.cyr's ⚠ AGAINST sd_canvas_blit_at note, here with the PAINT's per-pixel colour, taken
+# from the colour probe). Violations of the law, over the coverage rig `ck`.
+fn eq_law(w, h, ck, dk): i64 {
+    var cv = sd_canvas_new(w, h);
+    pp_cov(cv, ck);
+    var s1 = sd_surface_new(w, h);
+    var s2 = sd_surface_new(w, h);
+    fill_dst(s1, dk);
+    fill_dst(s2, dk);
+    sd_canvas_blit_paint(cv, s1, mk(1));
+    sd_canvas_blit_paint_premul(cv, s2, mk(1));
+    var bad = 0;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var cov = sd_canvas_coverage_at(cv, x, y);
+            if (cov != 0) {
+                var e = ref_e(x, y);
+                var ws = sd_surface_rgba_at(s1, x, y);
+                var wp = sd_surface_rgba_at(s2, x, y);
+                if (((wp >> 24) & 255) != 255) { bad = bad + 1; }
+                var lane = 0;
+                while (lane < 3) {
+                    var c = (e >> (lane * 8)) & 255;
+                    var d = (dpat(dk, x, y) >> (lane * 8)) & 255;
+                    var m = c * cov + d * (255 - cov);
+                    var vs = (ws >> (lane * 8)) & 255;
+                    var vp = (wp >> (lane * 8)) & 255;
+                    if (vs != m / 255) { bad = bad + 1; }
+                    var want = vs;
+                    if ((m % 255) >= 128) { want = vs + 1; }
+                    if (vp != want) { bad = bad + 1; }
+                    lane = lane + 1;
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return bad;
+}
+
+# ---- group F: the invariant sweep over every valid (d_c, d_a) -------------------------------------
+# A 256 x 129 surface whose first 32,896 pixels hold every (d_c, d_a) with d_c <= d_a in the blue
+# lane (green = d_a - d_c, red = (3 d_c + d_a) / 4, both <= d_a); the rest transparent.
+fn pg_px(dc, da): i64 {
+    return (da << 24) | (((dc * 3 + da) / 4) << 16) | ((da - dc) << 8) | dc;
+}
+
+fn pg_reset(s): i64 {
+    var px = sd_surface_pixels(s);
+    var i = 0;
+    var da = 0;
+    while (da < 256) {
+        var dc = 0;
+        while (dc <= da) {
+            store32(px + i * 4, pg_px(dc, da));
+            i = i + 1;
+            dc = dc + 1;
+        }
+        da = da + 1;
+    }
+    while (i < 256 * 129) {
+        store32(px + i * 4, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---- group G: the wrapped rig — 21 x 13 over a 29-px pitch, 4 px left pad, 3 guard rows each side -
+var WR_W = 21;
+var WR_H = 13;
+var WR_STRIDE = 116;        # 29 px * 4 — width*4 would be 84
+var WR_LX = 4;
+var WR_GT = 3;
+var WR_GB = 3;
+var WR_SENT = 173;
+var g_wbuf = 0;
+var g_wlen = 0;
+var g_wpx = 0;
+
+fn wr_guard_bad(): i64 {
+    var bad = 0;
+    var i = 0;
+    while (i < g_wlen) {
+        var row = i / WR_STRIDE;
+        var col = i % WR_STRIDE;
+        var inwin = 0;
+        if (row >= WR_GT) {
+            if (row < WR_GT + WR_H) {
+                if (col >= WR_LX * 4) {
+                    if (col < (WR_LX + WR_W) * 4) { inwin = 1; }
+                }
+            }
+        }
+        if (inwin == 0) {
+            if (load8(g_wbuf + i) != WR_SENT) { bad = bad + 1; }
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# ---- group L: the divergence from sd_canvas_blit_paint_at, as a NUMBER ---------------------------
+# ⛔ src/premul.cyr's ⚠ note on the two blits, asserted rather than asserted-in-prose. Group B's
+# "byte-identical at full coverage" is the OPAQUE gradient's promise ONLY: the straight blit rounds
+# its effective source alpha DOWN to a byte (sa = cov * paint_alpha / 255) before it truncates its
+# store, and for an opaque paint that first rounding is exact (sa = cov) — so it is invisible there
+# and only there. With a TRANSLUCENT stop the two roundings compound and can reach TWO levels, and
+# full coverage no longer saves it. Both helpers below paint a ONE-STOP gradient (uniform colour and
+# stop alpha, so the paint colour of every pixel is exactly (c, pa)) through BOTH blits over an
+# OPAQUE destination, and compare the blue lane.
+var LV_S = 0;
+var LV_P = 0;
+var LV_CV = 0;
+var LV_S1 = 0;
+var LV_S2 = 0;
+
+# The current spec := a one-stop gradient, colour (c, c, c) at stop alpha `pa`, over a `w`-wide axis.
+fn lv_spec(c, pa, w): i64 {
+    st_reset();
+    st_add(0, sd_rgba(c, c, c, pa));
+    GK = 0;
+    GP0 = 0;
+    GP1 = 0;
+    GP2 = w * SD_ONE;
+    GP3 = 0;
+    GSPREAD = SD_SPREAD_PAD;
+    GMAT = 0;
+    return 0;
+}
+
+# One witness: colour `c` at stop alpha `pa`, uniform coverage `cov`, every destination lane `d`
+# (opaque). Leaves the straight blue lane in LV_S and the premultiplied one in LV_P; returns
+# LV_P - LV_S, the signed divergence at that lane input.
+fn lv_pair(c, pa, cov, d): i64 {
+    memset(sd_canvas_coverage(LV_CV), cov, 4 * 3);
+    var dp = 0xFF000000 | (d << 16) | (d << 8) | d;
+    var y = 0;
+    while (y < 3) {
+        var x = 0;
+        while (x < 4) {
+            store32(sd_surface_pixels(LV_S1) + y * sd_surface_stride(LV_S1) + x * 4, dp);
+            store32(sd_surface_pixels(LV_S2) + y * sd_surface_stride(LV_S2) + x * 4, dp);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    lv_spec(c, pa, 4);
+    sd_canvas_blit_paint(LV_CV, LV_S1, mk(0));
+    sd_canvas_blit_paint_premul(LV_CV, LV_S2, mk(0));
+    LV_S = sd_surface_rgba_at(LV_S1, 1, 1) & 255;
+    LV_P = sd_surface_rgba_at(LV_S2, 1, 1) & 255;
+    return LV_P - LV_S;
+}
+
+# The sweep rig: coverage = x + 1 across a 255-wide row (1..255, cov = 255 in the LAST column),
+# destination lane = lg_d(y) down the 8 rows.
+var LG_W = 255;
+var LG_H = 8;
+var LG_CV = 0;
+var LG_S1 = 0;
+var LG_S2 = 0;
+var LG_MIN = 0;
+var LG_MAX = 0;
+var LG_MINF = 0;
+var LG_MAXF = 0;
+var LG_P2 = 0;
+var LG_N2 = 0;
+var LG_DIFF = 0;
+
+fn lg_d(y): i64 {
+    if (y == 0) { return 0; }
+    if (y == 1) { return 1; }
+    if (y == 2) { return 2; }
+    if (y == 3) { return 127; }
+    if (y == 4) { return 128; }
+    if (y == 5) { return 225; }
+    if (y == 6) { return 254; }
+    return 255;
+}
+
+# One (colour, stop alpha) of the grid: both blits over the rig, every pixel's blue lane folded into
+# LG_MIN / LG_MAX (and LG_MINF / LG_MAXF in the cov = 255 column), the two-level hits counted.
+fn lg_pass(c, pa): i64 {
+    var y = 0;
+    while (y < LG_H) {
+        var d = lg_d(y);
+        var dp = 0xFF000000 | (d << 16) | (d << 8) | d;
+        var x = 0;
+        while (x < LG_W) {
+            store32(sd_surface_pixels(LG_S1) + y * sd_surface_stride(LG_S1) + x * 4, dp);
+            store32(sd_surface_pixels(LG_S2) + y * sd_surface_stride(LG_S2) + x * 4, dp);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    lv_spec(c, pa, LG_W);
+    sd_canvas_blit_paint(LG_CV, LG_S1, mk(0));
+    sd_canvas_blit_paint_premul(LG_CV, LG_S2, mk(0));
+    y = 0;
+    while (y < LG_H) {
+        var x2 = 0;
+        while (x2 < LG_W) {
+            var df = (sd_surface_rgba_at(LG_S2, x2, y) & 255) - (sd_surface_rgba_at(LG_S1, x2, y) & 255);
+            if (df != 0) { LG_DIFF = LG_DIFF + 1; }
+            if (df < LG_MIN) { LG_MIN = df; }
+            if (df > LG_MAX) { LG_MAX = df; }
+            if (df == 2) { LG_P2 = LG_P2 + 1; }
+            if (df == 0 - 2) { LG_N2 = LG_N2 + 1; }
+            if (x2 == LG_W - 1) {
+                if (df < LG_MINF) { LG_MINF = df; }
+                if (df > LG_MAXF) { LG_MAXF = df; }
+            }
+            x2 = x2 + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    st_off = alloc(ST_MAX * 8);
+    st_col = alloc(ST_MAX * 8);
+    g_mrot = sd_matrix_mul(sd_matrix_rotate(11930), sd_matrix_scale(2 * SD_ONE, 2 * SD_ONE));
+    g_mscale = sd_matrix_scale(2 * SD_ONE, 2 * SD_ONE);
+    g_mshear = sd_matrix_new(SD_ONE, SD_ONE / 2, 0 - SD_ONE / 4, SD_ONE, 3 * SD_ONE, 0 - SD_ONE);
+
+    # ---- A. wiring: return codes, the no-ops, and 0 B per blit -----------------------------------
+    var sa = sd_surface_new(33, 25);
+    var snap = sd_surface_new(33, 25);
+    var ca = pp_full(33, 25);
+    spec(0);
+    var ga = mk(0);
+    check(sd_canvas_blit_paint_premul_at(0, sa, ga, 0, 0), SADISH_ERR_BOUNDS);          # 1
+    check(sd_canvas_blit_paint_premul_at(ca, 0, ga, 0, 0), SADISH_ERR_BOUNDS);          # 2
+    check(sd_canvas_blit_paint_premul_at(ca, sa, 0, 0, 0), SADISH_ERR_BOUNDS);          # 3
+    check(sd_canvas_blit_paint_premul(0, sa, ga), SADISH_ERR_BOUNDS);                   # 4
+    check(sd_canvas_blit_paint_premul(ca, 0, ga), SADISH_ERR_BOUNDS);                   # 5
+    check(sd_canvas_blit_paint_premul(ca, sa, 0), SADISH_ERR_BOUNDS);                   # 6
+    # A gradient with NO stops paints nothing and says so; so does a BLOCKED matrix.
+    fill_dst(sa, 2);
+    surf_copy(snap, sa);
+    var gnone = sd_gradient_linear(0, 0, 8 * SD_ONE, 0);
+    check(sd_canvas_blit_paint_premul(ca, sa, gnone), SADISH_OK);                       # 7
+    check(surf_diff(sa, snap), 0);                                                      # 8
+    var gblk = sd_gradient_linear(0, 0, 8 * SD_ONE, 0);
+    sd_gradient_add_stop(gblk, 0, sd_rgb(255, 255, 255));
+    check(sd_gradient_set_matrix(gblk, sd_matrix_new(SD_ONE, 0, 2 * SD_ONE, 0, 0, 0)), SADISH_ERR_BOUNDS);   # 9
+    check(sd_canvas_blit_paint_premul(ca, sa, gblk), SADISH_OK);                        # 10
+    check(surf_diff(sa, snap), 0);                                                      # 11
+    # The FIRST-EVER premultiplied paint blit of this process: 0 B on the heap, ramp rebuild included.
+    var h0 = alloc_used();
+    check(sd_canvas_blit_paint_premul_at(ca, sa, ga, 0, 0), SADISH_OK);                 # 12
+    check(alloc_used() - h0, 0);                                                        # 13
+    # ...and every kind, under a consumer's arena hook: 0 B there and 0 B on the heap.
+    g_arena = arena_new_growable(1048576);
+    check(g_arena != 0, 1);                                                             # 14
+    var gk0 = mk(0);
+    spec(3);
+    var gk1 = mk(0);
+    spec(5);
+    var gk2 = mk(0);
+    spec(7);
+    var gk3 = mk(0);
+    spec(9);
+    var gk4 = mk(0);
+    check(sd_alloc_set(&hook_alloc), 0);                                                # 15
+    h0 = alloc_used();
+    var a0 = arena_used(g_arena);
+    sd_canvas_blit_paint_premul_at(ca, sa, gk0, 0, 0);
+    sd_canvas_blit_paint_premul_at(ca, sa, gk1, 0 - 3, 2);
+    sd_canvas_blit_paint_premul_at(ca, sa, gk2, 1, 0 - 4);
+    sd_canvas_blit_paint_premul_at(ca, sa, gk3, 0, 0);
+    sd_canvas_blit_paint_premul(ca, sa, gk4);
+    check(arena_used(g_arena) - a0, 0);                                                 # 16
+    check(alloc_used() - h0, 0);                                                        # 17
+    check(sd_alloc_set(0), &hook_alloc);                                                # 18
+
+    # ---- B. ⛔ against sd_canvas_blit_paint_at ----------------------------------------------------
+    # B1: at full coverage an OPAQUE gradient paints byte-identical pixels through both blits, for
+    # every spec — the proof that the two compositors share one evaluation, pixel for pixel.
+    var bfull = 0;
+    var bvar = 0;
+    var si = 0;
+    while (si < SPECS) {
+        spec(si);
+        bfull = bfull + eq_full(33, 25, 1);
+        bfull = bfull + eq_full(33, 25, 0);
+        if (si < 10) {
+            if (eq_variety(33, 25) > 400) { bvar = bvar + 1; }
+        }
+        si = si + 1;
+    }
+    check(bfull, 0);                                                                    # 19
+    check(bvar, 10);                                                                    # 20 — none of the 10 is flat
+    # B2: at EVERY coverage, the two differ exactly by the straight blit's truncation.
+    var blaw = 0;
+    si = 0;
+    while (si < SPECS) {
+        spec(si);
+        build_refs(33, 25);
+        blaw = blaw + eq_law(33, 25, 1, 1);
+        blaw = blaw + eq_law(33, 25, 2, 1);
+        si = si + 1;
+    }
+    check(blaw, 0);                                                                     # 21
+
+    # ---- C. the per-pixel premultiplied reference ------------------------------------------------
+    # 12 specs x 3 coverage rigs x 3 destinations, every pixel of a 33 x 25 surface against
+    # ref_paint_px of its own (destination, paint colour, coverage). The paint colour comes from the
+    # probes, so this pins the shared evaluation AND the compositing at once.
+    g_invalid = 0;
+    var cbad = 0;
+    si = 0;
+    while (si < SPECS) {
+        spec(si);
+        build_refs(33, 25);
+        var ck = 0;
+        while (ck < 3) {
+            var cvc = sd_canvas_new(33, 25);
+            pp_cov(cvc, ck);
+            var dk = 0;
+            while (dk < 3) {
+                cbad = cbad + run_case(sa, snap, cvc, 0, 0, dk);
+                dk = dk + 1;
+            }
+            ck = ck + 1;
+        }
+        si = si + 1;
+    }
+    check(cbad, 0);                                                                     # 22 — 108 blits
+    check(g_invalid, 0);                                                                # 23 — every pixel valid
+
+    # ---- D. opaque -> transparent over a TRANSPARENT clear ---------------------------------------
+    # A two-stop gradient from an opaque colour to the faintest expressible one, over (0,0,0,0):
+    # out_a must be the interpolated stop alpha times coverage, rounded once — and nothing else.
+    st_reset();
+    st_add(0, sd_rgba(250, 120, 30, 255));
+    st_add(SD_ONE, sd_rgba(250, 120, 30, 1));
+    GK = 0;
+    GP0 = SD_ONE / 2;
+    GP1 = 0;
+    GP2 = 32 * SD_ONE + SD_ONE / 2;
+    GP3 = 0;
+    GSPREAD = SD_SPREAD_PAD;
+    GMAT = 0;
+    build_refs(33, 25);
+    var cvd = sd_canvas_new(33, 25);
+    pp_cov(cvd, 1);
+    fill_dst(sa, 0);
+    surf_copy(snap, sa);
+    sd_canvas_blit_paint_premul(cvd, sa, mk(0));
+    var dbad = 0;
+    var dinv = 0;
+    var dfade = 0;
+    var dy = 0;
+    while (dy < 25) {
+        var dx = 0;
+        while (dx < 33) {
+            var cov = sd_canvas_coverage_at(cvd, dx, dy);
+            var pal = sd_surface_rgba_at(g_refa, dx, dy) & 255;
+            var got = sd_surface_rgba_at(sa, dx, dy);
+            # over a transparent destination the formula is R(a * cov * 255) = round(a*cov/255)
+            var wa = (pal * cov * 255 * 2 + 65025) / 130050;
+            if (cov == 0) { wa = 0; }
+            if (((got >> 24) & 255) != wa) { dbad = dbad + 1; }
+            if (valid_pm(got) == 0) { dinv = dinv + 1; }
+            if (((got >> 24) & 255) == 0) { dfade = dfade + 1; }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    check(dbad, 0);                                                                     # 24 — alpha == alpha x cov
+    check(dinv, 0);                                                                     # 25 — c <= a at every pixel
+    check(dfade > 40, 1);                                                               # 26 — the fade reaches 0
+    # The straight blit on the same canvas forces alpha 255 on every covered pixel — the gap closed.
+    fill_dst(sa, 0);
+    sd_canvas_blit_paint(cvd, sa, mk(0));
+    var op = 0;
+    dy = 0;
+    while (dy < 25) {
+        var dx2 = 0;
+        while (dx2 < 33) {
+            if (sd_canvas_coverage_at(cvd, dx2, dy) != 0) {
+                if (((sd_surface_rgba_at(sa, dx2, dy) >> 24) & 255) == 255) { op = op + 1; }
+            }
+            dx2 = dx2 + 1;
+        }
+        dy = dy + 1;
+    }
+    check(op > 600, 1);                                                                 # 27 — straight: all opaque
+
+    # ---- E. an anti-aliased PATH edge x stop alpha -----------------------------------------------
+    var cve = sd_canvas_new(33, 25);
+    pp_cov(cve, 2);
+    var partial = 0;
+    var ey = 0;
+    while (ey < 25) {
+        var ex = 0;
+        while (ex < 33) {
+            var cvv = sd_canvas_coverage_at(cve, ex, ey);
+            if (cvv > 0) {
+                if (cvv < 255) { partial = partial + 1; }
+            }
+            ex = ex + 1;
+        }
+        ey = ey + 1;
+    }
+    check(partial > 30, 1);                                                             # 28 — the edge really is AA
+    g_invalid = 0;
+    check(run_case(sa, snap, cve, 0, 0, 0), 0);                                         # 29 — AA edge, transparent
+    check(run_case(sa, snap, cve, 0, 0, 2), 0);                                         # 30 — ...and a premul dst
+    check(g_invalid, 0);                                                                # 31
+    # Spot value: an opaque one-stop gradient through an AA edge leaves alpha EXACTLY the coverage.
+    st_reset();
+    st_add(0, sd_rgb(255, 255, 255));
+    GK = 0;
+    GP0 = 0;
+    GP1 = 0;
+    GP2 = 20 * SD_ONE;
+    GP3 = 0;
+    GSPREAD = SD_SPREAD_PAD;
+    GMAT = 0;
+    fill_dst(sa, 0);
+    sd_canvas_blit_paint_premul(cve, sa, mk(0));
+    var wbad = 0;
+    ey = 0;
+    while (ey < 25) {
+        var ex2 = 0;
+        while (ex2 < 33) {
+            var cw = sd_canvas_coverage_at(cve, ex2, ey);
+            if (sd_surface_rgba_at(sa, ex2, ey) != ((cw << 24) | (cw << 16) | (cw << 8) | cw)) { wbad = wbad + 1; }
+            ex2 = ex2 + 1;
+        }
+        ey = ey + 1;
+    }
+    check(wbad, 0);                                                                     # 32 — white: byte == coverage
+
+    # ---- F. ⛔ out_c <= out_a over ALL 32,896 valid (d_c, d_a) ------------------------------------
+    # The pair grid as the destination, a varying-alpha gradient across it and a coverage ramp: every
+    # pixel is checked against ref_paint_px AND for validity. Four specs (linear, radial, focal,
+    # transformed), 33,024 pixels each. The proof in src/premul.cyr is monotonicity in the source
+    # term; this is what catches an implementation that does not compute the formula it proves.
+    var sf = sd_surface_new(256, 129);
+    var sfsnap = sd_surface_new(256, 129);
+    var cvf2 = sd_canvas_new(256, 129);
+    pp_cov(cvf2, 1);
+    g_invalid = 0;
+    var fbad = 0;
+    var fi = 0;
+    while (fi < 4) {
+        var sidx = 0;
+        if (fi == 1) { sidx = 3; }
+        if (fi == 2) { sidx = 5; }
+        if (fi == 3) { sidx = 7; }
+        spec(sidx);
+        # Stretch the geometry over the wide grid so the whole ramp is seen.
+        if (sidx == 0) {
+            GP0 = SD_ONE;
+            GP1 = SD_ONE;
+            GP2 = 250 * SD_ONE;
+            GP3 = 120 * SD_ONE;
+        }
+        if (sidx == 3) {
+            GP0 = 128 * SD_ONE;
+            GP1 = 64 * SD_ONE;
+            GP2 = 90 * SD_ONE;
+        }
+        if (sidx == 5) {
+            GP0 = 128 * SD_ONE;
+            GP1 = 64 * SD_ONE;
+            GP2 = 100 * SD_ONE;
+            GFX = 60 * SD_ONE;
+            GFY = 40 * SD_ONE;
+        }
+        build_refs(256, 129);
+        pg_reset(sf);
+        surf_copy(sfsnap, sf);
+        sd_canvas_blit_paint_premul(cvf2, sf, mk(0));
+        fbad = fbad + pm_check(sf, sfsnap, cvf2, 0, 0);
+        fi = fi + 1;
+    }
+    check(fbad, 0);                                                                     # 33 — 33,024 px x 4 specs
+    check(g_invalid, 0);                                                                # 34 — every one valid
+
+    # ---- G. a WRAPPED surface: rows at the stride, padding and guard rows untouched --------------
+    g_wlen = (WR_GT + WR_H + WR_GB) * WR_STRIDE;
+    g_wbuf = alloc(g_wlen);
+    memset(g_wbuf, WR_SENT, g_wlen);
+    g_wpx = g_wbuf + WR_GT * WR_STRIDE + WR_LX * 4;
+    var ws = alloc(SD_SURFACE_SIZE);
+    store64(ws + SD_SURFACE_WIDTH_OFFSET, WR_W);
+    store64(ws + SD_SURFACE_HEIGHT_OFFSET, WR_H);
+    store64(ws + SD_SURFACE_PIXELS_OFFSET, g_wpx);
+    store64(ws + SD_SURFACE_STRIDE_OFFSET, WR_STRIDE);
+    var wsnap = sd_surface_new(WR_W, WR_H);
+    var packed = sd_surface_new(WR_W, WR_H);
+    var cvw = sd_canvas_new(WR_W, WR_H);
+    pp_cov(cvw, 1);
+    g_invalid = 0;
+    var gbad = 0;
+    var gguard = 0;
+    si = 0;
+    while (si < SPECS) {
+        spec(si);
+        build_refs(WR_W, WR_H);
+        # ⚠ The WRAPPED surface first, guards checked BEFORE the packed twin is drawn: an unclipped
+        # write lands in this rig's guard bytes (and fails here) rather than past a packed buffer.
+        gbad = gbad + run_case(ws, wsnap, cvw, 0, 0, 2);
+        gguard = gguard + wr_guard_bad();
+        gbad = gbad + run_case(packed, wsnap, cvw, 0, 0, 2);
+        gbad = gbad + surf_diff(ws, packed);
+        si = si + 1;
+    }
+    check(gbad, 0);                                                                     # 35 — wrapped == reference
+    check(gguard, 0);                                                                   # 36 — padding untouched
+    check(g_invalid, 0);                                                                # 37
+    # Row 2 of the wrapped window really is 2 * 116 bytes in, not 2 * 84.
+    check(sd_surface_rgba_at(ws, 5, 2), load32(g_wpx + 2 * WR_STRIDE + 5 * 4));         # 38
+    # ...and a clipped blit on the wrapped surface stays in the window too.
+    spec(5);
+    build_refs(WR_W, WR_H);
+    check(run_case(ws, wsnap, cvw, 0 - 6, 4, 2), 0);                                    # 39
+    check(wr_guard_bad(), 0);                                                           # 40
+
+    # ---- H. clipping on every side ---------------------------------------------------------------
+    # run_case checks EVERY pixel of the surface, inside the clipped window and outside it, so each
+    # of these pins both halves: what was painted, and what was left alone.
+    var cvh = sd_canvas_new(9, 7);
+    pp_cov(cvh, 1);
+    var hbad = 0;
+    g_invalid = 0;
+    si = 0;
+    while (si < SPECS) {
+        spec(si);
+        build_refs(9, 7);
+        hbad = hbad + run_case(sa, snap, cvh, 5, 4, 2);                # inside
+        hbad = hbad + run_case(sa, snap, cvh, 0 - 3, 4, 2);            # off the left
+        hbad = hbad + run_case(sa, snap, cvh, 20, 2, 2);               # off the right
+        hbad = hbad + run_case(sa, snap, cvh, 6, 0 - 4, 2);            # off the top
+        hbad = hbad + run_case(sa, snap, cvh, 3, 15, 2);               # off the bottom
+        hbad = hbad + run_case(sa, snap, cvh, 0 - 4, 0 - 3, 2);        # the top-left corner
+        hbad = hbad + run_case(sa, snap, cvh, 22, 16, 2);              # the bottom-right corner
+        si = si + 1;
+    }
+    check(hbad, 0);                                                                     # 41
+    check(g_invalid, 0);                                                                # 42
+    # Fully off, and absurd offsets: nothing is painted and nothing faults.
+    fill_dst(sa, 2);
+    surf_copy(snap, sa);
+    spec(0);
+    var gh = mk(0);
+    check(sd_canvas_blit_paint_premul_at(cvh, sa, gh, 0 - 9, 0), SADISH_OK);            # 43
+    check(sd_canvas_blit_paint_premul_at(cvh, sa, gh, 33, 0), SADISH_OK);               # 44
+    check(sd_canvas_blit_paint_premul_at(cvh, sa, gh, 0, 0 - 7), SADISH_OK);            # 45
+    check(sd_canvas_blit_paint_premul_at(cvh, sa, gh, 0, 25), SADISH_OK);               # 46
+    check(sd_canvas_blit_paint_premul_at(cvh, sa, gh, 1000000, 1000000), SADISH_OK);    # 47
+    check(sd_canvas_blit_paint_premul_at(cvh, sa, gh, 0 - 1000000, 0 - 1000000), SADISH_OK);   # 48
+    check(surf_diff(sa, snap), 0);                                                      # 49 — none of them painted
+    # A canvas LARGER than the surface, clipped on all four sides at once.
+    var cvbig = sd_canvas_new(60, 40);
+    pp_cov(cvbig, 1);
+    spec(3);
+    build_refs(60, 40);
+    check(run_case(sa, snap, cvbig, 0 - 15, 0 - 9, 2), 0);                              # 50
+
+    # ---- I. every spread and every kind is in the sweeps above ------------------------------------
+    var nlin = 0;
+    var nrad = 0;
+    var nfoc = 0;
+    var npad = 0;
+    var nrep = 0;
+    var nref = 0;
+    var nmat = 0;
+    si = 0;
+    while (si < SPECS) {
+        spec(si);
+        if (GK == 0) { nlin = nlin + 1; }
+        if (GK == 1) { nrad = nrad + 1; }
+        if (GK == 2) { nfoc = nfoc + 1; }
+        if (GSPREAD == SD_SPREAD_PAD) { npad = npad + 1; }
+        if (GSPREAD == SD_SPREAD_REPEAT) { nrep = nrep + 1; }
+        if (GSPREAD == SD_SPREAD_REFLECT) { nref = nref + 1; }
+        if (GMAT != 0) { nmat = nmat + 1; }
+        si = si + 1;
+    }
+    check(nlin, 5);                                                                     # 51
+    check(nrad, 4);                                                                     # 52
+    check(nfoc, 3);                                                                     # 53
+    check(npad, 7);                                                                     # 54
+    check(nrep, 3);                                                                     # 55
+    check(nref, 2);                                                                     # 56
+    check(nmat, 3);                                                                     # 57
+
+    # ---- J. a ONE-STOP gradient IS sd_canvas_blit_premul_at ---------------------------------------
+    # paint.cyr promises an opaque one-stop gradient paints sd_canvas_blit_at's bytes; this is the
+    # premultiplied twin, and it holds at every alpha because both go through _sd_premul_cov_run with
+    # the same (P, a, cov).
+    var s1j = sd_surface_new(33, 25);
+    var s2j = sd_surface_new(33, 25);
+    var jbad = 0;
+    var ji = 0;
+    while (ji < 4) {
+        var jal = 1;
+        if (ji == 1) { jal = 64; }
+        if (ji == 2) { jal = 128; }
+        if (ji == 3) { jal = 255; }
+        var jk = 0;
+        while (jk < 3) {
+            var jcol = sd_rgb(230, 90, 17);
+            if (jk == 1) { jcol = sd_rgb(255, 255, 255); }
+            if (jk == 2) { jcol = sd_rgb(0, 0, 3); }
+            st_reset();
+            st_add(0, sd_rgba(sd_color_r(jcol), sd_color_g(jcol), sd_color_b(jcol), jal));
+            GK = 0;
+            GP0 = 0;
+            GP1 = 0;
+            GP2 = 17 * SD_ONE;
+            GP3 = 9 * SD_ONE;
+            GSPREAD = SD_SPREAD_PAD;
+            GMAT = 0;
+            var jc = 0;
+            while (jc < 3) {
+                var cvj = sd_canvas_new(33, 25);
+                pp_cov(cvj, jc);
+                var jd = 0;
+                while (jd < 3) {
+                    fill_dst(s1j, jd);
+                    fill_dst(s2j, jd);
+                    sd_canvas_blit_paint_premul_at(cvj, s1j, mk(0), 2, 1);
+                    sd_canvas_blit_premul_at(cvj, s2j, jcol, jal, 2, 1);
+                    jbad = jbad + surf_diff(s1j, s2j);
+                    jd = jd + 1;
+                }
+                jc = jc + 1;
+            }
+            jk = jk + 1;
+        }
+        ji = ji + 1;
+    }
+    check(jbad, 0);                                                                     # 58 — 108 blit pairs
+    # A radial one-stop, and a DEGENERATE one (the solid path), are the same colour too.
+    st_reset();
+    st_add(0, sd_rgba(12, 200, 77, 200));
+    GK = 1;
+    GP0 = 16 * SD_ONE;
+    GP1 = 12 * SD_ONE;
+    GP2 = 9 * SD_ONE;
+    var cvj2 = sd_canvas_new(33, 25);
+    pp_cov(cvj2, 1);
+    fill_dst(s1j, 2);
+    fill_dst(s2j, 2);
+    sd_canvas_blit_paint_premul(cvj2, s1j, mk(0));
+    sd_canvas_blit_premul(cvj2, s2j, sd_rgb(12, 200, 77), 200);
+    check(surf_diff(s1j, s2j), 0);                                                      # 59
+    GP2 = 0;
+    fill_dst(s1j, 2);
+    sd_canvas_blit_paint_premul(cvj2, s1j, mk(0));
+    check(surf_diff(s1j, s2j), 0);                                                      # 60 — r = 0: the last stop
+
+    # ---- K. ⛔ the alpha traps, and the premultiply-after-interpolation claim ---------------------
+    var sk = sd_surface_new(8, 6);
+    var ck1 = pp_full(8, 6);
+    # K1. A stop whose alpha byte is 0 is OPAQUE — paint.cyr's legacy rule, inherited here, and the
+    # one place this module's "0 means transparent" rule does not apply (it cannot: the ramp resolves
+    # every stop through sd_alpha_of long before the blit sees it).
+    st_reset();
+    st_add(0, sd_rgba(200, 100, 50, 0));
+    GK = 0;
+    GP0 = 0;
+    GP1 = 0;
+    GP2 = 8 * SD_ONE;
+    GP3 = 0;
+    GSPREAD = SD_SPREAD_PAD;
+    GMAT = 0;
+    fill_dst(sk, 0);
+    sd_canvas_blit_paint_premul(ck1, sk, mk(0));
+    check(sd_surface_rgba_at(sk, 3, 3), 0xFFC86432);                                    # 61 — opaque, NOT transparent
+    st_reset();
+    st_add(0, sd_rgba(200, 100, 50, 255));
+    fill_dst(sk, 0);
+    sd_canvas_blit_paint_premul(ck1, sk, mk(0));
+    check(sd_surface_rgba_at(sk, 3, 3), 0xFFC86432);                                    # 62 — alpha 255 agrees
+    # K2. The faintest expressible stop is alpha 1: at full coverage it leaves alpha 1 and, with the
+    # truncating premultiply, colour 0 for every channel below 255.
+    st_reset();
+    st_add(0, sd_rgba(254, 255, 3, 1));
+    fill_dst(sk, 0);
+    sd_canvas_blit_paint_premul(ck1, sk, mk(0));
+    check(sd_surface_rgba_at(sk, 3, 3), 0x01000100);                                    # 63 — only g = 255 survives
+    # K3. ⛔ Where the STRAIGHT blit's source alpha rounds to 0 (coverage * paint alpha / 255), this
+    # blit still paints: it never rounds the effective alpha to a byte. cov 127 -> alpha 0 (the pixel
+    # ends fully transparent), cov 128 -> alpha 1. The straight blit writes dst alpha 255 at both.
+    var ck2 = sd_canvas_new(8, 6);
+    memset(sd_canvas_coverage(ck2), 127, 48);
+    fill_dst(sk, 0);
+    sd_canvas_blit_paint_premul(ck2, sk, mk(0));
+    check(sd_surface_rgba_at(sk, 3, 3), 0);                                             # 64 — 1 x 127 rounds to 0
+    memset(sd_canvas_coverage(ck2), 128, 48);
+    fill_dst(sk, 0);
+    sd_canvas_blit_paint_premul(ck2, sk, mk(0));
+    check(sd_surface_rgba_at(sk, 3, 3), 0x01000100);                                    # 65 — 1 x 128 rounds to 1
+    fill_dst(sk, 0);
+    sd_canvas_blit_paint(ck2, sk, mk(0));
+    check(sd_surface_rgba_at(sk, 3, 3), 0xFF000000);                                    # 66 — straight: opaque black
+    # ...and coverage 0 is untouched by both.
+    sd_canvas_clear(ck2);
+    fill_dst(sk, 2);
+    surf_copy(snap, sk);
+    check(sd_canvas_blit_paint_premul(ck2, sk, mk(0)), SADISH_OK);                      # 67
+    check(surf_diff(sk, snap), 0);                                                      # 68 — cov 0: nothing written
+    # K4. ⭐ PREMULTIPLY AFTER INTERPOLATION. Stops opaque BLACK -> WHITE at alpha 1; the pixel at
+    # t = 0.5 interpolates to colour 128 at alpha 128, premultiplied ONCE to P = floor(128*128/255)
+    # = 64 — sd_premul(sd_rgba(128, 128, 128, 128)) exactly. Had the ramp held PREMULTIPLIED entries
+    # instead, its ends would be (0,0,0,255) and (1,1,1,1) and the same pixel would come out at
+    # P = 1: a premultiplied colour of 1 at alpha 128 is 2 out of 255 once the compositor divides it
+    # back out, i.e. BLACK where this is mid grey. Both models are computed here from the stops.
+    st_reset();
+    st_add(0, sd_rgb(0, 0, 0));
+    st_add(SD_ONE, sd_rgba(255, 255, 255, 1));
+    GP2 = 8 * SD_ONE;
+    fill_dst(sk, 0);
+    var ck3 = pp_full(8, 6);
+    var gkk = mk(0);
+    sd_canvas_blit_paint_premul(ck3, sk, gkk);
+    # pixel x = 3 has centre 3.5 of 8 -> t = 3.5/8; take the value at t = 0.5 from the paint itself.
+    var mid = sd_gradient_color_at(gkk, SD_ONE / 2);
+    check(sd_color_a(mid), 128);                                                        # 69 — interpolated alpha
+    check(sd_color_r(mid), 128);                                                        # 70 — interpolated colour
+    var p_after = (sd_color_r(mid) * sd_color_a(mid)) / 255;                            # premultiply AFTER: 64
+    var p0 = (0 * 255) / 255;                                                           # premultiplied stop ends...
+    var p1 = (255 * 1) / 255;
+    var p_before = (p0 * 32768 + p1 * 32768 + 32768) / 65536;                           # ...interpolated: 1
+    check(p_after, 64);                                                                 # 71
+    check(p_before, 1);                                                                 # 72
+    check(p_after - p_before, 63);                                                      # 73 — 63 levels of darkening
+    # ...and what that is worth on screen, over an OPAQUE WHITE destination at full coverage:
+    check(ref_cov(p_after, 128, 255, 255), 191);                                        # 74 — mid grey
+    check(ref_cov(p_before, 128, 255, 255), 128);                                       # 75 — black
+    # The blit paints p_after, not p_before: the pixel whose t is exactly 0.5 is x = 3 on a 8 px axis
+    # from 0 (centre 3.5 -> t = 0.4375) — so take the value through sd_gradient_color_at's own path,
+    # which is the ramp the blit reads, and assert the blit's own pixel against the reference.
+    build_refs(8, 6);
+    fill_dst(sk, 0);
+    surf_copy(snap, sk);
+    sd_canvas_blit_paint_premul(ck3, sk, mk(0));
+    check(pm_check(sk, snap, ck3, 0, 0), 0);                                            # 76
+    check(sd_surface_rgba_at(sk, 3, 3), ref_paint_px(0, ref_e(3, 3), 255));             # 77
+
+    # ---- L. ⛔ THE DIVERGENCE BOUND against sd_canvas_blit_paint_at -------------------------------
+    # src/premul.cyr's ⚠ note, as numbers. "Identical RGB at full coverage" belongs to the OPAQUE
+    # gradient (group B) and to it alone; a TRANSLUCENT stop alpha makes the straight blit round its
+    # effective source alpha DOWN to a byte before it truncates its store, and the two roundings
+    # compound. MEASURED over ALL 4,261,478,400 lane inputs (c 0..255, stop alpha 1..255, cov 1..255,
+    # d 0..255) the signed difference premul - straight lies in -2..+2 and reaches both ends.
+    LV_CV = sd_canvas_new(4, 3);
+    LV_S1 = sd_surface_new(4, 3);
+    LV_S2 = sd_surface_new(4, 3);
+    # L1. The +2 witness: colour 255 at stop alpha 2, coverage 193, destination lane 1. The straight
+    # blit's sa = 193 * 2 / 255 = 1 (the real effective alpha is 1.51), so it lands on 1; this blit
+    # keeps alpha and coverage apart to the last division and lands on 3.
+    check(lv_pair(255, 2, 193, 1), 2);                                                  # 78
+    check(LV_S, 1);                                                                     # 79 — straight
+    check(LV_P, 3);                                                                     # 80 — premultiplied
+    # L2. The -2 witness: the same truncation the other way (sa rounds down, so the straight blit
+    # keeps too MUCH of a bright destination).
+    check(lv_pair(55, 4, 253, 225), 0 - 2);                                             # 81
+    check(LV_S, 223);                                                                   # 82
+    check(LV_P, 221);                                                                   # 83
+    # L3. ⛔ AT FULL COVERAGE, TOO: a translucent stop breaks the "identical" promise at cov = 255.
+    check(lv_pair(0, 1, 255, 1), 1);                                                    # 84
+    check(LV_S, 0);                                                                     # 85
+    check(LV_P, 1);                                                                     # 86
+    # ...while an OPAQUE stop at full coverage is identical, which is the promise that does hold.
+    check(lv_pair(200, 255, 255, 17), 0);                                               # 87
+    check(LV_S, 200);                                                                   # 88 — the paint's own byte
+    # L4. The bound itself, swept through both shipped blits: colour in {0, 55, 255} x stop alpha
+    # 1..255 x coverage 1..255 x destination lane in {0, 1, 2, 127, 128, 225, 254, 255} — 1,560,600
+    # lane inputs, which contain all three witnesses above. The signed difference never leaves
+    # -2..+2, and in the cov = 255 column never leaves -1..+1.
+    LG_CV = sd_canvas_new(LG_W, LG_H);
+    LG_S1 = sd_surface_new(LG_W, LG_H);
+    LG_S2 = sd_surface_new(LG_W, LG_H);
+    var ly = 0;
+    while (ly < LG_H) {
+        var lx = 0;
+        while (lx < LG_W) {
+            store8(sd_canvas_coverage(LG_CV) + ly * sd_canvas_stride(LG_CV) + lx, lx + 1);
+            lx = lx + 1;
+        }
+        ly = ly + 1;
+    }
+    var lc = 0;
+    while (lc < 3) {
+        var lcol = 0;
+        if (lc == 1) { lcol = 55; }
+        if (lc == 2) { lcol = 255; }
+        var lpa = 1;
+        while (lpa <= 255) {
+            lg_pass(lcol, lpa);
+            lpa = lpa + 1;
+        }
+        lc = lc + 1;
+    }
+    check(LG_MAX, 2);                                                                   # 89 — +2 is reached
+    check(LG_MIN, 0 - 2);                                                               # 90 — and -2
+    check(LG_MAXF, 1);                                                                  # 91 — cov 255 narrows...
+    check(LG_MINF, 0 - 1);                                                              # 92 — ...to one level
+    check(LG_P2, 28837);                                                                # 93 — exact hit counts
+    check(LG_N2, 50);                                                                   # 94
+    check(LG_DIFF, 642773);                                                             # 95 — 41 % of 1,560,600
+
+    if (g_fails == 0) {
+        var ok = "paint_premul_test: PASS (equivalence, probes, c<=a, AA x alpha, spreads, clip, stride, 0 B, bound)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "paint_premul_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

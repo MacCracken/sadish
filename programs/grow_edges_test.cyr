@@ -1,0 +1,1190 @@
+# programs/grow_edges_test.cyr — RUN test for the growable edge list, crossings, stroke run, stroke
+# batch and flatten result (0.6.1): the lift of SD_FLATTEN_CAP = 8,192.
+#
+# ⭐ WHAT THIS EXISTS TO PROVE. Through 0.6.0 every one of those stores DROPPED what did not fit: a
+# fill of more than 8,192 edges left contours open (MEASURED on 0.6.0: a 20,000-gon disc of radius
+# 120 px filled 24.5 % of its ink, its centre pixel 0), a longer stroke run stopped at point 8,192,
+# sd_path_flatten returned 8,192 points, and a styled stroke longer than one 8,192-edge batch met
+# itself by MAX where it crossed (MEASURED on 60 random self-crossing walks: 20 split, worst 118
+# levels). Now each grows. The checks below hold every result to a reference that is EXACT for its
+# geometry, built without the growth it tests:
+#   · fills — the same disjoint shapes filled in chunks under 8,192 edges and unioned (disjoint
+#     pixels: neither engine lets one shape's arithmetic reach another's pixels), or a rect whose
+#     sides are cut into 20,000 vertical pieces against the plain rect;
+#   · round strokes — the path in two halves (every piece is its own MAX pass, so any split that
+#     keeps every piece is byte-identical), or duplicates of a point (a MAX pass twice is once);
+#   · styled strokes — a collinear 9,001-point polyline against its 2-point chord (one nonzero fill:
+#     stacked vertical rect sides cross each sub-scanline exactly where the chord's do), and a
+#     self-crossing walk against itself walked backwards (one fill cannot depend on emission order);
+#   · the out-of-memory path — the 0.6.0 result, reproduced through the knob that forces it.
+# ⚠ ORDER MATTERS: groups A-D measure exact global-heap figures from cold capacities, so they run
+# first and in this order. The out-of-memory path is driven through raster.cyr's _sd_grow_limit (a
+# growth request above it fails as alloc failing would) and, for sd_path_flatten, through a
+# fixed-size arena hook that runs out.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+# The ceiling the process STARTED with — captured before any group changes it, so group L can
+# pin the shipped default rather than the constant it is compared against.
+var g_limit0 = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "grow_edges_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+var g_arena = 0;
+
+fn hook_alloc(n): i64 {
+    return arena_alloc(g_arena, n);
+}
+
+# ---- canvases ---------------------------------------------------------------------------------
+fn cov_diff(a, b): i64 {
+    var n = sd_canvas_width(a) * sd_canvas_height(a);
+    var pa = sd_canvas_coverage(a);
+    var pb = sd_canvas_coverage(b);
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(pa + i) != load8(pb + i)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn cov_maxdiff(a, b): i64 {
+    var n = sd_canvas_width(a) * sd_canvas_height(a);
+    var pa = sd_canvas_coverage(a);
+    var pb = sd_canvas_coverage(b);
+    var m = 0;
+    var i = 0;
+    while (i < n) {
+        var d = sd_abs(load8(pa + i) - load8(pb + i));
+        if (d > m) { m = d; }
+        i = i + 1;
+    }
+    return m;
+}
+
+# Take `src`'s coverage aside into `dst` (same dimensions), so a canvas can be compared as the
+# growing call left it — a second, warm call into the same canvas would overwrite (fill) or MAX-
+# repair (stroke) whatever the growth got wrong. Allocates nothing.
+fn cov_copy(dst, src): i64 {
+    memcpy(sd_canvas_coverage(dst), sd_canvas_coverage(src),
+      sd_canvas_width(src) * sd_canvas_height(src));
+    return 0;
+}
+
+fn cov_sum(cv): i64 {
+    var n = sd_canvas_width(cv) * sd_canvas_height(cv);
+    var p = sd_canvas_coverage(cv);
+    var s = 0;
+    var i = 0;
+    while (i < n) {
+        s = s + load8(p + i);
+        i = i + 1;
+    }
+    return s;
+}
+
+# non-zero pixels in column >= xmin OR row >= ymin
+fn lit_outside(cv, xmin, ymin): i64 {
+    var n = 0;
+    var py = 0;
+    while (py < sd_canvas_height(cv)) {
+        var px = 0;
+        while (px < sd_canvas_width(cv)) {
+            var out = 0;
+            if (px >= xmin) { out = 1; }
+            if (py >= ymin) { out = 1; }
+            if (out != 0) {
+                if (sd_canvas_coverage_at(cv, px, py) != 0) { n = n + 1; }
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return n;
+}
+
+fn aa_canvas(w, h, mode): i64 {
+    var cv = sd_canvas_new(w, h);
+    sd_canvas_set_aa(cv, mode);
+    return cv;
+}
+
+# ---- shapes -----------------------------------------------------------------------------------
+# Diamonds [first, first + count) of a grid `cols` wide on a 3 px pitch: diamond i sits in cell
+# (i % cols, i / cols), centre (1.5, 1.5) px into it moved by up to +-0.2 px, radius 1.1 px — so it
+# lies inside its cell's 3 x 3 pixels, and no two diamonds share a pixel. 4 edges each, none
+# horizontal. Appended to `p`.
+fn diamonds(p, first, count, cols): i64 {
+    var r = 72089;                       # 1.1 px
+    var i = first;
+    while (i < first + count) {
+        var cx = ((i % cols) * 3) * SD_ONE + 98304 + (((i * 37) % 64) - 32) * 409;
+        var cy = ((i / cols) * 3) * SD_ONE + 98304 + (((i * 23) % 64) - 32) * 409;
+        sd_path_moveto(p, cx + r, cy);
+        sd_path_lineto(p, cx, cy + r);
+        sd_path_lineto(p, cx - r, cy);
+        sd_path_lineto(p, cx, cy - r);
+        sd_path_close(p);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn diamond_path(first, count, cols): i64 {
+    return diamonds(sd_path_new(), first, count, cols);
+}
+
+# The rect [x0, x1] x [y0, y0 + pieces * step] (x whole pixels, 16.16 args) with each vertical side
+# cut into `pieces` collinear edges: 2 * pieces edges, the same area as the plain rect.
+fn subrect(x0, x1, y0, step, pieces): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0, y0);
+    var k = 1;
+    while (k <= pieces) {
+        sd_path_lineto(p, x0, y0 + k * step);
+        k = k + 1;
+    }
+    sd_path_lineto(p, x1, y0 + pieces * step);
+    k = pieces - 1;
+    while (k >= 0) {
+        sd_path_lineto(p, x1, y0 + k * step);
+        k = k - 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+fn rect4(x0, x1, y0, y1): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0, y0);
+    sd_path_lineto(p, x0, y1);
+    sd_path_lineto(p, x1, y1);
+    sd_path_lineto(p, x1, y0);
+    sd_path_close(p);
+    return p;
+}
+
+# Points [first, last] of the vertical polyline x = 4.5 px, y = 1.25 px + k * `step` raw.
+fn vpoly(first, last, step): i64 {
+    var p = sd_path_new();
+    var x = 4 * SD_ONE + 32768;
+    var k = first;
+    while (k <= last) {
+        var y = SD_ONE + 16384 + k * step;
+        if (k == first) { sd_path_moveto(p, x, y); } else { sd_path_lineto(p, x, y); }
+        k = k + 1;
+    }
+    return p;
+}
+
+# `count` open vertical strokes in one row: x = 2 + 3k px, y 0.5 .. 3.5 px (from index `first`).
+fn vbars(first, count): i64 {
+    var p = sd_path_new();
+    var k = first;
+    while (k < first + count) {
+        sd_path_moveto(p, (2 + 3 * k) * SD_ONE, 32768);
+        sd_path_lineto(p, (2 + 3 * k) * SD_ONE, 3 * SD_ONE + 32768);
+        k = k + 1;
+    }
+    return p;
+}
+
+# M P0, `dups` x L P0, then L P1 (and L P2 when `corner` != 0) — P0 (3.5, 3.25), P1 (12.5, 3.25),
+# P2 (12.5, 11.75). With dups = 0 it is the plain polyline.
+fn dup_poly(dups, corner): i64 {
+    var p = sd_path_new();
+    var x0 = 3 * SD_ONE + 32768;
+    var y0 = 3 * SD_ONE + 16384;
+    sd_path_moveto(p, x0, y0);
+    var k = 0;
+    while (k < dups) {
+        sd_path_lineto(p, x0, y0);
+        k = k + 1;
+    }
+    sd_path_lineto(p, 12 * SD_ONE + 32768, y0);
+    if (corner != 0) { sd_path_lineto(p, 12 * SD_ONE + 32768, 11 * SD_ONE + 49152); }
+    return p;
+}
+
+# n samples of the 3:4 Lissajous figure (radius 90 px about (100, 100)) at whole pixels, walked
+# forwards or backwards — a path that crosses itself many times (stroke_style_test's liss).
+fn liss(n, rev): i64 {
+    var p = sd_path_new();
+    var k = 0;
+    while (k < n) {
+        var j = k;
+        if (rev != 0) { j = n - 1 - k; }
+        var t = (411775 * j) / n;
+        var x = (100 + sd_asr(90 * sd_sin(3 * t) + 32768, 16)) * SD_ONE;
+        var y = (100 + sd_asr(90 * sd_sin(4 * t) + 32768, 16)) * SD_ONE;
+        if (k == 0) { sd_path_moveto(p, x, y); } else { sd_path_lineto(p, x, y); }
+        k = k + 1;
+    }
+    return p;
+}
+
+# stroke_style_test's cusp "M 10,30 C 50,5 10,5 50,30", then `dups` x L 50,30 and L 50,38. The
+# cusp's flattened vertices carry the inside-a-curve flag, which rounds its 150° turn (a MITER join
+# at limit 4 would spike to row 3); the duplicates push the run past the flags' capacity.
+fn cusp_dups(dups): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 10 * SD_ONE, 30 * SD_ONE);
+    sd_path_cubicto(p, 50 * SD_ONE, 5 * SD_ONE, 10 * SD_ONE, 5 * SD_ONE, 50 * SD_ONE, 30 * SD_ONE);
+    var k = 0;
+    while (k < dups) {
+        sd_path_lineto(p, 50 * SD_ONE, 30 * SD_ONE);
+        k = k + 1;
+    }
+    sd_path_lineto(p, 50 * SD_ONE, 38 * SD_ONE);
+    return p;
+}
+
+# `dups` x L 10,30 BEFORE the cusp, so the curve's flattened vertices (and their flags) land around
+# index `dups` + 2 of the run — put the capacity there and the curve straddles a growth.
+fn dups_cusp(dups): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 10 * SD_ONE, 30 * SD_ONE);
+    var k = 0;
+    while (k < dups) {
+        sd_path_lineto(p, 10 * SD_ONE, 30 * SD_ONE);
+        k = k + 1;
+    }
+    sd_path_cubicto(p, 50 * SD_ONE, 5 * SD_ONE, 10 * SD_ONE, 5 * SD_ONE, 50 * SD_ONE, 30 * SD_ONE);
+    sd_path_lineto(p, 50 * SD_ONE, 38 * SD_ONE);
+    return p;
+}
+
+# An n-gon of radius r about (cx, cy), closed.
+fn ngon(cx, cy, r, n): i64 {
+    var p = sd_path_new();
+    var k = 0;
+    while (k < n) {
+        var ang = (411775 * k) / n;
+        var x = cx + sd_fixed_mul(r, sd_cos(ang));
+        var y = cy + sd_fixed_mul(r, sd_sin(ang));
+        if (k == 0) { sd_path_moveto(p, x, y); } else { sd_path_lineto(p, x, y); }
+        k = k + 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+# A closed ring of `n` cubic arcs around (32, 32), radius 24 px, each bulging 3 px out: a curve path
+# whose flattening runs to many points.
+fn cubic_ring(n): i64 {
+    var p = sd_path_new();
+    var cx = 32 * SD_ONE + 12345;
+    var cy = 32 * SD_ONE + 23456;
+    var r = 24 * SD_ONE;
+    var ro = 27 * SD_ONE;
+    var k = 0;
+    while (k < n) {
+        var a0 = (411775 * k) / n;
+        var a1 = (411775 * (k + 1)) / n;
+        var am = (a0 * 2 + a1) / 3;
+        var an = (a0 + a1 * 2) / 3;
+        if (k == 0) { sd_path_moveto(p, cx + sd_fixed_mul(r, sd_cos(a0)), cy + sd_fixed_mul(r, sd_sin(a0))); }
+        var c1x = cx + sd_fixed_mul(ro, sd_cos(am));
+        var c1y = cy + sd_fixed_mul(ro, sd_sin(am));
+        var c2x = cx + sd_fixed_mul(ro, sd_cos(an));
+        var c2y = cy + sd_fixed_mul(ro, sd_sin(an));
+        sd_path_cubicto(p, c1x, c1y, c2x, c2y, cx + sd_fixed_mul(r, sd_cos(a1)), cy + sd_fixed_mul(r, sd_sin(a1)));
+        k = k + 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+# The polyline `pl` as a closed path of explicit LINETOs.
+fn poly_closed(pl): i64 {
+    var p = sd_path_new();
+    var pts = sd_polyline_points(pl);
+    var i = 0;
+    while (i < sd_polyline_count(pl)) {
+        var q = load64(pts + i * 8);
+        if (i == 0) {
+            sd_path_moveto(p, sd_point_x(q), sd_point_y(q));
+        } else {
+            sd_path_lineto(p, sd_point_x(q), sd_point_y(q));
+        }
+        i = i + 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+fn stroked(w, h, mode, path, width, cap, join): i64 {
+    var cv = aa_canvas(w, h, mode);
+    sd_canvas_stroke_path_ex(cv, path, width, cap, join, 4 * SD_ONE);
+    return cv;
+}
+
+fn round_stroked(w, h, path, width): i64 {
+    var cv = sd_canvas_new(w, h);
+    sd_canvas_stroke_path(cv, path, width);
+    return cv;
+}
+
+fn main(): i64 {
+    alloc_init();
+    g_limit0 = sd_grow_limit_get();
+    var ONE = SD_ONE;
+    var BM = SD_CAP_BUTT;
+    var MI = SD_JOIN_MITER;
+    # 128 MiB: the round stroker's 18,000-piece strokes put ~78 MB of paths on the hook, and a chunk
+    # the arena chained would come from the global heap the checks below measure.
+    g_arena = arena_new_growable(134217728);
+
+    # ── A) WARM-UP; AT THE OLD CAP NOTHING GROWS ────
+    var warm = sd_canvas_new(186, 156);
+    sd_canvas_fill_path(warm, rect4(ONE, 2 * ONE, ONE, 2 * ONE), SD_FILL_NONZERO);
+    sd_canvas_stroke_path_ex(warm, rect4(ONE, 9 * ONE, ONE, 9 * ONE), 2 * ONE, BM, MI, 4 * ONE);
+    sd_canvas_fill_path(sd_canvas_new(13504, 4), rect4(ONE, 2 * ONE, ONE, 2 * ONE), SD_FILL_NONZERO);   # accrow
+    check(_sd_fill_edges_cap, 8192);                                  # 1
+    check(_sd_fill_cross_cap, 8192);                                  # 2
+    check(_sd_sb_cap, 8192);                                          # 3
+    check(_sd_stroke_run_cap, 8192);                                  # 4
+    check(_sd_sb_inner_cap, 8192);                                    # 5
+    var d2048 = diamond_path(0, 2048, 60);                            # exactly 8,192 edges
+    var cv = sd_canvas_new(186, 150);
+    var g0 = alloc_used();
+    sd_canvas_fill_path(cv, d2048, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 0);                                      # 6 — a full list is not grown
+    check(load64(_sd_fill_ectx + 8), 8192);                           # 7
+    check(_sd_fill_trunc + _sd_fill_edges_cap - 8192, 0);             # 8
+
+    # ── B) OUT OF MEMORY: every growth fails -> 0.6.0's result, recorded, and 0 B ────
+    # B1. A fill of 12,000 edges keeps its first 8,192 — the first 2,048 diamonds, byte for byte.
+    var d3000 = diamond_path(0, 3000, 60);
+    var ref2048 = sd_canvas_new(186, 150);
+    sd_canvas_fill_path(ref2048, d2048, SD_FILL_NONZERO);
+    _sd_grow_limit = 1;
+    var oom = sd_canvas_new(186, 150);
+    g0 = alloc_used();
+    sd_canvas_fill_path(oom, d3000, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 0);                                      # 9 — nothing allocated
+    check(load64(_sd_fill_ectx + 8), 8192);                           # 10
+    check(_sd_fill_trunc, 1);                                         # 11 — and recorded
+    check(_sd_fill_edges_cap + _sd_fill_cross_cap, 16384);            # 12 — both blocks kept
+    check(cov_diff(oom, ref2048), 0);                                 # 13 — the prefix, exactly
+    check(cov_sum(oom) > 0, 1);                                       # 14
+    # B2. ⛔ On an AREA canvas a truncated list must NOT reach the area engine: it runs the default
+    # loop. A triangle below the grid first (3 edges) moves the cut INTO diamond 2,047, whose one kept
+    # edge is an open contour — the area engine would streak from it to the right edge (columns
+    # 180..185 hold no shape); the default loop paints nothing right of a row's last crossing. Its
+    # bytes must be the default canvas's, which the area engine's are not (#17).
+    var tri_d = sd_path_new();
+    sd_path_moveto(tri_d, 10 * ONE, 151 * ONE + 32768);
+    sd_path_lineto(tri_d, 20 * ONE, 152 * ONE + 32768);
+    sd_path_lineto(tri_d, 14 * ONE, 155 * ONE + 32768);
+    sd_path_close(tri_d);
+    diamonds(tri_d, 0, 3000, 60);
+    var oomd = aa_canvas(186, 156, SD_AA_SUBSCANLINE);
+    sd_canvas_fill_path(oomd, tri_d, SD_FILL_NONZERO);
+    var ooma = aa_canvas(186, 156, SD_AA_AREA);
+    sd_canvas_fill_path(ooma, tri_d, SD_FILL_NONZERO);
+    check(_sd_fill_trunc, 1);                                         # 15
+    check(cov_diff(ooma, oomd), 0);                                   # 16 — the default loop's bytes
+    var area2048 = aa_canvas(186, 150, SD_AA_AREA);
+    sd_canvas_fill_path(area2048, d2048, SD_FILL_NONZERO);
+    check(cov_diff(area2048, oom) > 0, 1);                            # 17 — the area engine reads otherwise
+    check(lit_outside(ooma, 180, 156), 0);                            # 18 — no streak right of the grid
+    check(_sd_fill_trunc, 0);                                         # 19 — the next fill resets the flag
+    # B3. A styled stroke whose batch cannot grow degrades to flushing — 0.6.0's batches exactly: the
+    # bytes SD_STROKE_BATCH_CAP = 8192 gives with no limit, which drops no edge (a dropped edge would
+    # show in #23).
+    var lf = liss(2000, 0);
+    var lim_liss = sd_canvas_new(200, 200);
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(lim_liss, lf, 3 * ONE, SD_CAP_SQUARE, MI, 4 * ONE);
+    check(alloc_used() - g0, 0);                                      # 20
+    check(_sd_sb_cap, 8192);                                          # 21
+    _sd_grow_limit = SD_GROW_LIMIT_DEFAULT;   # back to the shipped ceiling
+    var keep_cap = SD_STROKE_BATCH_CAP;
+    SD_STROKE_BATCH_CAP = 8192;
+    var k8_liss = stroked(200, 200, SD_AA_SUBSCANLINE, lf, 3 * ONE, SD_CAP_SQUARE, MI);
+    SD_STROKE_BATCH_CAP = keep_cap;
+    check(_sd_sb_cap, 8192);                                          # 22 — still cold
+    check(cov_diff(lim_liss, k8_liss), 0);                            # 23
+    check(cov_sum(lim_liss) > 1000000, 1);                            # 24
+    _sd_grow_limit = 1;
+    # B4. The batch's own backstop. A rect's two sides [4, 12] x [2.3, 6.3] and 4,095 pairs of edges
+    # that cancel (down and back up x = 14) are 8,192 edges; one more cannot fit. The flag must stop
+    # the flush from handing that list to the area engine: the walk reads row 2 as 3 sub-scanlines of
+    # 4 (191), the area engine 0.7 of it (178).
+    _sd_sb_n = 0;
+    var y23 = 2 * ONE + 19660;
+    var y63 = 6 * ONE + 19660;
+    _sd_sb_edge(4 * ONE, y63, 4 * ONE, y23);
+    _sd_sb_edge(12 * ONE, y23, 12 * ONE, y63);
+    var bk = 0;
+    while (bk < 4095) {
+        _sd_sb_edge(14 * ONE, y23, 14 * ONE, y63);
+        _sd_sb_edge(14 * ONE, y63, 14 * ONE, y23);
+        bk = bk + 1;
+    }
+    check(_sd_sb_trunc, 0);                                           # 25 — exactly full is whole
+    var bfull = aa_canvas(16, 8, SD_AA_AREA);
+    _sd_sb_flush(bfull);
+    check(sd_canvas_coverage_at(bfull, 8, 2), 178);                   # 26 — whole: the area engine
+    _sd_sb_edge(4 * ONE, y63, 4 * ONE, y23);
+    _sd_sb_edge(12 * ONE, y23, 12 * ONE, y63);
+    bk = 0;
+    while (bk < 4095) {
+        _sd_sb_edge(14 * ONE, y23, 14 * ONE, y63);
+        _sd_sb_edge(14 * ONE, y63, 14 * ONE, y23);
+        bk = bk + 1;
+    }
+    _sd_sb_edge(14 * ONE, y23, 14 * ONE, y63);                         # does not fit: an open edge
+    check(_sd_sb_n, 8192);                                            # 27
+    check(_sd_sb_trunc, 1);                                           # 28
+    var btrunc = aa_canvas(16, 8, SD_AA_AREA);
+    _sd_sb_flush(btrunc);
+    check(sd_canvas_coverage_at(btrunc, 8, 2), 191);                  # 29 — truncated: the walk
+    check(lit_outside(btrunc, 13, 8), 0);                             # 30 — the dropped edge drew nothing
+    check(_sd_sb_trunc + _sd_sb_n, 0);                                # 31 — the flush clears both
+    # B5. The round stroker's run: 9,001 points, 1/1024 px apart, keep their first 8,192 — the bytes of
+    # the 8,192-point prefix (every piece its own MAX pass, so the same run is the same bytes).
+    var vfull = vpoly(0, 9000, 64);
+    var vpre = vpoly(0, 8191, 64);
+    var rtr = sd_canvas_new(10, 12);
+    var rpre = sd_canvas_new(10, 12);
+    check(sd_alloc_set(&hook_alloc), 0);                              # 32 — the stroker's paths on the arena
+    g0 = alloc_used();
+    sd_canvas_stroke_path(rtr, vfull, 3 * ONE);
+    check(alloc_used() - g0, 0);                                      # 33
+    check(_sd_run_trunc, 1);                                          # 34
+    check(_sd_stroke_run_cap, 8192);                                  # 35
+    arena_reset(g_arena);
+    sd_canvas_stroke_path(rpre, vpre, 3 * ONE);
+    arena_reset(g_arena);
+    check(_sd_run_trunc, 0);                                          # 36 — reset per call
+    check(cov_diff(rtr, rpre), 0);                                    # 37
+    # B6. The styled path's run, likewise (its batch cannot grow either: it flushes).
+    var str8 = sd_canvas_new(10, 12);
+    var stp8 = sd_canvas_new(10, 12);
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(str8, vfull, 3 * ONE, BM, MI, 4 * ONE);
+    check(alloc_used() - g0, 0);                                      # 38
+    check(_sd_run_trunc, 1);                                          # 39
+    sd_canvas_stroke_path_ex(stp8, vpre, 3 * ONE, BM, MI, 4 * ONE);
+    check(cov_diff(str8, stp8), 0);                                   # 40
+    check(sd_alloc_set(0), &hook_alloc);                              # 41
+    arena_reset(g_arena);
+    _sd_grow_limit = SD_GROW_LIMIT_DEFAULT;   # back to the shipped ceiling
+    # B7. sd_path_flatten on a hook that runs out: the result keeps 8,192 points and says so.
+    var fa = arena_new(65536 + 24 + 16);
+    var fpath = vpoly(0, 9000, 64);
+    var prev_hook = sd_alloc_set(&hook_alloc);
+    var keep_arena = g_arena;
+    g_arena = fa;
+    var fpl = sd_path_flatten(fpath, ONE >> 2);
+    g_arena = keep_arena;
+    sd_alloc_set(prev_hook);
+    check(fpl != 0, 1);                                               # 42
+    check(sd_polyline_count(fpl), 8192);                              # 43
+    check(_sd_flat_trunc, 1);                                         # 44
+    check(arena_used(fa), 65536 + 24 + 16);                           # 45 — the doubling was refused
+    check(sd_point_y(load64(sd_polyline_points(fpl) + 8191 * 8)), ONE + 16384 + 8191 * 64);   # 46
+
+    # ── C) GROWTH: exact figures from cold capacities, 0 B on the hook, 0 B warm ────
+    # (paths are built first, off the hook: the arena is reset after this group)
+    var bars = vbars(0, 4500);
+    var dp = cusp_dups(9000);
+    var dp_ref = cusp_dups(0);
+    var drow = diamond_path(0, 4500, 4500);
+    var v20k = vpoly(0, 20000, 64);
+    var c1 = sd_canvas_new(186, 150);
+    var c2 = sd_canvas_new(13504, 4);
+    # ⚠ c1 is filled twice below and c2 stroked twice, to measure a warm call's 0 B. The SECOND call
+    # runs at the grown capacity and so cannot show a growth that lost an edge — an overwriting fill
+    # replaces it, a MAX-combined stroke repairs it. Group K compares these snapshots, taken as the
+    # GROWING call left them (they are allocated here, before the hook, so they cost the group's
+    # arena figures nothing).
+    var c1snap = sd_canvas_new(186, 150);
+    var c2snap = sd_canvas_new(13504, 4);
+    var c3 = sd_canvas_new(10, 12);
+    var c4 = sd_canvas_new(60, 40);
+    var c4ref = sd_canvas_new(60, 40);
+    var c5 = sd_canvas_new(10, 12);
+    var c6 = sd_canvas_new(13504, 4);
+    check(sd_alloc_set(&hook_alloc), 0);                              # 47
+    # C1. The first fill past 8,192 edges: 12,000 edges -> 16,384 * 32 edges + 16,384 * 16 crossings.
+    var cross0 = _sd_fill_cross;
+    g0 = alloc_used();
+    var a0 = arena_used(g_arena);
+    sd_canvas_fill_path(c1, d3000, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 524288 + 262144);                        # 48 — 786,432 B on the global heap
+    check(arena_used(g_arena) - a0, 0);                               # 49 — and not one byte on the hook
+    check(_sd_fill_edges_cap, 16384);                                 # 50
+    check(_sd_fill_cross_cap, 16384);                                 # 51
+    check(load64(_sd_fill_ectx + 8), 12000);                          # 52
+    check(_sd_fill_trunc, 0);                                         # 53
+    check(_sd_fill_cross != cross0, 1);                               # 54 — the NEW block, which the walk read
+    cov_copy(c1snap, c1);                                             # the fill that grew (group K)
+    g0 = alloc_used();
+    sd_canvas_fill_path(c1, d3000, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 0);                                      # 55 — warm: 0
+    check(arena_used(g_arena) - a0, 0);                               # 56
+    # C2. The first styled batch past 8,192 edges: 4,500 bars in one row = 9,000 edges (and 9,000
+    # crossings on a sub-scanline, past the OLD crossings array). The crossings are already 16,384, so
+    # only the edges grow: 16,384 * 32. ⚠ The 8,192-slot block the crossings outgrew in C1 is the one
+    # _sd_scratch_init put the stroker's run right behind: pattern the run and read it back, so a
+    # flush still walking the old block shows up as a write into it rather than as nothing at all.
+    var pk = 2;
+    while (pk < 8192) {
+        store64(_sd_stroke_run + pk * 8, 165 * pk + 7);
+        pk = pk + 1;
+    }
+    g0 = alloc_used();
+    a0 = arena_used(g_arena);
+    sd_canvas_stroke_path_ex(c2, bars, ONE, BM, MI, 4 * ONE);
+    check(alloc_used() - g0, 524288);                                 # 57
+    check(arena_used(g_arena) - a0, 0);                               # 58
+    check(_sd_sb_cap, 16384);                                         # 59
+    cov_copy(c2snap, c2);                                             # the stroke that grew (group K)
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(c2, bars, ONE, BM, MI, 4 * ONE);
+    check(alloc_used() - g0, 0);                                      # 60
+    var pbad = 0;
+    pk = 2;
+    while (pk < 8192) {
+        if (load64(_sd_stroke_run + pk * 8) != 165 * pk + 7) { pbad = pbad + 1; }
+        pk = pk + 1;
+    }
+    check(pbad, 0);                                                   # 61 — nothing written past the crossings
+    # C3. The round stroker's run past 8,192 points: 16,384 * 8. (Its pieces' paths go on the arena.)
+    arena_reset(g_arena);
+    g0 = alloc_used();
+    sd_canvas_stroke_path(c3, vfull, 3 * ONE);
+    check(alloc_used() - g0, 131072);                                 # 62
+    check(_sd_stroke_run_cap, 16384);                                 # 63
+    check(_sd_run_trunc, 0);                                          # 64
+    arena_reset(g_arena);
+    # C4. The styled curve flags past 8,192 points: 16,384 B (the run is already big enough; the 9,000
+    # duplicates de-duplicate away, so the batch stays small). The cusp's flags, set before the growth,
+    # must be copied into the new block: the stroke is the de-duplicated path's, byte for byte.
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(c4, dp, 4 * ONE, BM, MI, 4 * ONE);
+    check(alloc_used() - g0, 16384);                                  # 65
+    check(_sd_sb_inner_cap, 16384);                                   # 66
+    sd_canvas_stroke_path_ex(c4ref, dp_ref, 4 * ONE, BM, MI, 4 * ONE);
+    check(cov_diff(c4, c4ref), 0);                                    # 67
+    check(lit_outside(c4, 60, 0) - lit_outside(c4, 60, 9), 0);        # 68 — rows 0..8: no spike
+    # C5. A batch past the crossings: the 9,001-point line is 18,000 edges -> edges 32,768 * 32 AND
+    # crossings 32,768 * 16 (a batch outgrowing every fill so far must grow them itself).
+    a0 = arena_used(g_arena);
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(c5, vfull, 3 * ONE, BM, MI, 4 * ONE);
+    check(alloc_used() - g0, 1048576 + 524288);                       # 69
+    check(arena_used(g_arena) - a0, 0);                               # 70
+    check(_sd_sb_cap, 32768);                                         # 71
+    check(_sd_fill_cross_cap, 32768);                                 # 72
+    # C6. A fill past 16,384 edges: 4,500 diamonds in one row, 18,000 edges -> edges only (32,768 * 32).
+    g0 = alloc_used();
+    sd_canvas_fill_path(c6, drow, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 1048576);                                # 73
+    check(_sd_fill_edges_cap, 32768);                                 # 74
+    g0 = alloc_used();
+    sd_canvas_fill_path(c6, drow, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 0);                                      # 75
+    # C7. sd_path_flatten's result is the CALLER's: on the hook, 65,536 + 131,072 + 262,144 B of
+    # arrays for 20,001 points, + ctx 24 + polyline 16; the global heap pays nothing.
+    a0 = arena_used(g_arena);
+    g0 = alloc_used();
+    sd_path_flatten(v20k, ONE >> 2);
+    check(arena_used(g_arena) - a0, 65536 + 131072 + 262144 + 24 + 16);   # 76
+    check(alloc_used() - g0, 0);                                      # 77
+    check(_sd_flat_trunc, 0);                                         # 78
+    a0 = arena_used(g_arena);
+    sd_path_flatten(vpre, ONE >> 2);
+    check(arena_used(g_arena) - a0, 65536 + 24 + 16);                 # 79 — at or under 8,192: as 0.6.0
+    check(sd_alloc_set(0), &hook_alloc);                              # 80
+    arena_reset(g_arena);
+
+    # ── D) A GROWTH THAT HALF-FAILS; THE FLAGS AT THE NEXT DOUBLING ────
+    # D1. 40,000 edges with the limit at 1,048,576 B: the crossings (65,536 * 16 = 1,048,576 B) grow,
+    # the edges (65,536 * 32) do not — the list keeps 32,768 and is marked; lifting the limit, the
+    # same fill grows only the edges.
+    var sr = subrect(2 * ONE, 13 * ONE, 85197, 44, 20000);
+    var d1 = sd_canvas_new(16, 16);
+    _sd_grow_limit = 1048576;
+    g0 = alloc_used();
+    sd_canvas_fill_path(d1, sr, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 1048576);                                # 81
+    check(_sd_fill_cross_cap, 65536);                                 # 82
+    check(_sd_fill_edges_cap, 32768);                                 # 83
+    check(load64(_sd_fill_ectx + 8), 32768);                          # 84
+    check(_sd_fill_trunc, 1);                                         # 85
+    _sd_grow_limit = SD_GROW_LIMIT_DEFAULT;   # back to the shipped ceiling
+    g0 = alloc_used();
+    sd_canvas_fill_path(d1, sr, SD_FILL_NONZERO);
+    check(alloc_used() - g0, 2097152);                                # 86
+    check(load64(_sd_fill_ectx + 8), 40000);                          # 87
+    check(_sd_fill_trunc, 0);                                         # 88
+    var d1p = sd_canvas_new(16, 16);
+    sd_canvas_fill_path(d1p, rect4(2 * ONE, 13 * ONE, 85197, 85197 + 880000), SD_FILL_NONZERO);
+    check(cov_diff(d1, d1p), 0);                                      # 89 — the rect, after growing mid-fill
+    # D2. The curve flags alone failing: a round stroke grows the run to 32,768; the styled stroke of
+    # the same 20,002-point run then needs 32,768 flag bytes, over a 32,767-B limit. It keeps a prefix
+    # of 16,384 points — all the duplicate P0, a lone point: SQUARE draws its square, nothing more.
+    var dp20 = dup_poly(20000, 0);
+    var d2r = sd_canvas_new(16, 16);
+    check(sd_alloc_set(&hook_alloc), 0);                              # 90
+    sd_canvas_stroke_path(d2r, dp20, 2 * ONE);
+    check(sd_alloc_set(0), &hook_alloc);                              # 91
+    arena_reset(g_arena);
+    check(_sd_stroke_run_cap, 32768);                                 # 92
+    _sd_grow_limit = 32767;
+    var d2 = stroked(16, 16, SD_AA_SUBSCANLINE, dp20, 2 * ONE, SD_CAP_SQUARE, MI);
+    check(_sd_run_trunc, 1);                                          # 93
+    check(_sd_sb_inner_cap, 16384);                                   # 94
+    check(cov_diff(d2, stroked(16, 16, SD_AA_SUBSCANLINE, dup_poly(0, 0), 2 * ONE, SD_CAP_SQUARE, MI)) > 0, 1);   # 95
+    var lone = sd_path_new();
+    sd_path_moveto(lone, 3 * ONE + 32768, 3 * ONE + 16384);
+    check(cov_diff(d2, stroked(16, 16, SD_AA_SUBSCANLINE, lone, 2 * ONE, SD_CAP_SQUARE, MI)), 0);   # 96
+    _sd_grow_limit = SD_GROW_LIMIT_DEFAULT;   # back to the shipped ceiling
+    var d2b = sd_canvas_new(16, 16);
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(d2b, dp20, 2 * ONE, SD_CAP_SQUARE, MI, 4 * ONE);
+    check(alloc_used() - g0, 32768);                                  # 97 — the flags, exactly
+    check(cov_diff(d2b, stroked(16, 16, SD_AA_SUBSCANLINE, dup_poly(0, 0), 2 * ONE, SD_CAP_SQUARE, MI)), 0);  # 98
+
+    # ── E) FILLS PAST THE OLD CAP ARE RIGHT: both engines, both rules, against exact references ────
+    # E1. 3,000 diamonds (12,000 edges) in one fill == diamonds 0..1,499 filled, 1,500..2,999 unioned.
+    var ch0 = diamond_path(0, 1500, 60);
+    var ch1 = diamond_path(1500, 1500, 60);
+    var rule = SD_FILL_EVEN_ODD;
+    var ebad = 0;
+    var mode = SD_AA_SUBSCANLINE;
+    var e_sub = 0;
+    var e_area = 0;
+    while (mode <= SD_AA_AREA) {
+        rule = SD_FILL_EVEN_ODD;
+        while (rule <= SD_FILL_NONZERO) {
+            var one = aa_canvas(186, 150, mode);
+            sd_canvas_fill_path(one, d3000, rule);
+            if (_sd_fill_trunc != 0) { ebad = ebad + 1; }
+            var parts = aa_canvas(186, 150, mode);
+            sd_canvas_fill_path(parts, ch0, rule);
+            sd_canvas_fill_union(parts, ch1, rule);
+            ebad = ebad + cov_diff(one, parts) + lit_outside(one, 180, 150);   # the grid ends at x = 180
+            if (rule == SD_FILL_NONZERO) {
+                if (mode == SD_AA_SUBSCANLINE) { e_sub = one; } else { e_area = one; }
+            }
+            rule = rule + 1;
+        }
+        mode = mode + 1;
+    }
+    check(ebad, 0);                                                   # 99
+    check(sd_canvas_coverage_at(e_sub, 178, 148) > 200, 1);           # 100 — the last diamond is inked
+    check(sd_canvas_coverage_at(e_area, 178, 148) > 200, 1);          # 101
+    check(cov_diff(e_sub, e_area) > 0, 1);                            # 102 — two engines really ran
+    check(cov_diff(c1, e_sub), 0);                                    # 103 — C1's fill grew mid-call: same bytes
+    var r_sub_parts = 0;
+    # E2. 4,500 diamonds in ONE row: 9,000 crossings on each sub-scanline through the row's middle —
+    # past the old 8,192-slot crossings array — against the two halves.
+    ebad = 0;
+    mode = SD_AA_SUBSCANLINE;
+    while (mode <= SD_AA_AREA) {
+        var rone = aa_canvas(13504, 4, mode);
+        sd_canvas_fill_path(rone, drow, SD_FILL_NONZERO);
+        var rparts = aa_canvas(13504, 4, mode);
+        sd_canvas_fill_path(rparts, diamond_path(0, 2250, 4500), SD_FILL_NONZERO);
+        sd_canvas_fill_union(rparts, diamond_path(2250, 2250, 4500), SD_FILL_NONZERO);
+        if (mode == SD_AA_SUBSCANLINE) { r_sub_parts = rparts; }
+        ebad = ebad + cov_diff(rone, rparts) + lit_outside(rone, 13500, 4);
+        if (sd_canvas_coverage_at(rone, 13498, 1) < 200) { ebad = ebad + 1; }
+        mode = mode + 1;
+    }
+    check(ebad, 0);                                                   # 104
+    check(cov_diff(c6, r_sub_parts), 0);                              # 105 — C6's fill grew mid-call
+    # E3. A rect with each side cut into 20,000 vertical pieces (40,000 edges) == the plain rect.
+    ebad = 0;
+    mode = SD_AA_SUBSCANLINE;
+    while (mode <= SD_AA_AREA) {
+        rule = SD_FILL_EVEN_ODD;
+        while (rule <= SD_FILL_NONZERO) {
+            var sone = aa_canvas(16, 16, mode);
+            sd_canvas_fill_path(sone, sr, rule);
+            var splain = aa_canvas(16, 16, mode);
+            sd_canvas_fill_path(splain, rect4(2 * ONE, 13 * ONE, 85197, 85197 + 880000), rule);
+            ebad = ebad + cov_diff(sone, splain) + lit_outside(sone, 13, 16);
+            rule = rule + 1;
+        }
+        mode = mode + 1;
+    }
+    check(ebad, 0);                                                   # 106
+    # E4. A 20,000-gon disc (radius 60 px): its ink is the disc's to within 0.01 %, in both engines,
+    # and a 2,000-gon's to within 2 levels. (0.6.0 kept 8,192 of its edges: MEASURED at radius 120 px
+    # on 256 x 256, 24.5 % of the ink, the centre pixel 0.)
+    var disc = ngon(64 * ONE + 19660, 64 * ONE + 45875, 60 * ONE, 20000);
+    var dsub = aa_canvas(128, 128, SD_AA_SUBSCANLINE);
+    sd_canvas_fill_path(dsub, disc, SD_FILL_NONZERO);
+    var darea = aa_canvas(128, 128, SD_AA_AREA);
+    sd_canvas_fill_path(darea, disc, SD_FILL_NONZERO);
+    var ideal = (255 * 355 * 3600) / 113;                             # 255 * pi * 60^2
+    check(sd_abs(cov_sum(dsub) - ideal) * 10000 < ideal, 1);          # 107
+    check(sd_abs(cov_sum(darea) - ideal) * 10000 < ideal, 1);         # 108
+    check(sd_canvas_coverage_at(dsub, 64, 64), 255);                  # 109
+    check(sd_canvas_coverage_at(darea, 20, 64), 255);                 # 110
+    var disc2 = ngon(64 * ONE + 19660, 64 * ONE + 45875, 60 * ONE, 2000);
+    var d2sub = aa_canvas(128, 128, SD_AA_SUBSCANLINE);
+    sd_canvas_fill_path(d2sub, disc2, SD_FILL_NONZERO);
+    var d2area = aa_canvas(128, 128, SD_AA_AREA);
+    sd_canvas_fill_path(d2area, disc2, SD_FILL_NONZERO);
+    check(cov_maxdiff(dsub, d2sub), 2);                               # 111 — MEASURED
+    check(cov_maxdiff(darea, d2area), 1);                             # 112 — MEASURED
+    # E5. A curve path whose flattening passes 8,192 points fills exactly as its own sd_path_flatten
+    # polyline does — the fill's edge list and the flatten result both grown, at the same tolerance.
+    var ring = cubic_ring(3000);
+    var rpl = sd_path_flatten(ring, ONE >> 2);
+    check(sd_polyline_count(rpl), 8601);                              # 113 — MEASURED: past 8,192
+    check(_sd_flat_trunc, 0);                                         # 114
+    var rc = sd_canvas_new(64, 64);
+    sd_canvas_fill_path(rc, ring, SD_FILL_NONZERO);
+    var rp = sd_canvas_new(64, 64);
+    sd_canvas_fill_path(rp, poly_closed(rpl), SD_FILL_NONZERO);
+    check(cov_diff(rc, rp), 0);                                       # 115
+    check(sd_canvas_coverage_at(rc, 32, 32), 255);                    # 116
+
+    # ── F) ROUND STROKES PAST 8,192 POINTS: every piece drawn ────
+    # Every piece of the round stroker is its own MAX pass, so the path in two halves that share
+    # their middle point draws exactly the same pieces. In 0.6.0 the one-call stroke stopped at
+    # point 8,191 (y = 1.25 + 8,191 / 1,024 px): the last row of the line, 9.8 px down, was empty.
+    var fone = sd_canvas_new(10, 12);
+    var fhalf = sd_canvas_new(10, 12);
+    var fpre = sd_canvas_new(10, 12);
+    var fdup = sd_canvas_new(16, 16);
+    check(sd_alloc_set(&hook_alloc), 0);                              # 117
+    sd_canvas_stroke_path(fone, vfull, 3 * ONE);
+    arena_reset(g_arena);
+    check(_sd_run_trunc, 0);                                          # 118
+    sd_canvas_stroke_path(fhalf, vpoly(0, 4500, 64), 3 * ONE);
+    arena_reset(g_arena);
+    sd_canvas_stroke_path(fhalf, vpoly(4500, 9000, 64), 3 * ONE);
+    arena_reset(g_arena);
+    sd_canvas_stroke_path(fpre, vpre, 3 * ONE);
+    arena_reset(g_arena);
+    # duplicates of a point: 9,000 extra discs on P0 are the one disc
+    sd_canvas_stroke_path(fdup, dup_poly(9000, 1), 2 * ONE);
+    arena_reset(g_arena);
+    check(sd_alloc_set(0), &hook_alloc);                              # 119
+    check(cov_diff(fone, fhalf), 0);                                  # 120
+    check(cov_diff(c3, fhalf), 0);                                    # 121 — C3's stroke grew the run mid-call
+    check(cov_diff(fone, fpre) > 0, 1);                               # 122 — the tail is really there
+    check(sd_canvas_coverage_at(fone, 4, 10), 255);                   # 123 — the end disc, 10.04 +- 1.5
+    check(sd_canvas_coverage_at(fpre, 4, 10), 191);                   # 124 — 0.6.0's end: 9.25 + 1.5
+    check(cov_diff(fdup, round_stroked(16, 16, dup_poly(0, 1), 2 * ONE)), 0);   # 125
+
+    # ── G) STYLED STROKES PAST 8,192 POINTS: one fill of the whole run ────
+    # The 9,001-point line is 18,000 vertical rect sides, 64 raw tall each: every sub-scanline crosses
+    # exactly one rect's pair, at x = 4.5 +- hw — the chord's crossings. So it strokes the chord's
+    # bytes exactly, on either engine, for any cap/join (collinear vertices make no join).
+    var chord = vpoly(0, 9000, 64);
+    var gc0 = sd_path_new();
+    sd_path_moveto(gc0, 4 * ONE + 32768, ONE + 16384);
+    sd_path_lineto(gc0, 4 * ONE + 32768, ONE + 16384 + 9000 * 64);
+    ebad = 0;
+    mode = SD_AA_SUBSCANLINE;
+    while (mode <= SD_AA_AREA) {
+        var gca = SD_CAP_BUTT;
+        while (gca <= SD_CAP_SQUARE) {
+            var gl = stroked(10, 14, mode, chord, 3 * ONE, gca, SD_JOIN_MITER);
+            if (_sd_run_trunc != 0) { ebad = ebad + 1; }
+            ebad = ebad + cov_diff(gl, stroked(10, 14, mode, gc0, 3 * ONE, gca, SD_JOIN_BEVEL));
+            gca = gca + 1;
+        }
+        mode = mode + 1;
+    }
+    check(ebad, 0);                                                   # 126
+    var gc5 = stroked(10, 12, SD_AA_SUBSCANLINE, gc0, 3 * ONE, BM, SD_JOIN_BEVEL);
+    check(cov_diff(c5, gc5), 0);                                      # 127 — C5's stroke grew the batch mid-call
+    # C2's 4,500 bars, which grew the batch mid-call, against the two halves (disjoint, so MAX is exact)
+    var gbars = sd_canvas_new(13504, 4);
+    sd_canvas_stroke_path_ex(gbars, vbars(0, 2250), ONE, BM, MI, 4 * ONE);
+    sd_canvas_stroke_path_ex(gbars, vbars(2250, 2250), ONE, BM, MI, 4 * ONE);
+    check(cov_diff(c2, gbars), 0);                                    # 128 — C2's stroke grew the batch mid-call
+    check(sd_canvas_coverage_at(c2, 13498, 2), 127);                  # 129 — the last bar: half of pixel 13,498
+    var gbutt = stroked(10, 14, SD_AA_SUBSCANLINE, chord, 3 * ONE, BM, MI);
+    check(sd_canvas_coverage_at(gbutt, 4, 9), 255);                   # 130 — past point 8,192 (y 9.25: 63)
+    var gsq = stroked(10, 14, SD_AA_SUBSCANLINE, chord, 3 * ONE, SD_CAP_SQUARE, MI);
+    check(sd_canvas_coverage_at(gsq, 4, 11), 127);                    # 131 — the cap to 11.54 (0.6.0: 0)
+    # a corner after 9,000 duplicates: de-duplicated to the 3-point L, byte for byte, both engines
+    ebad = 0;
+    mode = SD_AA_SUBSCANLINE;
+    while (mode <= SD_AA_AREA) {
+        var gd = stroked(16, 16, mode, dup_poly(9000, 1), 2 * ONE, SD_CAP_SQUARE, MI);
+        ebad = ebad + cov_diff(gd, stroked(16, 16, mode, dup_poly(0, 1), 2 * ONE, SD_CAP_SQUARE, MI));
+        mode = mode + 1;
+    }
+    check(ebad, 0);                                                   # 132
+    # the miter's outer corner (13.5, 2.25): [13, 13.5] x [2.25, 3] of pixel (13, 2), 3 samples of 4
+    var gcorner = stroked(16, 16, SD_AA_SUBSCANLINE, dup_poly(9000, 1), 2 * ONE, SD_CAP_SQUARE, MI);
+    check(sd_canvas_coverage_at(gcorner, 13, 2), 95);                 # 133
+
+    # ── H) A SELF-CROSSING STYLED STROKE PAST ONE 0.6.0 BATCH IS ONE FILL ────
+    # A 2,000-sample Lissajous at whole pixels crosses itself many times. As ONE nonzero fill its bytes
+    # cannot depend on the order its pieces were emitted in: walked backwards, the same bytes. In
+    # 0.6.0's 8,192-edge batches (SD_STROKE_BATCH_CAP = 8192, B3's bytes) pieces from different
+    # batches meet by MAX where the figure crosses itself — the two directions split differently.
+    var lb = liss(2000, 1);
+    var hf = stroked(200, 200, SD_AA_SUBSCANLINE, lf, 3 * ONE, SD_CAP_SQUARE, MI);
+    var hb = stroked(200, 200, SD_AA_SUBSCANLINE, lb, 3 * ONE, SD_CAP_SQUARE, MI);
+    check(_sd_sb_cap >= 16384, 1);                                    # 134
+    check(cov_diff(hf, hb), 0);                                       # 135 — one fill: order-free
+    check(cov_maxdiff(hf, k8_liss), 102);                             # 136 — MEASURED: 0.6.0's batches lost this much
+    SD_STROKE_BATCH_CAP = 8192;
+    var hb8 = stroked(200, 200, SD_AA_SUBSCANLINE, lb, 3 * ONE, SD_CAP_SQUARE, MI);
+    SD_STROKE_BATCH_CAP = keep_cap;
+    check(cov_diff(k8_liss, hb8) > 0, 1);                             # 137 — ...and depended on direction
+    # a limit under SD_STROKE_BATCH_MIN is held to it — 10 and 800 flush at the same edges
+    SD_STROKE_BATCH_CAP = 10;
+    var hmin = stroked(200, 200, SD_AA_SUBSCANLINE, lf, 3 * ONE, SD_CAP_SQUARE, MI);
+    SD_STROKE_BATCH_CAP = SD_STROKE_BATCH_MIN;
+    var hmin2 = stroked(200, 200, SD_AA_SUBSCANLINE, lf, 3 * ONE, SD_CAP_SQUARE, MI);
+    SD_STROKE_BATCH_CAP = keep_cap;
+    check(cov_diff(hmin, hmin2), 0);                                  # 138 — the floor holds
+    check(cov_diff(hmin, hf) > 0, 1);                                 # 139 — and it really did flush
+    var hfa = stroked(200, 200, SD_AA_AREA, lf, 3 * ONE, SD_CAP_SQUARE, MI);
+    var hba = stroked(200, 200, SD_AA_AREA, lb, 3 * ONE, SD_CAP_SQUARE, MI);
+    check(cov_diff(hfa, hba), 0);                                     # 140 — on the area engine too
+
+    # ── I) sd_path_flatten PAST 8,192 POINTS RETURNS THEM ALL ────
+    var pl20k = sd_path_flatten(v20k, ONE >> 2);
+    check(sd_polyline_count(pl20k), 20001);                           # 141
+    var ibad = 0;
+    var ik = 0;
+    while (ik <= 20000) {
+        var ip = load64(sd_polyline_points(pl20k) + ik * 8);
+        if (sd_point_y(ip) != ONE + 16384 + ik * 64) { ibad = ibad + 1; }
+        if (sd_point_x(ip) != 4 * ONE + 32768) { ibad = ibad + 1; }
+        ik = ik + 1;
+    }
+    check(ibad, 0);                                                   # 142 — every point, across both doublings
+
+    # ── J) THE GUARDS, WHITE-BOX ────
+    # J1. Only sd_path_flatten's ctx grows. A full ctx of any other kind — the fill's and stroker's
+    # per-curve buffers — drops the point and allocates nothing, even on a hook.
+    var jbuf = alloc(16);
+    var jctx = alloc(24);
+    store64(jctx + 0, jbuf);
+    store64(jctx + 8, 0);
+    store64(jctx + 16, 2);
+    check(sd_alloc_set(&hook_alloc), 0);                              # 143
+    a0 = arena_used(g_arena);
+    sd_flat_emit(jctx, 11);
+    sd_flat_emit(jctx, 22);
+    sd_flat_emit(jctx, 33);
+    check(arena_used(g_arena) - a0, 0);                               # 144
+    check(sd_alloc_set(0), &hook_alloc);                              # 145
+    check(load64(jctx + 8) + load64(jctx + 16), 4);                   # 146 — 2 kept, cap unchanged
+    check(load64(jctx + 0), jbuf);                                    # 147
+    check(load64(jbuf + 8), 22);                                      # 148
+    # J2. An edge arriving at a FULL batch grows it (the backstop behind the unit reserve), and the
+    # batch stays whole: the area engine takes it. The rect and cancelling pairs of B4, past 32,768.
+    check(_sd_sb_cap, 32768);                                         # 149
+    _sd_sb_n = 0;
+    _sd_sb_edge(4 * ONE, y63, 4 * ONE, y23);
+    _sd_sb_edge(12 * ONE, y23, 12 * ONE, y63);
+    bk = 0;
+    g0 = alloc_used();
+    while (bk < 16384) {
+        _sd_sb_edge(14 * ONE, y23, 14 * ONE, y63);
+        _sd_sb_edge(14 * ONE, y63, 14 * ONE, y23);
+        bk = bk + 1;
+    }
+    check(alloc_used() - g0, 2097152);                                # 150 — edges 65,536 * 32; crossings held
+    check(_sd_sb_n, 32770);                                           # 151
+    check(_sd_sb_trunc, 0);                                           # 152
+    var jfull = aa_canvas(16, 8, SD_AA_AREA);
+    _sd_sb_flush(jfull);
+    check(sd_canvas_coverage_at(jfull, 8, 2), 178);                   # 153
+    check(_sd_fill_cross_cap >= _sd_sb_cap, 1);                       # 154
+    check(_sd_fill_cross_cap >= _sd_fill_edges_cap, 1);               # 155
+    # J3. A CURVE that straddles the run's capacity: 32,765 duplicates put the cusp's flattened
+    # vertices either side of point 32,768, so the run and the flags grow in the middle of the curve
+    # — and every vertex, with its inside-a-curve flag, must come across. The de-duplicated path is
+    # the reference: same stroke, and the cusp still rounds (rows 0..8 empty; a MITER there spikes).
+    check(_sd_stroke_run_cap, 32768);                                 # 156
+    check(_sd_sb_inner_cap, 32768);                                   # 157
+    var jc = sd_canvas_new(60, 40);
+    var jcref = sd_canvas_new(60, 40);
+    var jref_path = dups_cusp(0);
+    sd_canvas_stroke_path_ex(jcref, jref_path, 4 * ONE, BM, MI, 4 * ONE);
+    var jmid = alloc_used();
+    sd_canvas_stroke_path_ex(jcref, jref_path, 4 * ONE, BM, MI, 4 * ONE);
+    var jmid_cost = alloc_used() - jmid;   # the cubic's flatten mid-points, on the seam
+    var jpath = dups_cusp(32765);
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(jc, jpath, 4 * ONE, BM, MI, 4 * ONE);
+    check(alloc_used() - g0, 524288 + 65536 + jmid_cost);             # 158 — run + flags + the cubic's mid-points
+    check(_sd_stroke_run_cap, 65536);                                 # 159
+    check(_sd_sb_inner_cap, 65536);                                   # 160
+    check(_sd_run_trunc, 0);                                          # 161
+    check(cov_diff(jc, jcref), 0);                                    # 162
+    check(lit_outside(jc, 60, 0) - lit_outside(jc, 60, 9), 0);        # 163 — the cusp still rounds
+
+    # ── K) THE COPY AND THE POINTER AT EVERY DOUBLING; THE KNOB'S FLOOR ────
+    # ⚠ WHY THIS GROUP EXISTS. Groups C and D measure what a growth COSTS and E-J that a grown
+    # result is right — but every fill they compare was filled again at the grown capacity
+    # (overwriting) and every stroke stroked again (MAX-repairing), so a growth that copied one
+    # entry short left no trace in them. These checks look at the growth itself: the snapshots taken
+    # as the growing call left them, and the live entries read back out of the new block.
+    # K1. The fills and strokes that grew MID-CALL, before their warm repeats.
+    check(cov_diff(c1snap, e_sub), 0);                                # 164 — C1's fill, as it grew it
+    check(cov_sum(c1snap) > 0, 1);                                    # 165
+    check(cov_diff(c2snap, gbars), 0);                                # 166 — C2's stroke, as it grew it
+    check(cov_sum(c2snap) > 0, 1);                                    # 167
+    # K2. Every live edge crosses the doubling, the LAST one included. White-box, from a fresh
+    # 8,192-edge block (the capacities reached above would make this cost megabytes): each edge's
+    # four words are a function of its index, and one more edge forces the growth.
+    var kcap = 8192;
+    _sd_fill_edges = alloc(kcap * 32);
+    _sd_fill_edges_cap = kcap;
+    _sd_fill_cross = alloc(kcap * 16);
+    _sd_fill_cross_cap = kcap;
+    _sd_fill_trunc = 0;
+    store64(_sd_fill_ectx + 0, _sd_fill_edges);
+    store64(_sd_fill_ectx + 8, 0);
+    store64(_sd_fill_ectx + 16, kcap);
+    var ki = 0;
+    while (ki < kcap) {
+        sd_edge_add(_sd_fill_ectx, ki + 1, 2 * ki + 1, 3 * ki + 2, 4 * ki + 3);
+        ki = ki + 1;
+    }
+    check(load64(_sd_fill_ectx + 8), kcap);                           # 168 — full, nothing dropped
+    var kold = _sd_fill_edges;
+    sd_edge_add(_sd_fill_ectx, 5, 6, 7, 8);
+    check(_sd_fill_edges_cap, 2 * kcap);                              # 169
+    check(_sd_fill_edges != kold, 1);                                 # 170
+    check(load64(_sd_fill_ectx + 0), _sd_fill_edges);                 # 171
+    var kbad = 0;
+    ki = 0;
+    while (ki < kcap) {
+        var ke = _sd_fill_edges + ki * 32;
+        if (load64(ke + 0) != ki + 1) { kbad = kbad + 1; }
+        if (load64(ke + 8) != 2 * ki + 1) { kbad = kbad + 1; }
+        if (load64(ke + 16) != 3 * ki + 2) { kbad = kbad + 1; }
+        if (load64(ke + 24) != 4 * ki + 3) { kbad = kbad + 1; }
+        ki = ki + 1;
+    }
+    check(kbad, 0);                                                   # 172 — the whole live list came across
+    check(_sd_fill_trunc, 0);                                         # 173
+    # A ctx that is NOT the fill's does not grow: it keeps 0.6.0's fixed capacity and drops, rather
+    # than repointing _sd_fill_edges at the caller's block.
+    var kfor = alloc(32);
+    var kfctx = alloc(24);
+    store64(kfctx + 0, kfor);
+    store64(kfctx + 8, 1);
+    store64(kfctx + 16, 1);
+    var kfe = _sd_fill_edges;
+    sd_edge_add(kfctx, 1, 2, 3, 4);
+    check(load64(kfctx + 8) + load64(kfctx + 16), 2);                 # 174 — count and cap unchanged
+    check(load64(kfctx + 0), kfor);                                   # 175
+    check(_sd_fill_edges, kfe);                                       # 176 — and the fill's block is its own
+    check(_sd_fill_edges_cap, 2 * kcap);                              # 177
+    _sd_fill_trunc = 0;
+    # K3. ⛔ The walk's crossings pointer is read AFTER the list is built, so a fill that grew its
+    # list mid-call walks the CURRENT block. 4,500 diamonds in one row put 9,000 crossings on a
+    # sub-scanline — 808 slots past an 8,192-slot block. Reset both capacities and give the crossings
+    # 2,048 slots of canary behind them, in ONE allocation so the canary really is what an overflow
+    # reaches. ⚠ No coverage check can see this: the walk would write and read the same wrong block.
+    var kslack = 2048;
+    _sd_fill_edges = alloc(kcap * 32);
+    _sd_fill_edges_cap = kcap;
+    var kblk = alloc((kcap + kslack) * 16);
+    _sd_fill_cross = kblk;
+    _sd_fill_cross_cap = kcap;
+    var kcan = kblk + kcap * 16;
+    ki = 0;
+    while (ki < kslack * 2) {
+        store64(kcan + ki * 8, 918273 * ki + 11);
+        ki = ki + 1;
+    }
+    var krow = sd_canvas_new(13504, 4);
+    sd_canvas_fill_path(krow, drow, SD_FILL_NONZERO);
+    check(_sd_fill_cross != kblk, 1);                                 # 178 — the crossings grew with the list
+    check(_sd_fill_cross_cap, 32768);                                 # 179
+    kbad = 0;
+    ki = 0;
+    while (ki < kslack * 2) {
+        if (load64(kcan + ki * 8) != 918273 * ki + 11) { kbad = kbad + 1; }
+        ki = ki + 1;
+    }
+    check(kbad, 0);                                                   # 180 — nothing written past the old block
+    check(cov_diff(krow, c6), 0);                                     # 181 — and the fill is still right
+    # K4. The batch's copy, the same way: a fresh 8,192-edge array, 8,192 indexed edges, one more.
+    _sd_sb_edges = alloc(kcap * 32);
+    _sd_sb_cap = kcap;
+    _sd_sb_n = 0;
+    _sd_sb_trunc = 0;
+    ki = 0;
+    while (ki < kcap) {
+        _sd_sb_edge(ki + 1, 2 * ki + 1, 3 * ki + 2, 4 * ki + 3);
+        ki = ki + 1;
+    }
+    check(_sd_sb_n, kcap);                                            # 182
+    var kbold = _sd_sb_edges;
+    _sd_sb_edge(5, 6, 7, 8);
+    check(_sd_sb_cap, 2 * kcap);                                      # 183
+    check(_sd_sb_edges != kbold, 1);                                  # 184
+    kbad = 0;
+    ki = 0;
+    while (ki < kcap) {
+        var kb = _sd_sb_edges + ki * 32;
+        if (load64(kb + 0) != ki + 1) { kbad = kbad + 1; }
+        if (load64(kb + 8) != 2 * ki + 1) { kbad = kbad + 1; }
+        if (load64(kb + 16) != 3 * ki + 2) { kbad = kbad + 1; }
+        if (load64(kb + 24) != 4 * ki + 3) { kbad = kbad + 1; }
+        ki = ki + 1;
+    }
+    check(kbad, 0);                                                   # 185
+    check(_sd_sb_trunc, 0);                                           # 186
+    _sd_sb_n = 0;
+    # K5. The curve flags' copy is the WHOLE old capacity, and the byte at its last index is exactly
+    # the one _sd_sb_mark_curve has not written yet when a curve straddles the growth: write a 1
+    # there, grow, read it back. (Index 8,191 is one of the 1s of the pattern below.)
+    _sd_sb_inner = alloc(kcap);
+    _sd_sb_inner_cap = kcap;
+    _sd_run_trunc = 0;
+    ki = 0;
+    while (ki < kcap) {
+        store8(_sd_sb_inner + ki, (ki % 3) & 1);
+        ki = ki + 1;
+    }
+    check(load8(_sd_sb_inner + kcap - 1), 1);                         # 187 — the last slot is a 1
+    var kiold = _sd_sb_inner;
+    check(_sd_inner_grow(kcap + 1), 1);                               # 188
+    check(_sd_sb_inner_cap, 2 * kcap);                                # 189
+    check(_sd_sb_inner != kiold, 1);                                  # 190
+    kbad = 0;
+    ki = 0;
+    while (ki < kcap) {
+        if (load8(_sd_sb_inner + ki) != ((ki % 3) & 1)) { kbad = kbad + 1; }
+        ki = ki + 1;
+    }
+    check(kbad, 0);                                                   # 191 — every flag, the last included
+    # K6. ⭐ SD_STROKE_BATCH_CAP bounds the batch's FIRST allocation, as it did through 0.6.0 — a
+    # consumer that asks for a small batch gets a small one, and does not pay 8,192 edges to have it.
+    # _sd_sb_init runs once per process, so this drives it white-box: park the live batch, clear the
+    # "already built" marker, measure a fresh init, and put the batch back.
+    var ksv_e = _sd_sb_edges;
+    var ksv_c = _sd_sb_cap;
+    var ksv_i = _sd_sb_inner;
+    var ksv_ic = _sd_sb_inner_cap;
+    var ksv_t = _sd_sb_trig;
+    SD_STROKE_BATCH_CAP = 900;
+    _sd_sb_edges = 0;
+    g0 = alloc_used();
+    _sd_sb_init();
+    check(alloc_used() - g0, 256 + 8192 + 900 * 32);                  # 192 — 37,248 B: 0.6.0's figure
+    check(_sd_sb_cap, 900);                                           # 193
+    # ...and it STAYS bounded: a 2,000-sample self-crossing stroke flushes at the limit instead of
+    # growing, so the array a bounded consumer paid for is all it ever holds.
+    var kbound = sd_canvas_new(200, 200);
+    g0 = alloc_used();
+    sd_canvas_stroke_path_ex(kbound, lf, 3 * ONE, SD_CAP_SQUARE, MI, 4 * ONE);
+    check(alloc_used() - g0, 0);                                      # 194 — nothing past the 900 edges
+    check(_sd_sb_cap, 900);                                           # 195
+    check(cov_sum(kbound) > 1000000, 1);                              # 196
+    SD_STROKE_BATCH_CAP = 10;
+    _sd_sb_edges = 0;
+    _sd_sb_init();
+    check(_sd_sb_cap, SD_STROKE_BATCH_MIN);                           # 197 — held to the floor
+    SD_STROKE_BATCH_CAP = 1 << 20;
+    _sd_sb_edges = 0;
+    _sd_sb_init();
+    check(_sd_sb_cap, 8192);                                          # 198 — and to the crossings' capacity
+    SD_STROKE_BATCH_CAP = keep_cap;
+    _sd_sb_edges = 0;
+    g0 = alloc_used();
+    _sd_sb_init();
+    check(alloc_used() - g0, 256 + 8192 + 8192 * 32);                 # 199 — the default: 270,592 B
+    check(_sd_sb_cap, 8192);                                          # 200
+    _sd_sb_edges = ksv_e;
+    _sd_sb_cap = ksv_c;
+    _sd_sb_inner = ksv_i;
+    _sd_sb_inner_cap = ksv_ic;
+    _sd_sb_trig = ksv_t;
+    _sd_sb_n = 0;
+    # The array's SIZE is a memory choice, not a drawing one: the same limit on the big array draws
+    # what it drew on the 900-edge one.
+    SD_STROKE_BATCH_CAP = 900;
+    var kbig = stroked(200, 200, SD_AA_SUBSCANLINE, lf, 3 * ONE, SD_CAP_SQUARE, MI);
+    SD_STROKE_BATCH_CAP = keep_cap;
+    check(cov_diff(kbound, kbig), 0);                                 # 201
+    # K7. The invariant every growth keeps: the crossings hold any list that is walked.
+    check(_sd_fill_cross_cap >= _sd_fill_edges_cap, 1);               # 202
+    check(_sd_fill_cross_cap >= _sd_sb_cap, 1);                       # 203
+
+    # ---- L. THE GROWTH CEILING (sd_grow_limit_set / _get) ------------------------------------
+    # ⛔ The default is a BOUND, not 0. Lifting SD_FLATTEN_CAP made one pathological path able to
+    # make a process keep memory for life (the scratch is process-lifetime on an allocator with no
+    # free()). MEASURED on this tree with the ceiling at 0, rekha's hostile repro — 4,096 maximally
+    # non-flat quads, one fill on 64x64 — grows edges + crossings to 1,048,576 entries and costs
+    # 150,602,312 B of global heap; under the default it keeps 262,144 edges, flags the truncation
+    # and costs 83,493,448 B (of which 50,135,040 B is the flatten mid-point waste rekha filed
+    # separately — docs/development/issues/2026-09-15-flatten-keeps-subdividing-… — and ~33 MB the
+    # bounded growth).
+    check(SD_GROW_LIMIT_DEFAULT, 8388608);                            # 204
+    check(g_limit0, SD_GROW_LIMIT_DEFAULT);                           # 205 — SHIPPED default, as
+    #                                                                   the process started, not the
+    #                                                                   constant compared with itself
+    check(sd_grow_limit_set(4096), SD_GROW_LIMIT_DEFAULT);            # 206 — returns the PREVIOUS
+    check(sd_grow_limit_get(), 4096);                                 # 207
+    check(sd_grow_limit_set(0 - 1), 4096);                            # 208 — negative is refused...
+    check(sd_grow_limit_get(), 4096);                                 # 209 — ...and changes nothing
+    # A ceiling the fill's NEXT doubling cannot clear: the list keeps the edges it has room for,
+    # drops the rest, and says so — 0.6.0's behaviour at the cap, now flagged. (The capacity here is
+    # whatever the groups above grew it to; the point is that it does not grow again.)
+    var lcap = _sd_fill_edges_cap;
+    var lcv = aa_canvas(40, 40, SD_AA_SUBSCANLINE);
+    var lp = diamond_path(0, lcap, 60);                               # 4 * lcap edges > lcap
+    sd_grow_limit_set(lcap * 32);                                     # one byte short of the double
+    check(sd_canvas_fill_path(lcv, lp, SD_FILL_NONZERO), SADISH_OK);  # 210
+    check(_sd_fill_trunc, 1);                                         # 211 — truncation recorded
+    check(_sd_fill_edges_cap, lcap);                                  # 212 — the list never grew
+    # The same fill with the ceiling lifted keeps every edge and paints more of the grid.
+    sd_grow_limit_set(0);
+    var lfull = aa_canvas(40, 40, SD_AA_SUBSCANLINE);
+    check(sd_canvas_fill_path(lfull, lp, SD_FILL_NONZERO), SADISH_OK);  # 213
+    check(_sd_fill_trunc, 0);                                         # 214 — nothing dropped
+    check(_sd_fill_edges_cap >= lcap * 4, 1);                         # 215 — it grew past the bound
+    # ⚠ NOT asserted: that the two pictures differ. They need not — this path's dropped edges are
+    # diamonds outside the 40x40 canvas, so the bounded fill draws the same pixels (MEASURED:
+    # cov_diff 0). Truncation is a CONTRACT breach, not a visible one; the flag is the only honest
+    # witness, which is exactly why the AREA dispatch reads the flag and not the coverage.
+    sd_grow_limit_set(SD_GROW_LIMIT_DEFAULT);
+    check(sd_grow_limit_get(), 8388608);                              # 216 — restored for the rest
+
+    if (g_fails == 0) {
+        var ok = "grow_edges_test: PASS (edge list, crossings, run, batch, flatten grow; OOM degrades to 0.6.0)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "grow_edges_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

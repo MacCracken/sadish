@@ -28,9 +28,18 @@ var SD_AA_AREA        = 1;
 #   +0:  width      (i64 — pixels)
 #   +8:  height     (i64 — pixels)
 #   +16: coverage   (ptr — owned width*height bytes, one coverage per px)
-#   +24: stride     (i64 — bytes per row; == width for the packed buffer)
+#   +24: stride     (i64 — bytes per row OF THE COVERAGE BUFFER; == width for the packed buffer)
 #   +32: clip       (ptr — top SdClip node, or 0 = unclipped)
 #   +40: aa         (i64 — coverage engine, SD_AA_SUBSCANLINE | SD_AA_AREA)
+# ⛔⛔ TWO PITCHES, AND ONLY ONE OF THEM IS THE STRIDE. The COVERAGE buffer at +16 is addressed
+# `y * stride + x` — it may be a window into a wider buffer. The CLIP MASK hanging off +32 is a
+# sadish-owned, never-wrapped `w * h` block and is addressed `y * w + x` — PACKED, ALWAYS, whatever
+# the canvas stride says. Every producer already wrote it packed (sd_canvas_clip_push_rect,
+# sd_clip_push_mask's intersection, the temp canvas behind sd_canvas_clip_push_path); since 0.6.1
+# the three consumers read it packed too (sd_fill_impl, _sd_area_fill, _sd_sb_flush). Byte-identical
+# on every canvas sd_canvas_new makes, where stride == width — the gate is programs/clip_pitch_test.cyr,
+# which hand-builds the header sd_canvas_new cannot. Closed
+# docs/development/issues/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md.
 # ⚠ The canvas was 40 bytes through 0.5.5. Nothing in dhancha, rekha or agnos builds one by hand
 # (checked by grep) — sd_canvas_new is the only constructor. But every canvas — and the temp mask
 # canvas behind each sd_canvas_clip_push_path — now costs 8 B more on sd_alloc, which moves exact
@@ -109,16 +118,25 @@ fn sd_canvas_coverage_at(cv, x, y): i64 {
     return load8(cov + y * stride + x);
 }
 
-# @public — zero the coverage buffer (reuse a canvas across draws).
+# @public — zero the canvas's WINDOW of the coverage buffer (reuse a canvas across draws).
+# ⛔ ROW BY ROW AT THE STRIDE, `w` bytes a row — not one flat `w * h` run. The coverage buffer is
+# the strided side of the canvas (see the layout note): a flat run over a wrapped canvas would
+# zero another row's padding and leave the window's last rows dirty. Byte-identical on every
+# canvas sd_canvas_new makes, where stride == width and the two walks are the same 70 bytes in the
+# same order. Gated by programs/clip_pitch_test.cyr.
 fn sd_canvas_clear(cv): i64 {
     var w = load64(cv + SD_CANVAS_WIDTH_OFFSET);
     var h = load64(cv + SD_CANVAS_HEIGHT_OFFSET);
     var cov = load64(cv + SD_CANVAS_COVERAGE_OFFSET);
-    var n = w * h;
-    var i = 0;
-    while (i < n) {
-        store8(cov + i, 0);
-        i = i + 1;
+    var stride = load64(cv + SD_CANVAS_STRIDE_OFFSET);
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            store8(cov + y * stride + x, 0);
+            x = x + 1;
+        }
+        y = y + 1;
     }
     return SADISH_OK;
 }
@@ -129,8 +147,9 @@ fn sd_canvas_clear(cv): i64 {
 # free(). MEASURED on 0.5.4, 8x8 canvas, one call: fill 327,824 B, stroke of a closed 4-vertex
 # rect 2,789,016 B (8 fill_union passes underneath it), per call, forever. dhancha filed it
 # (2026-09-13, scalable text allocates per call outside the frame arena); crab's zero-heap
-# frame gate is what it blocks. The capacity is FIXED (SD_FLATTEN_CAP) and does not depend on
-# the path, so it is one process-wide set, allocated lazily ONCE and reused by every call.
+# frame gate is what it blocks. The capacity was FIXED (SD_FLATTEN_CAP) and did not depend on
+# the path, so it is one process-wide set, allocated lazily ONCE and reused by every call (and
+# since 0.6.1 grown in place when a path outgrows it — GROWTH, below).
 #
 # ⛔ FROM THE GLOBAL `alloc`, NEVER `sd_alloc`. A consumer's hook is typically a per-frame arena
 # that gets reset; a scratch drawn from it would be dangling on the second frame. The scratch
@@ -157,18 +176,90 @@ fn sd_canvas_clear(cv): i64 {
 # only ever costs 48 x (2^d - 1) B because both de Casteljau halves carry the parent's second
 # difference / 4 and so split to the same depth).
 var _sd_fill_ectx = 0;         # edge builder ctx (24 B): +0 edges  +8 count  +16 cap
-var _sd_fill_edges = 0;        # SD_FLATTEN_CAP * 32
-var _sd_fill_fbuf = 0;         # SD_FLATTEN_CAP * 8 — flatten output for one curve verb
+var _sd_fill_edges = 0;        # _sd_fill_edges_cap * 32 — GROWS (0.6.1)
+var _sd_fill_edges_cap = 0;    # edges the current block holds (SD_FLATTEN_CAP until a path needs more)
+var _sd_fill_trunc = 0;        # 1 if THIS fill's edge list dropped an edge (a growth failed)
+var _sd_fill_fbuf = 0;         # SD_FLATTEN_CAP * 8 — flatten output for one curve verb (FIXED, below)
 var _sd_fill_fctx = 0;         # flatten ctx (24 B)
-var _sd_fill_cross = 0;        # SD_FLATTEN_CAP * 16 — (x, dir) crossings; n_edges <= cap
+var _sd_fill_cross = 0;        # _sd_fill_cross_cap * 16 — (x, dir) crossings — GROWS (0.6.1)
+var _sd_fill_cross_cap = 0;    # >= every edge list that is walked: the fill's AND the stroke batch's
 var _sd_fill_accrow = 0;       # w * 8 — per-row 16.16 accumulator, sized to the widest canvas seen
 var _sd_fill_accrow_cap = 0;   # pixels the current accrow block can hold
-var _sd_stroke_run = 0;        # SD_FLATTEN_CAP * 8 — the stroker's polyline run
-var _sd_stroke_fbuf = 0;       # SD_FLATTEN_CAP * 8 — the stroker's OWN flatten output
+var _sd_stroke_run = 0;        # _sd_stroke_run_cap * 8 — the stroker's polyline run — GROWS (0.6.1)
+var _sd_stroke_run_cap = 0;    # points the current run block holds
+var _sd_stroke_fbuf = 0;       # SD_FLATTEN_CAP * 8 — the stroker's OWN flatten output (FIXED)
 var _sd_stroke_fctx = 0;       # the stroker's OWN flatten ctx (24 B)
 # ⚠ The SD_AA_AREA engine's accumulator (_sd_area_acc, (w+1)*8) is the same kind of scratch but
 # lives with its engine in src/coverage.cyr, allocated on the first AREA fill — NOT here, so a
 # process that never opts in pays nothing and the first-fill figures below stay exact.
+#
+# ⭐ GROWTH (0.6.1). Through 0.6.0 the edge list, the crossings and the stroker's run held
+# SD_FLATTEN_CAP = 8,192 entries and DROPPED the rest: a path of more edges filled wrong (its
+# contours left open), a longer run stroked only its first 8,192 points. Now each grows by
+# doubling when full — from the GLOBAL alloc, for the reason above — copying its live entries and
+# abandoning the old block (no free()), exactly like _sd_fill_accrow_for. The INITIAL capacities
+# are unchanged, so every first-use figure stays exact, and growth is monotone: a process pays for
+# its largest path once, then 0 B a call. MEASURED (programs/grow_edges_test.cyr): the first fill
+# past 8,192 edges costs 786,432 B (edges 16,384 * 32 + crossings 16,384 * 16); a repeat 0 B.
+# ⚠ The two per-curve buffers (_sd_fill_fbuf, _sd_stroke_fbuf) stay FIXED: they hold ONE curve
+# verb's flattening, which sd_flatten_quad / sd_flatten_cubic bound by 2^SD_FLATTEN_MAX_DEPTH = 256
+# points (every leaf of the depth-8 recursion emits exactly one) — a 32nd of their capacity.
+# ⚠ OUT OF MEMORY: a failed growth keeps the old block and drops, as 0.6.0 did, and RECORDS it
+# (_sd_fill_trunc here; _sd_sb_trunc / _sd_run_trunc in stroke.cyr) — so the SD_AA_AREA dispatch,
+# which streaks on an open contour, falls back only for a list that is really incomplete.
+
+# ================================================================
+# THE GROWTH CEILING — the largest single growth request, in bytes, that is attempted. A request
+# above it fails exactly as `alloc` failing would: the store keeps its old block, drops what does
+# not fit, and RECORDS the truncation (the flags above), which is 0.6.0's behaviour for a path this
+# large. 0 = no bound of sadish's own (alloc itself refuses over 2 GiB).
+#
+# ⛔⛔ WHY THIS IS BOUNDED BY DEFAULT, AND WHY THAT IS A TRADE AND NOT A FREE WIN. Lifting
+# SD_FLATTEN_CAP turned "a path over 8,192 edges renders WRONG" into "a path over 8,192 edges costs
+# whatever it costs" — and the scratch is process-lifetime on an allocator with no free(), so ONE
+# pathological path makes a process keep that memory for the rest of its life. MEASURED on this
+# tree, rekha's hostile repro (4,096 maximally non-flat quads, one sd_canvas_fill_path on 64x64,
+# the shape a font file can carry — docs/development/issues/2026-09-15-flatten-keeps-subdividing-…):
+# unbounded, it grows the edge list and crossings to 1,048,576 entries and the fill costs
+# 150,602,312 B of global heap, permanently. At the default below the same fill keeps its first
+# 262,144 edges, flags the truncation, and the AREA dispatch falls back to the sub-scanline loop
+# (which paints nothing past a row's last crossing) rather than streaking on an open contour.
+# ⇒ Over the ceiling, sadish chooses BOUNDED MEMORY AND A FLAGGED, DEGRADED FILL over correct
+# output at any price. A consumer that renders its own trusted geometry and wants the old
+# behaviour sets 0; a consumer that fills untrusted outlines (rekha → dhancha → crab draw glyph
+# paths from font files, every frame) should keep a bound.
+# ⚠ THE PEAK IS ABOUT TWICE THE CEILING PER STORE. Growth doubles and abandons the old block, so a
+# store that reaches the ceiling has also paid for every smaller block below it (8 MiB + 4 + 2 + …
+# ≈ 16 MiB). The ceiling bounds one REQUEST, not a process's total.
+# ⚠ It is also what lets programs/grow_edges_test.cyr drive the out-of-memory path a real failure
+# takes — no honest test reaches alloc's own limit, which is 67 M edges.
+# ================================================================
+# 8 MiB: 262,144 edges (32 B each), 524,288 crossings (16 B) or 1,048,576 run points (8 B) in one
+# request — far past any legitimate path this stack draws, and short of the hostile repro above.
+var SD_GROW_LIMIT_DEFAULT = 8388608;
+var _sd_grow_limit = 8388608;
+
+# @public — set the growth ceiling in bytes (0 = unbounded); returns the PREVIOUS value, so a caller
+# can scope it. SD_GROW_LIMIT_DEFAULT restores the default.
+fn sd_grow_limit_set(n): i64 {
+    var prev = _sd_grow_limit;
+    if (n < 0) { return prev; }
+    _sd_grow_limit = n;
+    return prev;
+}
+
+# @public — the current growth ceiling in bytes (0 = unbounded).
+fn sd_grow_limit_get(): i64 {
+    return _sd_grow_limit;
+}
+
+# `alloc(n)` for a growth of the process-lifetime scratch, subject to _sd_grow_limit. 0 on failure.
+fn _sd_grow_alloc(n): i64 {
+    if (_sd_grow_limit > 0) {
+        if (n > _sd_grow_limit) { return 0; }
+    }
+    return alloc(n);
+}
 
 # Allocate the fixed-capacity scratch once (idempotent). Called at the top of sd_fill_impl and
 # sd_canvas_stroke_path; a second call is one load + compare. MEASURED one-time cost: 589,896 B
@@ -179,13 +270,65 @@ fn _sd_scratch_init(): i64 {
     if (_sd_fill_ectx != 0) { return 0; }
     _sd_fill_ectx = alloc(24);
     _sd_fill_edges = alloc(SD_FLATTEN_CAP * 32);
+    _sd_fill_edges_cap = SD_FLATTEN_CAP;
     _sd_fill_fbuf = alloc(SD_FLATTEN_CAP * 8);
     _sd_fill_fctx = alloc(24);
     _sd_fill_cross = alloc(SD_FLATTEN_CAP * 16);
+    _sd_fill_cross_cap = SD_FLATTEN_CAP;
     _sd_stroke_run = alloc(SD_FLATTEN_CAP * 8);
+    _sd_stroke_run_cap = SD_FLATTEN_CAP;
     _sd_stroke_fbuf = alloc(SD_FLATTEN_CAP * 8);
     _sd_stroke_fctx = alloc(24);
     return 0;
+}
+
+# The crossings array for walking a list of `n` edges (a sub-scanline crosses each edge at most
+# once, so n slots always suffice). Doubles from the current capacity until it holds n; the old
+# block is abandoned and NOT copied — crossings are rebuilt per sub-scanline, and nothing grows it
+# while a walk is reading it (the fill's edge list and the stroke batch grow while they are BUILT).
+# ⛔ So every walk must read _sd_fill_cross AFTER its list is complete, never cache it across a
+# growth. Returns the block, or 0 if the growth failed (the old block and capacity are kept).
+#
+# ⛔ THE INVARIANT IT EXISTS FOR: _sd_fill_cross_cap >= the capacity of EVERY list that is walked
+# (the fill's _sd_fill_edges_cap and the stroke batch's _sd_sb_cap). Nothing checks it at run time —
+# it holds because both growers reserve HERE first and abandon their own growth if this one fails,
+# and because every capacity climbs the same power-of-two ladder from SD_FLATTEN_CAP. ⚠ A caller
+# that ignored the 0 would raise its own capacity above the crossings and the next walk would write
+# past this block; with lib/alloc.cyr that cannot be reached from here (a bump allocator that
+# refuses nc * 16 refuses the caller's nc * 32 too, so the caller fails at its own allocation
+# either way) — but a future allocator with size classes could, so the 0 is a contract, not a
+# formality. programs/grow_edges_test.cyr asserts the invariant after every growth it drives.
+fn _sd_fill_cross_for(n): i64 {
+    if (n <= _sd_fill_cross_cap) { return _sd_fill_cross; }
+    var nc = _sd_fill_cross_cap;
+    while (nc < n) { nc = nc * 2; }
+    var blk = _sd_grow_alloc(nc * 16);
+    if (blk == 0) { return 0; }
+    _sd_fill_cross = blk;
+    _sd_fill_cross_cap = nc;
+    return blk;
+}
+
+# Double the fill's edge list in `ectx` (the crossings first, so crossings >= edges always holds),
+# copying its live edges. Returns 1, or 0 if either allocation failed — the list is then unchanged.
+# ⛔ ONLY THE FILL'S OWN ctx GROWS. Success repoints the process-lifetime _sd_fill_edges /
+# _sd_fill_edges_cap at the new block, so growing a ctx that is not _sd_fill_ectx would hand the
+# fill's scratch bookkeeping to someone else's array. A foreign ctx therefore returns 0 here and its
+# caller drops the edge, exactly as 0.6.0 did at the cap — the same guard _sd_flat_widen puts on
+# sd_flat_emit's ctx, for the same reason. (Every in-tree caller passes _sd_fill_ectx.)
+fn _sd_fill_edges_grow(ectx): i64 {
+    if (ectx != _sd_fill_ectx) { return 0; }
+    var count = load64(ectx + 8);
+    var nc = load64(ectx + 16) * 2;
+    if (_sd_fill_cross_for(nc) == 0) { return 0; }
+    var blk = _sd_grow_alloc(nc * 32);
+    if (blk == 0) { return 0; }
+    memcpy(blk, load64(ectx + 0), count * 32);
+    store64(ectx + 0, blk);
+    store64(ectx + 16, nc);
+    _sd_fill_edges = blk;
+    _sd_fill_edges_cap = nc;
+    return 1;
 }
 
 # The per-row accumulator for a canvas `w` pixels wide. Its size is the only part of the scratch
@@ -207,13 +350,23 @@ fn _sd_fill_accrow_for(w): i64 {
 # stays the default; full 2-axis signed-area accumulation is SD_AA_AREA (src/coverage.cyr).
 var SD_FILL_SS = 4;
 
-# Edge builder ctx: +0 edges(ptr, 4 i64/edge: ax,ay,bx,by)  +8 count  +16 cap.
-# Horizontal edges (ay == by) contribute no crossings and are dropped.
+# Edge builder ctx: +0 edges(ptr, 4 i64/edge: ax,ay,bx,by)  +8 count  +16 cap. `ectx` is the
+# fill's _sd_fill_ectx: a full list grows (_sd_fill_edges_grow) — and ONLY that ctx does, so any
+# other one keeps its own fixed capacity and drops at it, as every ctx did through 0.6.0.
+# Horizontal edges (ay == by)
+# contribute no crossings and are dropped. ⚠ An edge that does not fit after a FAILED growth is
+# dropped and _sd_fill_trunc set — and once set, this fill stops trying to grow, so the list it
+# keeps is a prefix of the path's edges (0.6.0's truncation) rather than a list with holes.
 fn sd_edge_add(ectx, ax, ay, bx, by): i64 {
     if (ay == by) { return 0; }
     var count = load64(ectx + 8);
-    var cap = load64(ectx + 16);
-    if (count >= cap) { return 0; }
+    if (count >= load64(ectx + 16)) {
+        if (_sd_fill_trunc != 0) { return 0; }
+        if (_sd_fill_edges_grow(ectx) == 0) {
+            _sd_fill_trunc = 1;
+            return 0;
+        }
+    }
     var e = load64(ectx + 0) + count * 32;
     store64(e + 0, ax);
     store64(e + 8, ay);
@@ -346,11 +499,11 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
 
     # ---- build the closed-edge list (into the process-lifetime scratch) ----
     _sd_scratch_init();
-    var ecap = SD_FLATTEN_CAP;
     var ectx = _sd_fill_ectx;
-    store64(ectx + 0, _sd_fill_edges);
+    store64(ectx + 0, _sd_fill_edges);      # the CURRENT block: a previous fill may have grown it
     store64(ectx + 8, 0);               # per-call reset: the edge count
-    store64(ectx + 16, ecap);
+    store64(ectx + 16, _sd_fill_edges_cap);
+    _sd_fill_trunc = 0;
     var fbuf = _sd_fill_fbuf;
     var fctx = _sd_fill_fctx;           # fields are (re)set before every flatten below
 
@@ -420,17 +573,18 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     # ---- SD_AA_AREA: exact 2-axis coverage (src/coverage.cyr), opt-in per canvas ----
     # ⛔ Only a canvas holding exactly SD_AA_AREA branches here; every other value runs the 0.4.0
     # loop below, untouched — the bytes agnos's refagree oracle is gated on.
-    # ⛔ AND ONLY WHEN THE EDGE LIST CAN BE WHOLE. sd_edge_add drops edges silently once the list
-    # holds ecap, leaving a contour OPEN. The loop below paints nothing right of a row's last
-    # crossing, so an open contour costs it the shape and no more; the area engine's running sum
-    # would stay non-zero to the canvas's right edge — a streak (MEASURED, 80x40, a triangle losing
-    # its closing edge: 28 of 40 rows lit at x = 79, 255 at (60, 20)). A full list cannot tell
-    # "exactly ecap" from "truncated", so an AREA fill that reaches ecap edges runs the loop below
-    # instead (programs/area_test.cyr group N pins both sides of the bound) — ⚠ at that loop's
-    # cost, which near the cap is steep (MEASURED 256x256, 8,000 edges: 10.9 s a fill, against the
-    # area engine's 41 ms).
+    # ⛔ AND ONLY WHEN THE EDGE LIST IS WHOLE. An edge dropped by sd_edge_add leaves a contour
+    # OPEN. The loop below paints nothing right of a row's last crossing, so an open contour costs
+    # it the shape and no more; the area engine's running sum would stay non-zero to the canvas's
+    # right edge — a streak (MEASURED, 80x40, a triangle losing its closing edge: 28 of 40 rows lit
+    # at x = 79, 255 at (60, 20)). Since 0.6.1 the list grows, so an edge is dropped only when a
+    # growth FAILED, which sd_edge_add records: a truncated AREA fill runs the loop below instead
+    # (programs/grow_edges_test.cyr) — ⚠ at that loop's cost, which for a list that large is steep
+    # (MEASURED 256x256, 8,000 edges: 10.9 s a fill, against the area engine's 41 ms). Through
+    # 0.6.0 a list cannot tell "exactly full" from "truncated", and ANY AREA fill of 8,192 edges ran
+    # the loop.
     if (load64(cv + SD_CANVAS_AA_OFFSET) == SD_AA_AREA) {
-        if (n_edges < ecap) {
+        if (_sd_fill_trunc == 0) {
             var nonzero = 0;
             if (rule == SD_FILL_NONZERO) { nonzero = 1; }
             var mask = 0;
@@ -447,6 +601,7 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     var weight = SD_ONE / ssy;         # coverage per full pixel per sub-scanline
     var accrow = _sd_fill_accrow_for(w);   # per-row fractional coverage (16.16); zeroed per row below
     var cross = _sd_fill_cross;            # (x, dir) crossings per sub-scanline; only [0, nc) is read
+    # ^ read AFTER the list is built: a growth above replaced the block, and its capacity >= n_edges
 
     var py = 0;
     while (py < h) {
@@ -537,10 +692,12 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
             if (c > 255) { c = 255; }
             var clipnode = load64(cv + SD_CANVAS_CLIP_OFFSET);
             if (clipnode != 0) {
-                c = (c * load8(load64(clipnode + 0) + py * stride + px)) / 255;
+                # ⛔ PACKED `py * w + px` — the mask is a w*h block, NOT a window into a wider
+                # buffer, so the canvas stride is not its pitch (see the SdCanvas layout note).
+                c = (c * load8(load64(clipnode + 0) + py * w + px)) / 255;
             }
             if (combine != 0) {
-                var oldc = load8(cov + py * stride + px);
+                var oldc = load8(cov + py * stride + px);   # coverage: the STRIDE, not w
                 if (c < oldc) { c = oldc; }
             }
             store8(cov + py * stride + px, c);
@@ -718,8 +875,11 @@ fn sd_canvas_blit_gradient(cv, surface, x0, y0, c0, x1, y1, c1): i64 {
 # composites the already-clipped coverage. Push intersects (multiplies) a new
 # shape into the current clip; pop restores the previous region.
 # SdClip node (16 bytes): +0 mask(ptr, w*h)  +8 prev(SdClip | 0).
+# ⛔ The mask is PACKED w*h — `y * w + x` — on a canvas of any stride. Every writer below and the
+# three readers (sd_fill_impl, _sd_area_fill, _sd_sb_flush) index it that way; see the SdCanvas
+# layout note for why a canvas's stride is the COVERAGE buffer's pitch and never the mask's.
 
-# Intersect `shape` (a w*h mask) with the current clip IN PLACE, then push it.
+# Intersect `shape` (a PACKED w*h mask) with the current clip IN PLACE, then push it.
 fn sd_clip_push_mask(cv, shape): i64 {
     var w = sd_canvas_width(cv);
     var h = sd_canvas_height(cv);
@@ -791,9 +951,9 @@ fn sd_canvas_clip_pop(cv): i64 {
 
 # ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
-# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600.
+# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700.
 # ================================================================
 # @public
 fn sadish_version(): i64 {
-    return 600;
+    return 700;
 }

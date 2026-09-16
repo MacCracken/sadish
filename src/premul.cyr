@@ -1,0 +1,479 @@
+# @public — sadish premultiplied writers: a surface with REAL alpha, for agnos gpu_shader_op#92.
+#
+# premul.cyr — every other writer in sadish treats an SdSurface as an OPAQUE render target: the
+# coverage blits (sd_canvas_blit_at, sd_canvas_blit_paint_at) and the blend (sd_blend_hline) force
+# the alpha byte to 255, and sd_clear cannot even say "transparent" (an alpha byte of 0 means OPAQUE
+# under the legacy rule, see surface.cyr). Correct for a screen; useless for a client whose surface
+# is flagged SETU_SURF_PREMULTIPLIED, which the compositor blends per pixel with #92 op 0x01
+# (`out = src + dst * (1 - src_a)`, setu proto.cyr / aethersafha gpu.cyr). Until this module no
+# sadish writer could produce such a surface with a non-255 alpha — no rounded corners, soft
+# shadows or translucent panels over a transparent window. These are the writers that can:
+#
+#   sd_clear_premul(s, color, a)                      # every pixel := color at alpha a (0 = 0,0,0,0)
+#   sd_fill_rect_premul(s, x, y, w, h, color, a)      # premultiplied src-over of a rect, clipped
+#   sd_canvas_blit_premul_at(cv, s, color, a, dx, dy) # coverage x colour, src-over, clipped
+#   sd_canvas_blit_premul(cv, s, color, a)            # ... with the canvas at the surface origin
+#   sd_canvas_blit_paint_premul_at(cv, s, g, dx, dy)  # coverage x GRADIENT paint (0.7.0, see below)
+#   sd_canvas_blit_paint_premul(cv, s, g)             # ... with the canvas at the surface origin
+#   sd_surface_rgba_at(s, x, y)                       # raw 0xAARRGGBB readback, no alpha mapping
+#
+# THE CONTRACT.
+#   · The DESTINATION is premultiplied BGRA (every channel <= its pixel's alpha) and is read as it
+#     is: nothing here unpremultiplies, and nothing maps an alpha byte. A fresh sd_surface_new is
+#     all-zero = transparent, and a surface the legacy writers only ever painted with OPAQUE colours
+#     (sd_clear, the blits, sd_fill_rect_blend) has alpha 255 everywhere — both valid. ⚠ Not valid:
+#     raw 0x00RRGGBB stores (byte 3 = 0), and sd_hline / sd_plot with an sd_rgba colour, which store
+#     STRAIGHT alpha. Compositing onto such a pixel cannot repair it.
+#   · Every output pixel is VALID premultiplied (out_c <= out_a) for every valid destination,
+#     proved below and swept in programs/premul_test.cyr. Every stored value is in [0, 255] even
+#     over an invalid destination, so no store8 ever truncates.
+#   · Rows are addressed by sd_surface_stride(s); only the w*4 visible bytes of a row are touched.
+#   · Clear, fill and both blits allocate NOTHING, first call included (asserted: 0 B on the heap,
+#     0 B on an arena hook) — there is no scratch; the gradient blit does not even allocate on the
+#     first call that rebuilds the ramp (it is rebuilt in place). Single-threaded, like the rest of
+#     sadish.
+#
+# ⛔⛔ ALPHA IS AN EXPLICIT ARGUMENT `a` (0..255, clamped) AND 0 MEANS TRANSPARENT — EVERYWHERE IN
+# THIS MODULE, the blit included. The colour's own alpha byte is NEVER read: `color` supplies R, G, B.
+# Why not the legacy sd_alpha_of rule (byte 0 = opaque) that sd_canvas_blit_at / paint use:
+#   · #92 reads byte 3 LITERALLY — 0 is transparent to the kernel. A premultiplied writer that
+#     read 0 as OPAQUE would put sadish and the compositor on opposite sides of the one value the
+#     stack has already been burned by: a byte-3 misreading is what made kashi's glyph text and a
+#     coverage-blend colour render as an ADDITIVE OVER-BRIGHT GHOST under #92 (dhancha canvas.cyr /
+#     surface.cyr, aethersafha window.cyr W_PREMUL) — a wrong picture with no error anywhere.
+#   · Under the legacy rule a COMPUTED alpha that reaches 0 (a fade-out's last frame) paints SOLID —
+#     the sd_rgba(0, 0, 0, 128)-painted-black trap sd_fill_rect_blend was built to close in 0.5.3.
+#   · The stack's colours arrive without alpha anyway: dhancha's theme tokens are 0x00RRGGBB with
+#     their alpha in a separate token (dh_theme_scrim / dh_theme_scrim_a), which is this signature.
+# ⚠ The price, pinned by the suite in both directions: sd_rgba(r, g, b, 128) passed with a = 255
+# paints OPAQUE (byte ignored), and sd_rgb(r, g, b) passed with a = 0 paints NOTHING.
+# ⛔ PORTING. sd_canvas_blit_at reads only R, G, B — coverage is its whole source alpha, whatever byte
+# 3 holds — so its port is sd_canvas_blit_premul_at(cv, s, c, 255, dx, dy): a = 255, NOT sd_alpha_of(c).
+# sd_alpha_of would halve an sd_rgba(.., 128) colour that blit_at paints solid (0xFF80007F against
+# blit_at's 0xFFFF0000 for red over opaque blue, pinned), and map a computed alpha that reached 0 back
+# to 255 — the paints-solid trap above. A caller that means to START honouring a colour's alpha passes
+# it raw: sd_color_a(c), where 0 is transparent.
+#
+# ================================================================
+# THE GRADIENT PAINT — sd_canvas_blit_paint_premul_at(cv, s, g, dx, dy) (0.7.0).
+# The combination a translucent UI actually needs: a gradient panel with anti-aliased rounded corners
+# on a TRANSPARENT window. src/paint.cyr's SdGradient (linear / radial / focal radial, multi-stop,
+# pad / repeat / reflect, gradient transforms) composited through a canvas's coverage — sampled,
+# stepped and evaluated EXACTLY as sd_canvas_blit_paint_at does, and composited with the arithmetic
+# below instead of paint's straight src-over-with-alpha-forced-255.
+#
+# ⭐ ONE EVALUATION, TWO COMPOSITORS. The two blits are the SAME function: paint.cyr's
+# _sd_paint_blit_run / _sd_paint_blit_point take a `pm` flag that chooses the store, and nothing
+# above the store differs — same DDA, same root, same spread, same 1025-entry ramp, same marked-cell
+# stop search. So no pixel can take a different t or a different colour here than it takes there:
+# for an OPAQUE gradient at full coverage the two blits write byte-identical RGB, asserted pixel by
+# pixel over a non-trivial canvas in programs/paint_premul_test.cyr (group B).
+#
+# ⛔ NO `a` ARGUMENT, AND 0 STILL CANNOT MEAN OPAQUE. Every other writer here takes an explicit
+# alpha because a sadish colour's byte 3 is ambiguous (the legacy 0-means-opaque rule). A gradient
+# is not ambiguous: sd_gradient_add_stop resolves each stop through sd_alpha_of when the ramp is
+# built, so a ramp entry's byte 3 is the ACTUAL interpolated alpha, 1..255, and this blit uses it as
+# the source alpha directly. The byte-3 misreading that burned kashi cannot reach this path.
+# ⚠ The price of the legacy rule, paid in paint.cyr and inherited here: a gradient CANNOT express a
+# fully transparent stop — sd_rgba(r, g, b, 0) is an OPAQUE stop. The faintest expressible stop is
+# alpha 1, which over transparent leaves out_a = 1 at full coverage and 0 below cov 128. A caller
+# that wants a true fade to nothing ends the ramp at alpha 1 (or stops painting).
+# ⇒ There is no alpha-0 no-op to skip: every covered pixel has k >= 1. The no-ops are the ones paint
+# already has — coverage 0 (untouched), zero stops and a blocked matrix (nothing painted, SADISH_OK).
+#
+# ⭐ PREMULTIPLY AFTER INTERPOLATION, PER PIXEL — not into the ramp. The ramp interpolates STRAIGHT
+# (non-premultiplied) colours, SVG's rule and paint.cyr's documented contract; this blit premultiplies
+# the RESULT at each pixel, P_c = floor(c * a / 255), which is exactly sd_premul of that colour. Why
+# not store premultiplied entries once and interpolate those:
+#   · The premultiply is TRUNCATING (it has to be: P is then exactly sd_premul, the stack's
+#     sanctioned producer — see the ⚠ REPEATED COMPOSITING note below). Truncating at the STOPS
+#     throws the colour away at the faint end — P = 0 for every c < 255 at a = 1 — and every
+#     interpolated value between the stops then carries that loss, pulling the whole transition
+#     toward the opaque stop's colour and, where that stop is dark, toward BLACK.
+#     MEASURED, stops opaque BLACK -> WHITE at alpha 1, the pixel at t = 0.5 over an opaque white
+#     destination: straight-then-premultiply gives 191 per lane (colour 128 at alpha 128, P = 64),
+#     premultiplied-interpolation 128 (P = 1) — 63 levels darker, on a ramp whose ends are identical
+#     either way. ⚠ P = 1, not the 0 the truncation alone suggests: the premultiplied ends would be
+#     (0,0,0,255) and (1,1,1,1) and _sd_gradient_lerp ROUNDS, so their midpoint comes back up to 1.
+#     Pinned in both directions in programs/paint_premul_test.cyr (group K, checks 71-75).
+#   · The ramp is SHARED with sd_canvas_blit_paint_at and with sd_gradient_color_at. A premultiplied
+#     one would be a second 4,100 B table and a second answer to "the colour at t".
+# ⇒ A ONE-STOP gradient of colour c at alpha a paints EXACTLY sd_canvas_blit_premul_at(cv, s, c, a)'s
+# bytes — the premultiplied twin of paint.cyr's "an opaque one-stop gradient paints sd_canvas_blit_at's
+# bytes", and asserted the same way.
+#
+# ================================================================
+# THE ARITHMETIC — chosen to equal agnos's own references, so a CPU-composited frame and the GPU
+# path agree. Channels c in {B, G, R}; cov = coverage 0..255 (255 for clear/fill); d = destination.
+# ⭐ ONE implementation, _sd_premul_cov_run, which both blits call; the gradient blit passes the
+# PIXEL'S OWN interpolated colour and its own straight alpha as (c, a), and nothing else changes.
+# ⚠ a is the pixel's alpha and cov its coverage, kept apart to the last division: the effective
+# source alpha a * cov / 255 is never rounded to a byte on the way (the straight paint blit's
+# `sa = coverage * paint_alpha / 255` does round it, and that 8-bit truncation is one of the two
+# reasons the two blits differ below full coverage — the other is straight's truncating store).
+#
+#   P_c  = floor(c * a / 255)       the premultiplied colour — EXACTLY sd_premul(sd_rgba(r, g, b, a))
+#                                   for a in 1..255 (the sanctioned producer; computed by it), 0 at a = 0
+#   k    = a * cov                  effective source alpha x 255, 0..65025
+#   out_c = R( P_c * cov * 255 + d_c * (65025 - k) )       R(n) = floor((2n + 65025) / 130050)
+#   out_a = R(   a * cov * 255 + d_a * (65025 - k) )       = n / 65025 rounded to nearest
+#
+# ⭐ That is agnos kernel/core/gpu.cyr cov_ref_px — the EXACT rational reference for #92 op 0x02
+# GPU_OP_BLEND_COV (8bpp coverage x one uniform premultiplied colour, src-over onto a strided
+# surface: this blit's GPU twin) — term for term, with the premultiplied colour sd_premul makes.
+# At cov = 255 it collapses (2 * 255 * n + 65025 = 255 * (2n + 255)) to
+#   out_c = P_c + floor((2 * d_c * (255 - a) + 255) / 510)
+# which is gpu.cyr blend_ref_px, the reference for op 0x01 BLEND_RECT — the op the compositor
+# composites this surface WITH. sd_fill_rect_premul computes that form; the suite holds the fill
+# and the blit at full coverage to the same cov_ref_px on all 32,896 valid (d_c, d_a) pairs.
+#
+# ⭐ NO TIES. R hits x.5 only if 2n = 65025 * (2j + 1): even = odd. So round-half-up, round-half-even
+# and round-to-nearest are the same function on every input, and the GPU's tie rule never matters.
+#
+# ⛔ VALIDITY, DERIVED. R is non-decreasing in n. For a valid destination (d_c <= d_a):
+#   P_c = floor(c * a / 255) <= a                       (c <= 255)
+#   65025 - k >= 0                                      (a, cov <= 255)
+#   ⇒ P_c * cov * 255 + d_c * (65025 - k) <= a * cov * 255 + d_a * (65025 - k)   ⇒  out_c <= out_a
+#   out_a <= R(k * 255 + 255 * (65025 - k)) = R(255 * 65025) = floor(255.5) = 255
+# The same bound holds for out_c with ANY d_c <= 255 (valid or not), so every store is a byte.
+# Equality is reached (c = 255, d_c = d_a): the invariant is tight, not merely held.
+# Exact endpoints: cov = 0 or a = 0 gives R(d * 65025) = d (the pixel is untouched, and is skipped);
+# k = 65025 gives P exactly — (b, g, r, 255) at a = 255, the four bytes sd_canvas_blit_at writes.
+# Widest intermediate: 2 * (255 * 65025 + 255 * 65025) + 65025 = 66,390,525 < 2^26.
+#
+# MEASURED against the kernel (a numpy f32 emulation of kernel/shaders/blend_premul.s and
+# blend_cov.s — every v_fma_f32 / v_mul_f32 rounded once to f32, v_cvt_pk_u8_f32 to nearest, both
+# tie rules, the literal constants 0xBB808081 / 0x3B808081, exact in 64-bit long double):
+#   · op 0x01, the dst term above over ALL 8,421,376 (A, S <= A, d) triples: 0 mismatches.
+#   · op 0x02 against this blit, ALL 4,294,967,296 (a, cov, c, d) colour-lane inputs and all
+#     16,777,216 (a, cov, d) alpha-lane inputs: worst |difference| 1, on 5,952 + 33 inputs (pack
+#     ties to even) or 3,380 + 28 (half up) — the f32 shader against its own exact reference, which
+#     is this arithmetic; the kernel's coverage self-test allows and reports exactly that ±1. At
+#     cov = 0 and cov = 255 the two agree on every input, as that self-test requires.
+#
+# ⚠ REPEATED COMPOSITING DRIFTS. One layer is close: over every (c, a, d) the fill is within 1 of
+# round(analytic) (MEASURED; worst |out - analytic| 1.49, at c 254, a 1, d 128). Stacking the SAME
+# translucent source N times over transparent (MEASURED from the fill form; the single numbers below
+# are also asserted through the functions in programs/premul_test.cyr, group L):
+#   · ALPHA STALLS below 255 for every a in 1..127, at the smallest d > 255 - 127.5/a, where the dst
+#     term d*(255-a)/255 rounds back up to d - a: a = 1 stops at 128 (after 128 layers, having run
+#     AHEAD of the analytic 100.8), a = 10 at 243, a = 64 and a = 127 at 254; a >= 128 reaches 255 (8
+#     layers at 128). Alpha never decreases. This is 8-bit src-over rounding, bit-identical to #92
+#     op 0x01 (the same stack composited on the GPU stalls at the same value), so it is kept.
+#   · COLOUR runs mostly LOW, compounding the truncating premultiply: 20 fills of (200, 200, 200) at
+#     a = 10 give 0x8D626262 (colour 98, analytic 110.14; alpha 141, analytic 140.43) and 1000 give
+#     0xF3A6A6A6 (straight 174 for 200); (128, 128, 128) at a = 1 stalls at 0x80000000, a 50 % BLACK,
+#     because P = 0 for every c < 255 at a = 1; 1000 coverage-128 blits of (200, 100, 50) at a = 20
+#     settle at 0xF3B34D1A (straight 188, 81, 27). Worst premultiplied-colour error over c in 0..255,
+#     a in 8..64, at N = 4 / 8 / 16: -4.44 / -7.79 / -13.95 (up to +1.04 / +1.76 / +3.22). A ROUNDED
+#     premultiply, (2*c*a + 255) / 510, would make it two-sided and about 30 % smaller: -2.67..+2.76 /
+#     -4.19..+5.26 / -7.56..+9.61 — not removed. Truncation stays because P is then exactly sd_premul,
+#     the stack's sanctioned producer, so a pixel sd_premul made and one this module made agree. A
+#     client building up an effect from many faint layers should composite once at the summed alpha.
+#
+# ⚠ AGAINST sd_canvas_blit_at, opaque colour (a = 255) over an OPAQUE destination: the alpha byte is
+# 255 from both, and the colour bytes are round-to-nearest here where the straight blit truncates:
+#   out_premul = floor((2m + 255) / 510)   vs   out_straight = floor(m / 255),   m = c*cov + d*(255 - cov)
+# ⇒ premul - straight is 0 or +1, and +1 exactly when m mod 255 >= 128. MEASURED over all 16,777,216
+# (cov, c, d) channel triples: 8,164,890 differ, all by +1; identical for every (c, d) at cov = 0 and
+# cov = 255, and for every cov when c == d. programs/premul_test.cyr asserts all of it through both
+# functions. (The gap is the straight blit's truncation, not an error here: truncation is what makes
+# its 50 % white-over-black read 127.)
+#
+# MEASURED cost (256x256, best of 5 x 40 passes, this host, ONE idle run; build/ probes —
+# perf_solid.cyr and perf_paint.cyr, gitignored like the rest of build/ — not a gate), ns/px.
+# ⚠ ns/px figures compare within one run on one host, never across them; these replace the earlier
+# table's, which were a different run:
+#   full coverage   sd_canvas_blit_at 6.5 | blit_premul a=255 2.6 (one store32) | a=128 10.4
+#   mixed coverage  sd_canvas_blit_at 11.9 | blit_premul a=255 10.4 | a=128 10.4
+#   rect at a=128   sd_fill_rect_blend 8.5 | sd_fill_rect_premul 8.9
+#   clear           sd_clear 8.3 | sd_clear_premul 1.5
+#   gradient, full  linear 23.1 straight / 35.1 premul | radial 50.9 / 61.6 | focal 63.7 / 75.6 |
+#                   transformed linear 23.2 / 35.6 | transformed radial 56.0 / 66.3
+# ⭐ The coverage blit got FASTER when the formula moved into _sd_premul_cov_run — a build of wave 1's
+# inlined loop in the same run: a=255 3.4 -> 2.6, a=128 12.1 -> 10.4, mixed 12.1 -> 10.4. (Why was not
+# chased; fewer values live across the row is the guess.) Sharing the arithmetic with the paint blit
+# cost this loop nothing — but only because the call is per ROW; see the ⛔ on _sd_premul_cov_run.
+# ⚠ The gradient rows use a 4-stop ramp with TRANSLUCENT stops, so the STRAIGHT blit is on its blend
+# path — paint.cyr's own 14 ns/px linear figure is an opaque ramp, which stores without blending. The
+# ~12 ns/px the premultiplied compositor adds is the per-pixel premultiply (three divisions) plus the
+# alpha lane the straight blit never computes.
+# ================================================================
+
+# P for (color, a) as 0xAARRGGBB: sd_premul's bytes at an explicit a, a clamped to [0, 255], 0 at a <= 0.
+fn _sd_premul_color(color, a): i64 {
+    if (a <= 0) { return 0; }
+    var av = a;
+    if (av > 255) { av = 255; }
+    return sd_premul(sd_rgba(sd_color_r(color), sd_color_g(color), sd_color_b(color), av));
+}
+
+# @public — read pixel (x, y) as 0xAARRGGBB: ALL FOUR BYTES, raw — no legacy alpha mapping (an
+# alpha byte of 0 reads 0) and no unpremultiply. Rows by the stride. Out-of-bounds reads return 0,
+# which is also transparent black: tell the two apart by the bounds, never by the value.
+# (sd_surface_pixel_at, by contrast, drops byte 3.)
+fn sd_surface_rgba_at(s, x, y): i64 {
+    if (s == 0) { return 0; }
+    if (x < 0) { return 0; }
+    if (y < 0) { return 0; }
+    if (x >= load64(s + SD_SURFACE_WIDTH_OFFSET)) { return 0; }
+    if (y >= load64(s + SD_SURFACE_HEIGHT_OFFSET)) { return 0; }
+    var px = load64(s + SD_SURFACE_PIXELS_OFFSET);
+    return load32(px + y * load64(s + SD_SURFACE_STRIDE_OFFSET) + x * 4);
+}
+
+# @public — set EVERY pixel of `s` to `color` premultiplied at alpha `a`: bytes
+# (floor(b*a/255), floor(g*a/255), floor(r*a/255), a) — exactly sd_premul(sd_rgba(r, g, b, a)).
+# `a` <= 0 is FULLY TRANSPARENT (0, 0, 0, 0) whatever the colour; `a` >= 255 is opaque (b, g, r, 255).
+# The colour's alpha byte is ignored. Overwrites, does not composite. Rows by the stride; padding
+# between rows is untouched. Returns SADISH_OK, or SADISH_ERR_BOUNDS for s == 0.
+fn sd_clear_premul(s, color, a): i64 {
+    if (s == 0) { return SADISH_ERR_BOUNDS; }
+    var w = load64(s + SD_SURFACE_WIDTH_OFFSET);
+    var h = load64(s + SD_SURFACE_HEIGHT_OFFSET);
+    var px = load64(s + SD_SURFACE_PIXELS_OFFSET);
+    var stride = load64(s + SD_SURFACE_STRIDE_OFFSET);
+    var p = _sd_premul_color(color, a);
+    var y = 0;
+    while (y < h) {
+        var row = px + y * stride;
+        var x = 0;
+        while (x < w) {
+            store32(row + x * 4, p);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return SADISH_OK;
+}
+
+# @public — composite a w*h rect of `color` at alpha `a` OVER a premultiplied surface, top-left
+# (x, y), clipped to the surface on every side:
+#   out_c = P_c + floor((2 * d_c * (255 - a) + 255) / 510)   (channels and alpha, P_alpha = a)
+# — gpu.cyr blend_ref_px, i.e. #92 op 0x01 with this uniform source (see the header). `a` <= 0
+# paints NOTHING; `a` >= 255 stores (b, g, r, 255). w <= 0 or h <= 0 paints nothing (⚠ unlike
+# sd_fill_rect, whose span swap paints 2 px for w == 0). The colour's alpha byte is ignored.
+# Returns SADISH_OK, or SADISH_ERR_BOUNDS for s == 0.
+fn sd_fill_rect_premul(s, x, y, w, h, color, a): i64 {
+    if (s == 0) { return SADISH_ERR_BOUNDS; }
+    if (a <= 0) { return SADISH_OK; }
+    var sw = load64(s + SD_SURFACE_WIDTH_OFFSET);
+    var sh = load64(s + SD_SURFACE_HEIGHT_OFFSET);
+    var px = load64(s + SD_SURFACE_PIXELS_OFFSET);
+    var stride = load64(s + SD_SURFACE_STRIDE_OFFSET);
+    var x0 = x;
+    if (x0 < 0) { x0 = 0; }
+    var y0 = y;
+    if (y0 < 0) { y0 = 0; }
+    var x1 = x + w;
+    if (x1 > sw) { x1 = sw; }
+    var y1 = y + h;
+    if (y1 > sh) { y1 = sh; }
+    if (x1 <= x0) { return SADISH_OK; }
+    if (y1 <= y0) { return SADISH_OK; }
+    var p = _sd_premul_color(color, a);
+    var av = (p >> 24) & 255;
+    var pb = p & 255;
+    var pg = (p >> 8) & 255;
+    var pr = (p >> 16) & 255;
+    var ia2 = (255 - av) * 2;
+    var yy = y0;
+    while (yy < y1) {
+        var row = px + yy * stride;
+        var xx = x0;
+        while (xx < x1) {
+            var o = row + xx * 4;
+            if (av == 255) {
+                store32(o, p);
+            } else {
+                store8(o, pb + (load8(o) * ia2 + 255) / 510);
+                store8(o + 1, pg + (load8(o + 1) * ia2 + 255) / 510);
+                store8(o + 2, pr + (load8(o + 2) * ia2 + 255) / 510);
+                store8(o + 3, av + (load8(o + 3) * ia2 + 255) / 510);
+            }
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+    return SADISH_OK;
+}
+
+# ⭐ THE header's cov_ref_px, and the ONE implementation of it in sadish: a RUN of `n` pixels from
+# surface offset `o`, their coverage bytes at `cp`, painted with the premultiplied source colour `p`
+# (0xAARRGGBB, _sd_premul_color's bytes) whose alpha is `av` and whose channels times 255 are `pb`,
+# `pg`, `pr`. Both premultiplied writers that take coverage run through here — sd_canvas_blit_premul_at
+# a row at a time, sd_canvas_blit_paint_premul_at a pixel at a time (its colour changes at every one)
+# — so the formula, its rounding and its two endpoints exist once. Every store is a byte and
+# out_c <= out_a for a valid destination: proved in the header, swept through BOTH callers in
+# programs/premul_test.cyr (F, M) and programs/paint_premul_test.cyr (C, F).
+# ⛔ A RUN, NOT A PIXEL, and that is not a style choice: CYRIUS DOES NOT INLINE. A first cut of this
+# split called a per-PIXEL helper from the solid blit and MEASURED 16.0 to 17.5 ns/px where the
+# inlined loop reads 11.5 to 12.1 (256x256, mixed coverage, the cost table's probe; the spread inside
+# each is run-to-run drift, the gap between them is not) — a third to a half more work for a helper
+# that loop calls 65,536 times a frame. Per ROW the call vanishes into the row setup: the same probe
+# reads 10.4, FASTER than the inlined loop it replaced. The paint blit, at 35 to 105 ns/px, pays it
+# per pixel at n = 1 and does not notice.
+# ⚠ The endpoints are IN here because they are exits, not cases: cov == 0 is skipped (R(d * 65025) = d
+# leaves the pixel exactly as it was) and av * cov == 65025 stores the four bytes of `p` outright,
+# which is what the formula collapses to there (130050 P + 65025 over 130050). Neither is a second
+# rule, and the suites hold both to this term.
+fn _sd_premul_cov_run(o, cp, n, p, pb, pg, pr, av): i64 {
+    var i = 0;
+    while (i < n) {
+        var cov = load8(cp + i);
+        if (cov != 0) {
+            var q = o + i * 4;
+            var k = av * cov;
+            if (k == 65025) {
+                store32(q, p);
+            } else {
+                var ik = 65025 - k;
+                store8(q, ((pb * cov + load8(q) * ik) * 2 + 65025) / 130050);
+                store8(q + 1, ((pg * cov + load8(q + 1) * ik) * 2 + 65025) / 130050);
+                store8(q + 2, ((pr * cov + load8(q + 2) * ik) * 2 + 65025) / 130050);
+                store8(q + 3, ((av * 255 * cov + load8(q + 3) * ik) * 2 + 65025) / 130050);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ================================================================
+# sd_canvas_blit_premul_at — composite the canvas coverage onto a PREMULTIPLIED surface with the
+# canvas's (0,0) at surface pixel (dx, dy): source = `color` premultiplied at alpha `a`, scaled by
+# each pixel's coverage, src-over (the formula and its proof are in the header). (dx, dy) may be
+# negative or beyond the surface — clipped on every side exactly as sd_canvas_blit_at clips. Rows by
+# sd_surface_stride. A pixel with coverage 0 is not touched; `a` <= 0 paints nothing.
+# ⭐ The alpha byte is COMPOSITED, not forced: over a transparent surface an opaque colour leaves
+# alpha == coverage, which is what makes an anti-aliased edge an anti-aliased edge under #92.
+# Returns SADISH_OK, or SADISH_ERR_BOUNDS for a null cv / surface.
+# ================================================================
+# @public
+fn sd_canvas_blit_premul_at(cv, surface, color, a, dx, dy): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (surface == 0) { return SADISH_ERR_BOUNDS; }
+    if (a <= 0) { return SADISH_OK; }
+    var cw = sd_canvas_width(cv);
+    var ch = sd_canvas_height(cv);
+    var covbuf = sd_canvas_coverage(cv);
+    var covstride = sd_canvas_stride(cv);
+    var sw = sd_surface_width(surface);
+    var sh = sd_surface_height(surface);
+    var spx = sd_surface_pixels(surface);
+    var pitch = sd_surface_stride(surface);
+
+    var p = _sd_premul_color(color, a);
+    var av = (p >> 24) & 255;
+    # P * 255 per channel: the source term is these times the coverage (see _sd_premul_cov_run).
+    var pb = (p & 255) * 255;
+    var pg = ((p >> 8) & 255) * 255;
+    var pr = ((p >> 16) & 255) * 255;
+
+    # Clip the canvas rect [dx, dx+cw) x [dy, dy+ch) to the surface (canvas coordinates).
+    var x0 = 0;
+    if (dx < 0) { x0 = 0 - dx; }
+    var y0 = 0;
+    if (dy < 0) { y0 = 0 - dy; }
+    var x1 = cw;
+    if (dx + x1 > sw) { x1 = sw - dx; }
+    var y1 = ch;
+    if (dy + y1 > sh) { y1 = sh - dy; }
+
+    # ⛔ BOTH POINTERS ARE ADVANCED TO x0 AND THE RUN STARTS AT INDEX 0 — a run takes a start and a
+    # length, not a range, so the clip lives in `+ x0` on each and in `x1 - x0`. The coverage one is
+    # the trap: getting it wrong shifts the whole row by a constant, which UNIFORM coverage cannot
+    # show and a wrapped-against-packed comparison cannot either (both surfaces shift alike).
+    # MEASURED: with that `+ x0` deleted the whole 23-suite sweep stayed green until
+    # programs/premul_test.cyr group N (#135, #139, #141, #142, #145-147) was written to read a
+    # varying coverage back through an independent per-pixel reference. Move any of these three and
+    # group N is what tells you.
+    var y = y0;
+    while (y < y1) {
+        var crow = covbuf + y * covstride + x0;
+        var srow = spx + (y + dy) * pitch + (dx + x0) * 4;
+        _sd_premul_cov_run(srow, crow, x1 - x0, p, pb, pg, pr, av);
+        y = y + 1;
+    }
+    return SADISH_OK;
+}
+
+# @public — sd_canvas_blit_premul_at with the canvas at the surface origin.
+fn sd_canvas_blit_premul(cv, surface, color, a): i64 {
+    return sd_canvas_blit_premul_at(cv, surface, color, a, 0, 0);
+}
+
+# One pixel of the gradient blit, and the ONLY place a paint colour is premultiplied: the paint's
+# colour `e` at that pixel (0xAARRGGBB with the ACTUAL alpha — a ramp entry, or _sd_gradient_eval's
+# value in a cell holding a stop), its coverage byte at `cp`, src-over the premultiplied pixel at `o`
+# — a one-pixel run of the formula above. P = _sd_premul_color(e, e's own alpha) = sd_premul(e) for an
+# alpha of 1..255, which is every value a ramp entry can hold (the header's ⛔ NO `a` ARGUMENT note).
+# ⚠ An alpha byte of 0 — which no ramp entry has — would premultiply to 0 and give k = 0, i.e.
+# R(d * 65025) = d: the pixel would be left exactly as it was, never painted opaque. The one place
+# byte 3 is read as itself rather than through sd_alpha_of, and it degrades to a no-op, not to the
+# additive over-bright ghost a legacy reading would make.
+# ⚠ THE PREMULTIPLY IS WRITTEN OUT rather than routed through _sd_premul_color, and the three lines
+# below are that function expanded for an alpha already in [0, 255] — floor(c * a / 255) per channel,
+# 0 at a = 0, the same bytes sd_premul gives, which is the whole point of the producer. It is expanded
+# because CYRIUS DOES NOT INLINE and _sd_premul_color reaches sd_premul -> sd_alpha_of / sd_color_r /
+# _g / _b / sd_rgba: TEN calls per painted pixel, MEASURED 67.8 ns/px against 35.1 for the linear
+# gradient blit (256x256, full coverage) — the call chain was more than half the blit. ⛔ If the
+# module's premultiply ever stops being floor(c * a / 255), these three lines and sd_premul must move
+# together; programs/paint_premul_test.cyr computes the expected P from the stops independently and
+# would fail, and programs/premul_test.cyr group M holds this path and sd_canvas_blit_premul_at (which
+# does call _sd_premul_color) to identical bytes over all 32,896 valid destinations.
+fn _sd_premul_paint_px(o, cp, e): i64 {
+    var av = (e >> 24) & 255;
+    var pb = ((e & 255) * av) / 255;
+    var pg = (((e >> 8) & 255) * av) / 255;
+    var pr = (((e >> 16) & 255) * av) / 255;
+    var p = (av << 24) | (pr << 16) | (pg << 8) | pb;
+    return _sd_premul_cov_run(o, cp, 1, p, pb * 255, pg * 255, pr * 255, av);
+}
+
+# ================================================================
+# sd_canvas_blit_paint_premul_at — composite the canvas coverage onto a PREMULTIPLIED surface with
+# the canvas's (0,0) at surface pixel (dx, dy), the source colour of each pixel coming from the
+# gradient `g` sampled at that pixel's centre in CANVAS space: a gradient panel with anti-aliased
+# edges over a transparent window, which sd_canvas_blit_paint_at (straight src-over, dst alpha forced
+# to 255) cannot produce and sd_canvas_blit_premul_at (one uniform colour) cannot either.
+#
+# The paint is src/paint.cyr's — geometry, spread, stops, ramp and the exact per-pixel t are ITS
+# contract, read there; every kind is supported (linear, radial, focal radial, any spread, a gradient
+# transform), because this is the same loop under a flag. What THIS function fixes is the store:
+#   · source alpha = the pixel's INTERPOLATED STRAIGHT stop alpha (1..255), premultiplied per pixel,
+#     weighted by the pixel's coverage — the header's cov_ref_px with (a, cov) kept apart;
+#   · the destination alpha is COMPOSITED, not forced: over a transparent surface an opaque gradient
+#     leaves alpha == coverage, which is what makes the rounded corner a rounded corner under #92;
+#   · every output pixel is valid premultiplied (out_c <= out_a) for every valid destination.
+# (dx, dy) may be negative or beyond the surface — clipped on every side exactly as the straight
+# paint blit clips. Rows by sd_surface_stride. A pixel with coverage 0 is not touched. 0 B per call.
+# Returns SADISH_OK (also for a gradient with no stops, or one whose matrix is blocked — both paint
+# nothing, as in paint.cyr), or SADISH_ERR_BOUNDS for a null cv / surface / g.
+# ⚠ Against sd_canvas_blit_paint_at on the same canvas and an opaque destination the RGB bytes can
+# differ for two reasons, BOTH the straight blit's: it rounds the effective source alpha DOWN to a
+# byte (sa = cov * paint_alpha / 255) and then truncates its store where this one rounds to nearest.
+# ⛔ "IDENTICAL AT FULL COVERAGE" IS THE OPAQUE GRADIENT'S PROMISE ONLY — the alpha truncation is
+# what makes it, and a translucent stop breaks it:
+#   · every stop alpha 255: sa is cov exactly, so at cov = 255 the two blits write byte-identical
+#     RGB (asserted pixel by pixel on 12 specs, paint_premul_test group B) and below it
+#     premul - straight is 0 or +1 — the ⚠ AGAINST sd_canvas_blit_at note above, unchanged.
+#   · a TRANSLUCENT stop: the signed difference premul - straight lies in -2..+2 and REACHES BOTH
+#     ENDS. MEASURED over ALL 4,261,478,400 lane inputs (c 0..255, stop alpha 1..255, cov 1..255,
+#     d 0..255): 1,403,649,306 differ at all and 3,955,618 by two — +2 at (c 255, alpha 2, cov 193,
+#     d 1), straight 1 against 3 here; -2 at (c 55, alpha 4, cov 253, d 225), straight 223 against
+#     221. At cov = 255 it narrows to -1..+1 — NOT to 0: (c 0, alpha 1, d 1) is straight 0, here 1.
+#     (The exhaustive scan is a build/ probe, gitignored like the perf ones and not a gate; its
+#     counts are reproduced through the SHIPPED blits on a 1,560,600-input slice by group L.)
+#   Both witnesses and the bound are pinned through both blits in paint_premul_test group L.
+# The alpha byte is the real difference: 255 there, composited here.
+# ================================================================
+# @public
+fn sd_canvas_blit_paint_premul_at(cv, surface, g, dx, dy): i64 {
+    return _sd_paint_blit_run(cv, surface, g, dx, dy, 1);
+}
+
+# @public — sd_canvas_blit_paint_premul_at with the canvas at the surface origin.
+fn sd_canvas_blit_paint_premul(cv, surface, g): i64 {
+    return _sd_paint_blit_run(cv, surface, g, 0, 0, 1);
+}

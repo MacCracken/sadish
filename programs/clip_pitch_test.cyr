@@ -1,0 +1,626 @@
+# programs/clip_pitch_test.cyr — RUN test: a clip MASK is PACKED w*h, on a canvas of ANY stride.
+#
+# ⭐⭐ WHAT THIS EXISTS TO PROVE. An SdCanvas carries TWO pitches and only one of them is the
+# stride. The COVERAGE buffer (SD_CANVAS_COVERAGE_OFFSET) is addressed `y * stride + x` — it may one
+# day be a window into a wider buffer, the coverage-side twin of dhancha's dh_surface_wrap. The CLIP
+# MASK hanging off SD_CANVAS_CLIP_OFFSET is a sadish-owned `w * h` block that is never wrapped, and
+# is addressed `y * w + x`. Through 0.6.0 the three consumers of the mask — sd_fill_impl's
+# SUBSCANLINE loop, _sd_area_fill and the styled flush _sd_sb_flush — read it `py * stride + px`,
+# the COVERAGE pitch, while all three producers wrote it packed. Filed as
+# docs/development/issues/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md; the
+# 0.6.0 stroke verifier's mutation "clip mask read by w" survived as EQUIVALENT because no canvas
+# could tell the two apart. This suite is the canvas that can.
+#
+# ⚠⚠ WHAT THIS SIMULATES, AND WHY THAT IS LEGITIMATE. sd_canvas_new CANNOT build the canvas below:
+# it stores `stride = w` and there is no canvas-wrap constructor yet. So every group hand-builds the
+# 48-byte SdCanvas header over a buffer of its own — exactly what programs/stride_test.cyr does for
+# SdSurface, what integration_test group D does for a wrapped surface, and what stroke_style_test
+# group T already does for a 13-pitch canvas. The header's fields are public vars and the shape is
+# the one a wrap API must produce, so a canvas built this way is a legitimate future caller, not an
+# invalid one — it is the ONLY input that can distinguish the two pitches, which is precisely why
+# the bug was invisible for three releases. ⛔ THIS SUITE MUST FAIL if any of the three readers goes
+# back to the stride. Groups B, C and D pin that with tell-tale pixels worked out by hand below.
+#
+# ⛔ AND IT MUST FAIL THE OTHER WAY TOO — the suite cannot be satisfied by making EVERYTHING packed.
+# Groups A, H, I and J pin the COVERAGE side at the stride, one loop at a time, because each is its
+# own expression and a comparison that never runs it proves nothing about it:
+#   A  sd_fill_impl's STORE, and sd_canvas_coverage_at's load.
+#   H  the `combine != 0` READ-BACK beside that store — sd_canvas_fill_union's, and so every styled
+#      stroke's union passes. A suite that only ever fills with combine = 0 cannot see it.
+#   I  sd_canvas_clear's walk.
+#   J  the three blit loads: sd_canvas_blit_at, sd_canvas_blit_paint_at, _sd_paint_blit_point.
+# ⚠ A and B..G do NOT cover H, I or J: each is a separate expression in a loop those groups never
+# run. MEASURED before H, I and J existed — pushing sd_fill_impl's read-back or any of the three
+# blit loads to the PACKED index, or reverting sd_canvas_clear to its flat `w * h` run, survived
+# ALL 23 suites. Each now fails this one and nothing else (7, 1, 1, 1 and 2 checks).
+#
+# ⚠ sd_canvas_clear IS exercised (group I), but only there and only after its own fill: through
+# 0.6.0 it zeroed a flat `w * h` run from the coverage pointer, which on a stride != width canvas is
+# neither all of the window nor only the window. It now walks rows at the stride, and group I is the
+# only thing in the tree that can see the difference. Every other group zeroes its window in cp_rig
+# by hand, so a clear regression cannot silently seed a later group. The same goes for
+# sd_canvas_coverage_at, which has always honoured the stride; the exhaustive comparisons below
+# still read the buffer by hand, so a reader and a writer cannot agree on the wrong address and pass.
+#
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "clip_pitch_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    var m2 = " got ";
+    syscall(1, 2, m2, strlen(m2));
+    fmt_int_fd(2, got);
+    var m3 = " want ";
+    syscall(1, 2, m3, strlen(m3));
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- the rig ------------------------------------------------------------------------------------
+# A 10x7 canvas over a 16-byte-pitch buffer: 6 bytes of padding a row, one guard row above the
+# window and one below. Every byte outside the window is a SENTINEL no coverage write can produce
+# by accident (a fill writes 0..255; 90 stays 90 only if nothing touched it).
+var CP_W = 10;
+var CP_H = 7;
+var CP_PITCH = 16;      # the canvas stride — NOT the mask's pitch
+var CP_GT = 1;          # guard rows above the window
+var CP_GB = 1;          # guard rows below it
+var CP_SENT = 90;       # 0x5A
+
+# The clip rectangle every group uses: [2, 5) x [2, 6).
+# ⭐ BOTH RANGES ARE ASYMMETRIC ON PURPOSE. A mask index is two halves, and a rectangle that is
+# symmetric in an axis cannot see that half go wrong. On a 10-wide canvas the mirror x -> 9 - x maps
+# [3, 7) onto itself, so the first draft of this suite (rect [3,7)) missed `py * w + (w - 1 - px)`
+# entirely — all 68 checks passed and only clip_test caught it. [2, 5) mirrors to the DISJOINT
+# [5, 8), so cp_clip_bad sees 6 wrong pixels on each of the 4 clipped rows: 3 lost, 3 leaked.
+# [2, 6) on h = 7 mirrors to [1, 5), which differs in 2 rows. Keep both asymmetric if you retune.
+var CP_X0 = 2;
+var CP_Y0 = 2;
+var CP_X1 = 5;
+var CP_Y1 = 6;
+
+var g_cp_buf = 0;       # the wide buffer (guard rows + window + per-row padding)
+var g_cp_len = 0;
+var g_cp_cov = 0;       # the window's coverage pointer (what the header carries)
+var g_cp_cv = 0;        # the hand-built SdCanvas header
+
+# Fresh buffer + header, window zeroed, no clip, SUBSCANLINE.
+fn cp_rig(): i64 {
+    g_cp_len = (CP_GT + CP_H + CP_GB) * CP_PITCH;
+    g_cp_buf = alloc(g_cp_len);
+    memset(g_cp_buf, CP_SENT, g_cp_len);
+    g_cp_cov = g_cp_buf + CP_GT * CP_PITCH;
+    var y = 0;
+    while (y < CP_H) {
+        var x = 0;
+        while (x < CP_W) {
+            store8(g_cp_cov + y * CP_PITCH + x, 0);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    g_cp_cv = alloc(SD_CANVAS_SIZE);
+    store64(g_cp_cv + SD_CANVAS_WIDTH_OFFSET, CP_W);
+    store64(g_cp_cv + SD_CANVAS_HEIGHT_OFFSET, CP_H);
+    store64(g_cp_cv + SD_CANVAS_COVERAGE_OFFSET, g_cp_cov);
+    store64(g_cp_cv + SD_CANVAS_STRIDE_OFFSET, CP_PITCH);
+    store64(g_cp_cv + SD_CANVAS_CLIP_OFFSET, 0);
+    store64(g_cp_cv + SD_CANVAS_AA_OFFSET, SD_AA_SUBSCANLINE);
+    return 0;
+}
+
+# A window byte, addressed by hand at the stride.
+fn cp_at(x, y): i64 { return load8(g_cp_cov + y * CP_PITCH + x); }
+
+# Bytes outside the window that no longer hold the sentinel.
+fn cp_guard_bad(): i64 {
+    var bad = 0;
+    var i = 0;
+    while (i < g_cp_len) {
+        var row = i / CP_PITCH;
+        var col = i % CP_PITCH;
+        var inwin = 0;
+        if (row >= CP_GT) {
+            if (row < CP_GT + CP_H) {
+                if (col < CP_W) { inwin = 1; }
+            }
+        }
+        if (inwin == 0) {
+            if (load8(g_cp_buf + i) != CP_SENT) { bad = bad + 1; }
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# 255 inside the clip rectangle, 0 outside — what an OPAQUE fill of the whole canvas must leave.
+fn cp_expect(x, y): i64 {
+    if (x < CP_X0) { return 0; }
+    if (x >= CP_X1) { return 0; }
+    if (y < CP_Y0) { return 0; }
+    if (y >= CP_Y1) { return 0; }
+    return 255;
+}
+
+# Window pixels that disagree with cp_expect.
+fn cp_clip_bad(): i64 {
+    var bad = 0;
+    var y = 0;
+    while (y < CP_H) {
+        var x = 0;
+        while (x < CP_W) {
+            if (cp_at(x, y) != cp_expect(x, y)) { bad = bad + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return bad;
+}
+
+# Window bytes that differ from a PACKED canvas of the same size (stride == width, so the two
+# pitches coincide there and it is the oracle).
+fn cp_diff_packed(pcv): i64 {
+    var pc = sd_canvas_coverage(pcv);
+    var d = 0;
+    var y = 0;
+    while (y < CP_H) {
+        var x = 0;
+        while (x < CP_W) {
+            if (cp_at(x, y) != load8(pc + y * CP_W + x)) { d = d + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return d;
+}
+
+# Pixels that differ between two surfaces of the same size — group J's oracle comparison.
+fn cp_surf_diff(sa, sb): i64 {
+    var d = 0;
+    var y = 0;
+    while (y < CP_H) {
+        var x = 0;
+        while (x < CP_W) {
+            if (sd_surface_pixel_at(sa, x, y) != sd_surface_pixel_at(sb, x, y)) { d = d + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return d;
+}
+
+# Coverage summed over the window pixels OUTSIDE the clip rectangle — 0 or the clip leaked.
+fn cp_outside_sum(): i64 {
+    var s = 0;
+    var y = 0;
+    while (y < CP_H) {
+        var x = 0;
+        while (x < CP_W) {
+            if (cp_expect(x, y) == 0) { s = s + cp_at(x, y); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return s;
+}
+
+# Coverage summed over the pixels INSIDE it — 0 means the shape never arrived.
+fn cp_inside_sum(): i64 {
+    var s = 0;
+    var y = 0;
+    while (y < CP_H) {
+        var x = 0;
+        while (x < CP_W) {
+            if (cp_expect(x, y) != 0) { s = s + cp_at(x, y); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return s;
+}
+
+# The whole canvas as one closed rectangle: every pixel 255 when unclipped.
+fn cp_full(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0, 0);
+    sd_path_lineto(p, CP_W * SD_ONE, 0);
+    sd_path_lineto(p, CP_W * SD_ONE, CP_H * SD_ONE);
+    sd_path_lineto(p, 0, CP_H * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+# The clip rectangle as a path, for sd_canvas_clip_push_path.
+fn cp_rect_path(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, CP_X0 * SD_ONE, CP_Y0 * SD_ONE);
+    sd_path_lineto(p, CP_X1 * SD_ONE, CP_Y0 * SD_ONE);
+    sd_path_lineto(p, CP_X1 * SD_ONE, CP_Y1 * SD_ONE);
+    sd_path_lineto(p, CP_X0 * SD_ONE, CP_Y1 * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+# An OPAQUE block [1,5) x [1,4) — the coverage group H lays down first, so the union that follows
+# has something to read back. Whole pixels, so every byte it writes is 0 or 255.
+fn cp_block(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, SD_ONE, SD_ONE);
+    sd_path_lineto(p, 5 * SD_ONE, SD_ONE);
+    sd_path_lineto(p, 5 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(p, SD_ONE, 4 * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+# A HALF-COVERAGE band: the full width, y in [3, 3.5). SUBSCANLINE samples row 3 at y + 1/8, 3/8,
+# 5/8, 7/8, so the band catches 2 of the 4 — row 3 lands at 127, every other row at 0. ⭐ The zeros
+# are the point: where the new coverage is 0 a union writes back exactly what it READ, so the whole
+# canvas becomes a print of the read-back's addressing.
+fn cp_halfband(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0 - 2 * SD_ONE, 3 * SD_ONE);
+    sd_path_lineto(p, 12 * SD_ONE, 3 * SD_ONE);
+    sd_path_lineto(p, 12 * SD_ONE, 3 * SD_ONE + 32768);
+    sd_path_lineto(p, 0 - 2 * SD_ONE, 3 * SD_ONE + 32768);
+    sd_path_close(p);
+    return p;
+}
+
+var CP_H2 = 32768;      # half a pixel, 16.16
+
+# A horizontal segment 14 px wide centred on y = 3.5 and running from x = -2 to x = 12: its band is
+# y in [-3.5, 10.5] and x in [-2, 12], so a BUTT stroke of it covers EVERY pixel of a 10x7 canvas at
+# 255 — the styled flush's answer to cp_full(), through _sd_sb_flush instead of sd_fill_impl.
+fn cp_band(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0 - 2 * SD_ONE, 3 * SD_ONE + CP_H2);
+    sd_path_lineto(p, 12 * SD_ONE, 3 * SD_ONE + CP_H2);
+    return p;
+}
+
+# An L with a MITER corner at (8,1), width 3: a varied pattern (fractional edges, a corner, caps)
+# for the byte-for-byte comparison against the packed oracle.
+fn cp_ell(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, SD_ONE, SD_ONE + CP_H2);
+    sd_path_lineto(p, 8 * SD_ONE, SD_ONE + CP_H2);
+    sd_path_lineto(p, 8 * SD_ONE, 6 * SD_ONE);
+    return p;
+}
+
+# The mask this suite pushes by hand: CP_H * CP_PITCH bytes, the first CP_W * CP_H of them the
+# PACKED clip rectangle and EVERY byte past that block 255.
+# ⭐ Why the trap value is 255 and the block is stride-sized. A reader using the canvas stride walks
+# to (CP_H - 1) * CP_PITCH + CP_W - 1 = 105, past the 70-byte packed block — on the sd_alloc bump
+# heap that is a read of whatever was allocated next, so the failure would depend on heap bytes.
+# With the block over-allocated to 112 and the tail set to 255 (fully transparent to the clip
+# multiply) a stride reader is IN BOUNDS and DETERMINISTIC: it lets the shape through everywhere the
+# packed mask says 0. Nothing reads those trap bytes when the readers are right.
+fn cp_trap_mask(): i64 {
+    var n = CP_H * CP_PITCH;
+    var m = alloc(n);
+    var i = 0;
+    while (i < n) {
+        var v = 255;
+        if (i < CP_W * CP_H) {
+            v = 0;
+            var mx = i % CP_W;
+            var my = i / CP_W;
+            if (mx >= CP_X0) {
+                if (mx < CP_X1) {
+                    if (my >= CP_Y0) {
+                        if (my < CP_Y1) { v = 255; }
+                    }
+                }
+            }
+        }
+        store8(m + i, v);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # ── A) THE RIG ITSELF: THE COVERAGE BUFFER STILL TAKES THE STRIDE ───────────────
+    # Unclipped, so no reader touches a mask. The window must equal a packed canvas filled the same
+    # way, nothing outside it may be written, and row 3 must land at 3 * CP_PITCH — not 3 * CP_W.
+    # ⚠ This group covers the overwriting fill's STORE and sd_canvas_coverage_at's load. The union
+    # read-back is a different expression and needs a different shape: group H.
+    cp_rig();
+    var pka = sd_canvas_new(CP_W, CP_H);
+    check(sd_canvas_fill_path(g_cp_cv, cp_full(), SD_FILL_NONZERO), SADISH_OK);      # 1
+    check(sd_canvas_fill_path(pka, cp_full(), SD_FILL_NONZERO), SADISH_OK);          # 2
+    check(cp_diff_packed(pka), 0);                                                   # 3
+    check(cp_guard_bad(), 0);                                                        # 4
+    check(cp_at(0, 3), 255);                                                         # 5 — row 3 at 3*16
+    # The byte 3 * CP_W into the buffer is row 1's padding, untouched: the two pitches really differ.
+    check(load8(g_cp_cov + 3 * CP_W), CP_SENT);                                      # 6
+    check(sd_canvas_coverage_at(g_cp_cv, 0, 3), 255);                                # 7 — accessor agrees
+    # The LAST row and the LAST column of the window, where a clamped loop bound would show first.
+    check(cp_at(CP_W - 1, CP_H - 1), 255);                                           # 8
+    check(cp_at(CP_W - 1, 0), 255);                                                  # 9
+    check(cp_at(0, CP_H - 1), 255);                                                  # 10
+
+    # ── B) sd_fill_impl's SUBSCANLINE LOOP READS THE MASK PACKED ────────────────
+    # The clip is the same rectangle on both canvases, and the fill is opaque over the whole canvas,
+    # so every pixel is exactly cp_expect. ⭐ THE TELL-TALES, worked out by hand for CP_PITCH = 16,
+    # CP_W = 10, rect [2,5) x [2,6). A STRIDE reader at (px, py) loads mask byte py*16 + px, which
+    # the packed mask holds for pixel (byte % 10, byte / 10):
+    #   (7, 1) is OUTSIDE the rect -> 0. A stride reader loads byte 1*16 + 7 = 23 = packed
+    #          (x 3, y 2) = 255: the fill LEAKS a full pixel one row above the clip.
+    #   (3, 2) is INSIDE it -> 255. A stride reader loads byte 2*16 + 3 = 35 = packed (x 5, y 3) = 0:
+    #          the fill LOSES a pixel it owed.
+    # And for an index mirrored in x (`py * w + (w - 1 - px)`), which reads packed (9 - px, py):
+    #   (6, 3) is OUTSIDE -> 0; mirrored it reads packed (3, 3) = 255 and LEAKS. (A stride reader
+    #          also gets this one wrong: byte 3*16 + 6 = 54 = packed (4, 5) = 255.)
+    #   (2, 3) is INSIDE -> 255; mirrored it reads packed (7, 3) = 0 and LOSES.
+    # All four lie inside the mask's own 70 bytes, so none depends on what follows it on the heap.
+    cp_rig();
+    var pkb = sd_canvas_new(CP_W, CP_H);
+    check(sd_canvas_clip_push_rect(g_cp_cv, CP_X0, CP_Y0, CP_X1, CP_Y1), SADISH_OK); # 11
+    check(sd_canvas_clip_push_rect(pkb, CP_X0, CP_Y0, CP_X1, CP_Y1), SADISH_OK);     # 12
+    sd_canvas_fill_path(g_cp_cv, cp_full(), SD_FILL_NONZERO);
+    sd_canvas_fill_path(pkb, cp_full(), SD_FILL_NONZERO);
+    check(cp_clip_bad(), 0);                                                         # 13
+    check(cp_diff_packed(pkb), 0);                                                   # 14
+    check(cp_guard_bad(), 0);                                                        # 15
+    check(cp_at(7, 1), 0);                                                           # 16 — no leak
+    check(cp_at(3, 2), 255);                                                         # 17 — no loss
+    check(cp_at(6, 3), 0);                                                           # 18 — no x-mirror leak
+    check(cp_at(2, 3), 255);                                                         # 19 — no x-mirror loss
+    check(cp_at(CP_X0, CP_Y0), 255);                                                 # 20 — near corner
+    check(cp_at(CP_X1 - 1, CP_Y1 - 1), 255);                                         # 21 — far corner
+    check(cp_outside_sum(), 0);                                                      # 22
+    check(cp_inside_sum(), 12 * 255);                                                # 23 — 3x4 pixels
+
+    # ── C) _sd_area_fill READS THE MASK PACKED ──────────────────────
+    # The SD_AA_AREA engine takes `cov`/`stride` AND `mask`; only the first pair is strided.
+    cp_rig();
+    store64(g_cp_cv + SD_CANVAS_AA_OFFSET, SD_AA_AREA);
+    var pkc = sd_canvas_new(CP_W, CP_H);
+    check(sd_canvas_set_aa(pkc, SD_AA_AREA), SADISH_OK);                             # 24
+    check(sd_canvas_clip_push_rect(g_cp_cv, CP_X0, CP_Y0, CP_X1, CP_Y1), SADISH_OK); # 25
+    check(sd_canvas_clip_push_rect(pkc, CP_X0, CP_Y0, CP_X1, CP_Y1), SADISH_OK);     # 26
+    sd_canvas_fill_path(g_cp_cv, cp_full(), SD_FILL_NONZERO);
+    sd_canvas_fill_path(pkc, cp_full(), SD_FILL_NONZERO);
+    check(cp_clip_bad(), 0);                                                         # 27
+    check(cp_diff_packed(pkc), 0);                                                   # 28
+    check(cp_guard_bad(), 0);                                                        # 29
+    check(cp_at(7, 1), 0);                                                           # 30 — no leak
+    check(cp_at(3, 2), 255);                                                         # 31 — no loss
+
+    # ── D) _sd_sb_flush (THE STYLED STROKE'S WALK) READS THE MASK PACKED ──────────────
+    # The band covers every pixel at 255, so the clipped stroke is the rectangle, tell-tales and all.
+    cp_rig();
+    var pkd = sd_canvas_new(CP_W, CP_H);
+    check(sd_canvas_clip_push_rect(g_cp_cv, CP_X0, CP_Y0, CP_X1, CP_Y1), SADISH_OK); # 32
+    check(sd_canvas_clip_push_rect(pkd, CP_X0, CP_Y0, CP_X1, CP_Y1), SADISH_OK);     # 33
+    var dband = cp_band();
+    var DW = 14 * SD_ONE;
+    var DML = 4 * SD_ONE;
+    check(sd_canvas_stroke_path_ex(g_cp_cv, dband, DW, SD_CAP_BUTT, SD_JOIN_MITER, DML), SADISH_OK);   # 34
+    check(sd_canvas_stroke_path_ex(pkd, dband, DW, SD_CAP_BUTT, SD_JOIN_MITER, DML), SADISH_OK);       # 35
+    check(cp_clip_bad(), 0);                                                         # 36
+    check(cp_diff_packed(pkd), 0);                                                   # 37
+    check(cp_guard_bad(), 0);                                                        # 38
+    check(cp_at(7, 1), 0);                                                           # 39 — no leak
+    check(cp_at(3, 2), 255);                                                         # 40 — no loss
+    # And a varied pattern — a MITER corner with SQUARE caps, fractional in y — byte for byte
+    # against the packed oracle. Uniform 255 cannot show a shear that lands on another 255.
+    cp_rig();
+    var pkd2 = sd_canvas_new(CP_W, CP_H);
+    sd_canvas_clip_push_rect(g_cp_cv, CP_X0, CP_Y0, CP_X1, CP_Y1);
+    sd_canvas_clip_push_rect(pkd2, CP_X0, CP_Y0, CP_X1, CP_Y1);
+    var dell = cp_ell();
+    sd_canvas_stroke_path_ex(g_cp_cv, dell, 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, 4 * SD_ONE);
+    sd_canvas_stroke_path_ex(pkd2, dell, 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, 4 * SD_ONE);
+    check(cp_diff_packed(pkd2), 0);                                                  # 41
+    check(cp_outside_sum(), 0);                                                      # 42
+    check(cp_inside_sum() > 0, 1);                                                   # 43 — the L did arrive
+    check(cp_guard_bad(), 0);                                                        # 44
+
+    # ── E) THE DETERMINISTIC TRAP MASK ─────────────────────────
+    # A hand-built PACKED mask over-allocated to CP_H * CP_PITCH with 255 past the packed block: a
+    # stride reader stays in bounds and lets the shape through wherever it over-reads. All three
+    # readers, one after another.
+    cp_rig();
+    check(sd_clip_push_mask(g_cp_cv, cp_trap_mask()), SADISH_OK);                    # 45
+    sd_canvas_fill_path(g_cp_cv, cp_full(), SD_FILL_NONZERO);
+    check(cp_clip_bad(), 0);                                                         # 46 — SUBSCANLINE
+    check(cp_guard_bad(), 0);                                                        # 47
+    cp_rig();
+    store64(g_cp_cv + SD_CANVAS_AA_OFFSET, SD_AA_AREA);
+    check(sd_clip_push_mask(g_cp_cv, cp_trap_mask()), SADISH_OK);                    # 48
+    sd_canvas_fill_path(g_cp_cv, cp_full(), SD_FILL_NONZERO);
+    check(cp_clip_bad(), 0);                                                         # 49 — AREA
+    check(cp_guard_bad(), 0);                                                        # 50
+    cp_rig();
+    check(sd_clip_push_mask(g_cp_cv, cp_trap_mask()), SADISH_OK);                    # 51
+    sd_canvas_stroke_path_ex(g_cp_cv, cp_band(), 14 * SD_ONE, SD_CAP_BUTT, SD_JOIN_MITER, 4 * SD_ONE);
+    check(cp_clip_bad(), 0);                                                         # 52 — styled flush
+    check(cp_guard_bad(), 0);                                                        # 53
+    # The same trap mask under an AREA styled stroke (_sd_sb_flush's dispatch into _sd_area_fill).
+    cp_rig();
+    store64(g_cp_cv + SD_CANVAS_AA_OFFSET, SD_AA_AREA);
+    check(sd_clip_push_mask(g_cp_cv, cp_trap_mask()), SADISH_OK);                    # 54
+    sd_canvas_stroke_path_ex(g_cp_cv, cp_band(), 14 * SD_ONE, SD_CAP_BUTT, SD_JOIN_MITER, 4 * SD_ONE);
+    check(cp_clip_bad(), 0);                                                         # 55
+    check(cp_guard_bad(), 0);                                                        # 56
+
+    # ── F) sd_canvas_clip_push_path's MASK IS THE TEMP CANVAS'S COVERAGE — ALSO PACKED ────────
+    # The temp canvas comes from sd_canvas_new, so its coverage is packed whatever the PARENT's
+    # stride is. Filling the clip rectangle as a path must land the same bytes as the rect clip.
+    cp_rig();
+    check(sd_canvas_clip_push_path(g_cp_cv, cp_rect_path(), SD_FILL_NONZERO), SADISH_OK);  # 57
+    sd_canvas_fill_path(g_cp_cv, cp_full(), SD_FILL_NONZERO);
+    check(cp_clip_bad(), 0);                                                         # 58
+    check(cp_guard_bad(), 0);                                                        # 59
+    check(cp_at(7, 1), 0);                                                           # 60
+    check(cp_at(3, 2), 255);                                                         # 61
+
+    # ── G) NESTED CLIPS INTERSECT PACKED, AND POP RESTORES ──────────────────
+    # [0,5) x [2,7) intersected with [2,10) x [0,6) is the same [2,5) x [2,6). sd_clip_push_mask
+    # multiplies the two `shape + i` over w*h — packed, like everything else on the mask side.
+    cp_rig();
+    check(sd_canvas_clip_push_rect(g_cp_cv, 0, CP_Y0, CP_X1, CP_H), SADISH_OK);      # 62
+    check(sd_canvas_clip_push_rect(g_cp_cv, CP_X0, 0, CP_W, CP_Y1), SADISH_OK);      # 63
+    sd_canvas_fill_path(g_cp_cv, cp_full(), SD_FILL_NONZERO);
+    check(cp_clip_bad(), 0);                                                         # 64
+    check(cp_at(7, 1), 0);                                                           # 65
+    check(cp_at(3, 2), 255);                                                         # 66
+    # Pop both: unclipped again, so the whole window fills — and still only the window.
+    check(sd_canvas_clip_pop(g_cp_cv), SADISH_OK);                                   # 67
+    check(sd_canvas_clip_pop(g_cp_cv), SADISH_OK);                                   # 68
+    sd_canvas_fill_path(g_cp_cv, cp_full(), SD_FILL_NONZERO);
+    var gfull = 0;
+    var gy = 0;
+    while (gy < CP_H) {
+        var gx = 0;
+        while (gx < CP_W) {
+            if (cp_at(gx, gy) != 255) { gfull = gfull + 1; }
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+    check(gfull, 0);                                                                 # 69
+    check(cp_guard_bad(), 0);                                                        # 70
+
+    # ── H) THE UNION READ-BACK IS COVERAGE, SO IT TAKES THE STRIDE ────────────
+    # ⭐ WHY THIS GROUP EXISTS. sd_fill_impl's inner loop touches the coverage buffer TWICE: it
+    # STORES at `cov + py * stride + px` always, and when combine != 0 (sd_canvas_fill_union, and so
+    # every styled stroke's union passes) it first LOADS the old byte from the same address. They are
+    # two separate expressions. Group A only ever drives combine = 0, so through the first draft of
+    # this suite the LOAD could be pushed to `py * w + px` and all 68 checks — and all 23 suites —
+    # still passed. It is not equivalent: it is a real wrong-output on the very canvas shape this
+    # file exists to pin.
+    # The shape of the test: lay an opaque block down with fill_path, then union a band whose
+    # coverage is ZERO everywhere but row 3. Where the new coverage is 0 the union writes back what
+    # it read, so a mis-addressed read-back prints itself across the window.
+    # ⭐ THE TELL-TALES, by hand (CP_PITCH = 16, CP_W = 10, block [1,5) x [1,4), sentinel 90):
+    #   (0, 1) is outside the block and outside the band -> 0. A packed read-back loads byte
+    #          1*10 + 0 = 10, which at a 16-pitch is row 0's PADDING = 90: the union LEAKS 90.
+    #   (1, 1) is inside the block, outside the band -> 255. A packed read-back loads byte
+    #          1*10 + 1 = 11 = row 0's padding = 90 as well: the union LOSES the block to 90.
+    cp_rig();
+    var pkh = sd_canvas_new(CP_W, CP_H);
+    var hblk = cp_block();
+    check(sd_canvas_fill_path(g_cp_cv, hblk, SD_FILL_NONZERO), SADISH_OK);           # 71
+    check(sd_canvas_fill_path(pkh, hblk, SD_FILL_NONZERO), SADISH_OK);               # 72
+    check(cp_diff_packed(pkh), 0);                                                   # 73 — the block
+    check(cp_at(1, 1), 255);                                                         # 74
+    check(cp_at(0, 1), 0);                                                           # 75
+    var hband = cp_halfband();
+    check(sd_canvas_fill_union(g_cp_cv, hband, SD_FILL_NONZERO), SADISH_OK);         # 76
+    check(sd_canvas_fill_union(pkh, hband, SD_FILL_NONZERO), SADISH_OK);             # 77
+    check(cp_diff_packed(pkh), 0);                                                   # 78 — THE read-back
+    check(cp_at(0, 1), 0);                                                           # 79 — no leak
+    check(cp_at(1, 1), 255);                                                         # 80 — no loss
+    check(cp_at(7, 3), 127);                                                         # 81 — the band, half covered
+    check(cp_at(1, 3), 255);                                                         # 82 — 255 beats 127
+    check(cp_guard_bad(), 0);                                                        # 83
+    # And the same pair CLIPPED: the mask multiply happens before the max, so this drives the packed
+    # mask read and the strided read-back in one expression.
+    cp_rig();
+    var pkh2 = sd_canvas_new(CP_W, CP_H);
+    check(sd_canvas_clip_push_rect(g_cp_cv, CP_X0, CP_Y0, CP_X1, CP_Y1), SADISH_OK); # 84
+    check(sd_canvas_clip_push_rect(pkh2, CP_X0, CP_Y0, CP_X1, CP_Y1), SADISH_OK);    # 85
+    sd_canvas_fill_path(g_cp_cv, hblk, SD_FILL_NONZERO);
+    sd_canvas_fill_path(pkh2, hblk, SD_FILL_NONZERO);
+    sd_canvas_fill_union(g_cp_cv, hband, SD_FILL_NONZERO);
+    sd_canvas_fill_union(pkh2, hband, SD_FILL_NONZERO);
+    check(cp_diff_packed(pkh2), 0);                                                  # 86
+    check(cp_outside_sum(), 0);                                                      # 87 — clipped both times
+    check(cp_at(2, 2), 255);                                                         # 88 — block inside the clip
+    check(cp_guard_bad(), 0);                                                        # 89
+
+    # ── I) sd_canvas_clear ZEROES THE WINDOW, ROW BY ROW AT THE STRIDE ──────────
+    # ⭐ The coverage-side twin of this file's bug, found while building the rig and fixed with it.
+    # Through 0.6.0 sd_canvas_clear walked one flat run of `w * h` bytes from the coverage pointer.
+    # On this canvas that is 70 bytes at a 16-pitch: it would zero rows 0..3 ENTIRELY — window and
+    # the 6 padding bytes each (24 sentinel bytes destroyed) — reach only column 5 of row 4, and
+    # leave rows 4..6 of the window (24 bytes) still holding 255. Both halves of that are checked.
+    cp_rig();
+    sd_canvas_fill_path(g_cp_cv, cp_full(), SD_FILL_NONZERO);
+    check(cp_at(CP_W - 1, CP_H - 1), 255);                                           # 90 — full first
+    check(sd_canvas_clear(g_cp_cv), SADISH_OK);                                      # 91
+    var idirty = 0;
+    var iy = 0;
+    while (iy < CP_H) {
+        var ix = 0;
+        while (ix < CP_W) {
+            if (cp_at(ix, iy) != 0) { idirty = idirty + 1; }
+            ix = ix + 1;
+        }
+        iy = iy + 1;
+    }
+    check(idirty, 0);                                                                # 92 — all of the window
+    check(cp_guard_bad(), 0);                                                        # 93 — and ONLY the window
+
+    # ── J) THE BLITS READ COVERAGE AT THE STRIDE TOO ────────────────
+    # ⭐ Three more coverage loads live outside sd_fill_impl, each in its own loop:
+    # sd_canvas_blit_at (src/raster.cyr), sd_canvas_blit_paint_at's gradient loop and
+    # _sd_paint_blit_point's per-pixel loop (both src/paint.cyr). All three are already right; none
+    # was reachable from any suite with stride != width, so pushing any one to `y * cw + x` survived
+    # all 23. The canvas here is the one input that can tell, so it closes them: the L's coverage is
+    # blitted from the 16-pitch canvas and from the packed twin onto two identical surfaces, which
+    # must come out pixel for pixel the same. ⚠ This is the COVERAGE side — the opposite half of
+    # this file's contract — and it is part of why group A's claim is true as written.
+    cp_rig();
+    var pkj = sd_canvas_new(CP_W, CP_H);
+    var jell = cp_ell();
+    sd_canvas_stroke_path_ex(g_cp_cv, jell, 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, 4 * SD_ONE);
+    sd_canvas_stroke_path_ex(pkj, jell, 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, 4 * SD_ONE);
+    check(cp_diff_packed(pkj), 0);                                                   # 94 — same coverage
+    var jsa = sd_surface_new(CP_W, CP_H);
+    var jsb = sd_surface_new(CP_W, CP_H);
+    check(sd_canvas_blit_at(g_cp_cv, jsa, 16711680, 0, 0), SADISH_OK);               # 95
+    check(sd_canvas_blit_at(pkj, jsb, 16711680, 0, 0), SADISH_OK);                   # 96
+    check(cp_surf_diff(jsa, jsb), 0);                                                # 97 — solid blit
+    # A LINEAR gradient: sd_canvas_blit_paint_at's own loop.
+    var jgl = sd_gradient_linear(0, 0, CP_W * SD_ONE, 0);
+    sd_gradient_add_stop(jgl, 0, 16711680);
+    sd_gradient_add_stop(jgl, SD_ONE, 255);
+    var jsc = sd_surface_new(CP_W, CP_H);
+    var jsd = sd_surface_new(CP_W, CP_H);
+    check(sd_canvas_blit_paint_at(g_cp_cv, jsc, jgl, 0, 0), SADISH_OK);              # 98
+    check(sd_canvas_blit_paint_at(pkj, jsd, jgl, 0, 0), SADISH_OK);                  # 99
+    check(cp_surf_diff(jsc, jsd), 0);                                                # 100 — gradient blit
+    # A FOCAL radial, focus off the centre: _sd_paint_blit_point's per-pixel loop.
+    var jgf = sd_gradient_radial_focal(5 * SD_ONE, 3 * SD_ONE, 4 * SD_ONE, 3 * SD_ONE, 2 * SD_ONE);
+    sd_gradient_add_stop(jgf, 0, 16711680);
+    sd_gradient_add_stop(jgf, SD_ONE, 255);
+    var jse = sd_surface_new(CP_W, CP_H);
+    var jsf = sd_surface_new(CP_W, CP_H);
+    check(sd_canvas_blit_paint_at(g_cp_cv, jse, jgf, 0, 0), SADISH_OK);              # 101
+    check(sd_canvas_blit_paint_at(pkj, jsf, jgf, 0, 0), SADISH_OK);                  # 102
+    check(cp_surf_diff(jse, jsf), 0);                                                # 103 — focal blit
+    # The three pictures must differ from each other, or the comparisons above prove nothing.
+    check(cp_surf_diff(jsa, jsc) > 0, 1);                                            # 104
+    check(cp_surf_diff(jsc, jse) > 0, 1);                                            # 105
+    check(cp_guard_bad(), 0);                                                        # 106 — a blit only reads
+
+    if (g_fails == 0) {
+        var ok = "clip_pitch_test: PASS (clip masks are packed w*h on a canvas of any stride)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "clip_pitch_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

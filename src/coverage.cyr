@@ -42,7 +42,8 @@
 # bound the default engine's (bx-ax)*(sy-ay) product already carries. Under it every intermediate
 # fits an i64: x at a row boundary (dx * dy_part) < 2^62; a column crossing's y offset
 # (pdy_row <= 2^16) * (x - x0 < 2^31) < 2^47; the split (pdy <= 2^16) * (fx_sum <= 2^17) <= 2^33;
-# the running sum <= SD_FLATTEN_CAP * ONE = 2^29. All divisions and shifts in the accumulation act
+# the running sum <= n_edges * ONE (an edge deposits at most ONE into a row), below 2^48 for any list
+# under 2^32 edges (128 GiB of records). All divisions and shifts in the accumulation act
 # on non-negative values (the sign is applied after the split), so truncation is the same for a
 # contour and its mirror: CW and CCW input give byte-identical coverage.
 # ⚠ Truncation is under a raw unit per step per piece (x at a row boundary, y at a column crossing,
@@ -105,8 +106,8 @@ fn _sd_area_swap(ea, eb): i64 {
     return 0;
 }
 
-# Sort the edge records by ymin, in place (Shell sort, Knuth 3h+1 gaps: no scratch, and no O(n^2)
-# on the 8,192-edge worst case a long flattened path can produce).
+# Sort the edge records by ymin, in place (Shell sort, Knuth 3h+1 gaps: no scratch, O(n^1.5) worst
+# case — not O(n^2) — on the lists a long flattened path produces, which since 0.6.1 are unbounded).
 fn _sd_area_sort(edges, n): i64 {
     var gap = 1;
     while (gap < n / 3) { gap = gap * 3 + 1; }
@@ -237,12 +238,13 @@ fn _sd_area_edge_row(acc, w, e, rt): i64 {
 # ================================================================
 # _sd_area_fill — the SD_AA_AREA engine behind sd_fill_impl. `edges`/`n_edges` is the closed edge
 # list sd_fill_impl built (REORDERED here); `cov`/`stride` the canvas's coverage buffer; `mask` the
-# active clip mask (0 = unclipped); `nonzero` 1 for SD_FILL_NONZERO, 0 for even-odd; `combine`
-# 0 = overwrite, 1 = MAX into the existing coverage. The byte mapping, clip multiply and union MAX
-# are the default engine's, verbatim.
+# active clip mask (0 = unclipped) — PACKED w*h, so `stride` addresses `cov` and nothing else;
+# `nonzero` 1 for SD_FILL_NONZERO, 0 for even-odd; `combine` 0 = overwrite, 1 = MAX into the
+# existing coverage. The byte mapping, clip multiply and union MAX are the default engine's, verbatim.
 # ⛔ The list must be WHOLE — every contour closed — or the running sum never returns to 0 and the
-# row streaks to the right edge. sd_fill_impl guarantees it by calling here only with n_edges <
-# SD_FLATTEN_CAP (sd_edge_add drops edges silently once the list is full).
+# row streaks to the right edge. sd_fill_impl guarantees it by calling here only when no edge was
+# dropped (_sd_fill_trunc == 0: the list grows, and drops only when a growth fails); the styled
+# stroke's flush likewise (_sd_sb_trunc).
 #
 # Rows are swept top to bottom over an ACTIVE WINDOW [lo, nxt) of the ymin-sorted edge list:
 # edges whose ymin is above the row's bottom join at nxt; an edge that ends at or before the
@@ -314,10 +316,13 @@ fn _sd_area_fill(edges, n_edges, w, h, cov, stride, mask, nonzero, combine): i64
             # s <= ONE, so c <= 255: the default engine's clamp cannot fire here
             var c = (s * 255) >> SD_SHIFT;
             if (mask != 0) {
-                c = (c * load8(mask + py * stride + px)) / 255;
+                # ⛔ PACKED `py * w + px` — the clip mask is a w*h block, never a window into a
+                # wider buffer, so `stride` (the COVERAGE buffer's pitch) is not its pitch. See
+                # raster.cyr's SdCanvas layout note; gated by programs/clip_pitch_test.cyr.
+                c = (c * load8(mask + py * w + px)) / 255;
             }
             if (combine != 0) {
-                var oldc = load8(cov + py * stride + px);
+                var oldc = load8(cov + py * stride + px);   # coverage: the STRIDE, not w
                 if (c < oldc) { c = oldc; }
             }
             store8(cov + py * stride + px, c);

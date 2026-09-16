@@ -1,0 +1,1250 @@
+# programs/dash_test.cyr — RUN test for sd_canvas_stroke_path_dash (src/dash.cyr).
+#
+# ⭐ WHAT THIS EXISTS TO PROVE. A dash is not a new stroker: it is the styled stroker's own
+# _sd_sb_subpath, run on a PIECE of the flattened run. So what has to be proved is that the CUT is
+# right — where a dash starts and ends, which end takes a cap and which vertex a join, and that the
+# phase arithmetic (an odd count, an offset outside the pattern or below zero, zero-length entries,
+# a closed subpath's wrap) lands where SVG says. Every reference below is exact for its geometry and
+# is built WITHOUT the dash walk:
+#   · pixel-aligned dashes — every ink and gap pixel of a row written out as a string;
+#   · solid fallbacks — the same call through sd_canvas_stroke_path_ex, compared pixel by pixel;
+#   · dots — a path of lone movetos, which takes the same lone-point branch;
+#   · a closed square's wrap — its dashes spelled out as open subpaths in one path, the wrapping one
+#     written THROUGH the closing corner so that corner is a join and not two caps;
+#   · a dashed cubic — the same polyline walked with the same arithmetic (arc_at), so each dash and
+#     gap is read at the distance it actually occupies;
+#   · drift — an axis-aligned polyline, where sd_isqrt is EXACT, against its own 2-point chord.
+# ⚠ ORDER MATTERS: group A measures exact global-heap figures from a cold dash buffer, so it runs
+# first and nothing may dash before it. Group P measures the growth, so it runs after everything
+# that would grow the buffer on its own.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "dash_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+var g_arena = 0;
+
+fn hook_alloc(n): i64 {
+    return arena_alloc(g_arena, n);
+}
+
+# ---- canvases ---------------------------------------------------------------------------------
+fn cov_diff(a, b): i64 {
+    var n = sd_canvas_width(a) * sd_canvas_height(a);
+    var pa = sd_canvas_coverage(a);
+    var pb = sd_canvas_coverage(b);
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(pa + i) != load8(pb + i)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn cov_maxdiff(a, b): i64 {
+    var n = sd_canvas_width(a) * sd_canvas_height(a);
+    var pa = sd_canvas_coverage(a);
+    var pb = sd_canvas_coverage(b);
+    var m = 0;
+    var i = 0;
+    while (i < n) {
+        var d = sd_abs(load8(pa + i) - load8(pb + i));
+        if (d > m) { m = d; }
+        i = i + 1;
+    }
+    return m;
+}
+
+# The largest amount by which `a` reads OVER `b`, pixel for pixel (0 = a is nowhere brighter).
+fn cov_over(a, b): i64 {
+    var n = sd_canvas_width(a) * sd_canvas_height(a);
+    var pa = sd_canvas_coverage(a);
+    var pb = sd_canvas_coverage(b);
+    var m = 0;
+    var i = 0;
+    while (i < n) {
+        var d = load8(pa + i) - load8(pb + i);
+        if (d > m) { m = d; }
+        i = i + 1;
+    }
+    return m;
+}
+
+fn cov_sum(cv): i64 {
+    var n = sd_canvas_width(cv) * sd_canvas_height(cv);
+    var p = sd_canvas_coverage(cv);
+    var s = 0;
+    var i = 0;
+    while (i < n) {
+        s = s + load8(p + i);
+        i = i + 1;
+    }
+    return s;
+}
+
+# Pixels of row `y` that do not read exactly what `spec` says: '#' is 255, anything else 0. One
+# character per canvas column — the whole row, ink and gap alike, written out.
+fn row_bad(cv, y, spec): i64 {
+    var w = sd_canvas_width(cv);
+    var bad = 0;
+    var x = 0;
+    while (x < w) {
+        var want = 0;
+        if (load8(spec + x) == 35) { want = 255; }
+        if (sd_canvas_coverage_at(cv, x, y) != want) { bad = bad + 1; }
+        x = x + 1;
+    }
+    return bad;
+}
+
+# Non-zero pixels in rows [y0, y1).
+fn lit_rows(cv, y0, y1): i64 {
+    var n = 0;
+    var py = y0;
+    while (py < y1) {
+        var px = 0;
+        while (px < sd_canvas_width(cv)) {
+            if (sd_canvas_coverage_at(cv, px, py) != 0) { n = n + 1; }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return n;
+}
+
+fn aa_canvas(w, h, mode): i64 {
+    var cv = sd_canvas_new(w, h);
+    sd_canvas_set_aa(cv, mode);
+    return cv;
+}
+
+# ---- patterns ---------------------------------------------------------------------------------
+# An i64 array of `n` zeroed entries, with 8 POISONED entries after them. ⭐ The poison is what
+# holds the odd-count rule honest: [a, b, c] must behave as the array read TWICE, indexed modulo 3
+# — a walk that indexed straight into the doubled view would read entry 3 and find 7.188 px here,
+# not a. Without it the NEXT allocation's bytes happen to repeat the pattern and the bug hides.
+fn pat_new(n): i64 {
+    var p = alloc((n + 8) * 8);
+    var i = 0;
+    while (i < n + 8) {
+        var v = 471189;                  # 7.188 px — a length in no pattern below
+        if (i < n) { v = 0; }
+        store64(p + i * 8, v);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn pat_set(p, i, v): i64 {
+    store64(p + i * 8, v);
+    return p;
+}
+
+fn pat2(a, b): i64 {
+    return pat_set(pat_set(pat_new(2), 0, a), 1, b);
+}
+
+fn pat1(a): i64 {
+    return pat_set(pat_new(1), 0, a);
+}
+
+# ---- paths ------------------------------------------------------------------------------------
+fn hline(x0, x1, y): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0, y);
+    sd_path_lineto(p, x1, y);
+    return p;
+}
+
+# The closed square [x0, x1] x [y0, y1], A -> B -> C -> D -> Z.
+fn square(x0, y0, x1, y1): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0, y0);
+    sd_path_lineto(p, x1, y0);
+    sd_path_lineto(p, x1, y1);
+    sd_path_lineto(p, x0, y1);
+    sd_path_close(p);
+    return p;
+}
+
+# `n` collinear segments of (`sx`, `sy`) raw each, from (x, y).
+fn steps(x, y, sx, sy, n): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x, y);
+    var k = 1;
+    while (k <= n) {
+        sd_path_lineto(p, x + k * sx, y + k * sy);
+        k = k + 1;
+    }
+    return p;
+}
+
+# The S-curve "M 4,30 C 20,4 44,56 60,30" — one cubic, 12 chords at the stroker's tolerance.
+fn scurve(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 4 * SD_ONE, 30 * SD_ONE);
+    sd_path_cubicto(p, 20 * SD_ONE, 4 * SD_ONE, 44 * SD_ONE, 56 * SD_ONE, 60 * SD_ONE, 30 * SD_ONE);
+    return p;
+}
+
+# stroke_style_test's cusp: a 150° flattened turn INSIDE one cubic, which the stroker rounds
+# instead of mitring (a miter at limit 4 would spike to row 3).
+fn cusp(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 10 * SD_ONE, 30 * SD_ONE);
+    sd_path_cubicto(p, 50 * SD_ONE, 5 * SD_ONE, 10 * SD_ONE, 5 * SD_ONE, 50 * SD_ONE, 30 * SD_ONE);
+    return p;
+}
+
+# The cusp, then `n` DISTINCT lineto points marching `step` raw down from its end: a run of n + 13
+# points whose first dozen carry the inside-a-curve flag. A piece buffer that grew mid-dash without
+# copying those flags would mitre the cusp back into its 6 px spike.
+fn cusp_tail(n, step): i64 {
+    var p = cusp();
+    var k = 1;
+    while (k <= n) {
+        sd_path_lineto(p, 50 * SD_ONE, 30 * SD_ONE + k * step);
+        k = k + 1;
+    }
+    return p;
+}
+
+# "M 2,30 L 10,30 C 50,5 10,5 50,30" — a straight lead-in (curve flag 0) and then the cusp (flag 1),
+# so a dash that STARTS inside the cubic sits at piece indices the run's own flags do not match.
+fn leadcusp(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 2 * SD_ONE, 30 * SD_ONE);
+    sd_path_lineto(p, 10 * SD_ONE, 30 * SD_ONE);
+    sd_path_cubicto(p, 50 * SD_ONE, 5 * SD_ONE, 10 * SD_ONE, 5 * SD_ONE, 50 * SD_ONE, 30 * SD_ONE);
+    return p;
+}
+
+# A radius-`r` circle about (cx, cy) as 4 cubic quadrants, kappa = 0.5522847 (36,204 in 16.16).
+fn circle4(cx, cy, r): i64 {
+    var k = sd_fixed_mul(r, 36204);
+    var p = sd_path_new();
+    sd_path_moveto(p, cx + r, cy);
+    sd_path_cubicto(p, cx + r, cy + k, cx + k, cy + r, cx, cy + r);
+    sd_path_cubicto(p, cx - k, cy + r, cx - r, cy + k, cx - r, cy);
+    sd_path_cubicto(p, cx - r, cy - k, cx - k, cy - r, cx, cy - r);
+    sd_path_cubicto(p, cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+    sd_path_close(p);
+    return p;
+}
+
+# The vertical polyline x = 4.5 px, y = 1.25 px + k * `step` raw, points [first, last].
+fn vpoly(first, last, step): i64 {
+    var p = sd_path_new();
+    var x = 4 * SD_ONE + 32768;
+    var k = first;
+    while (k <= last) {
+        var y = SD_ONE + 16384 + k * step;
+        if (k == first) { sd_path_moveto(p, x, y); } else { sd_path_lineto(p, x, y); }
+        k = k + 1;
+    }
+    return p;
+}
+
+# ---- polyline arithmetic (the dash walk's own) ------------------------------------------------
+# Total length of `pl` by per-segment sd_isqrt — exactly what the dash walk accumulates.
+fn poly_len(pl): i64 {
+    var pts = sd_polyline_points(pl);
+    var n = sd_polyline_count(pl);
+    var s = 0;
+    var i = 0;
+    while (i < n - 1) {
+        var a = load64(pts + i * 8);
+        var b = load64(pts + (i + 1) * 8);
+        var dx = sd_point_x(b) - sd_point_x(a);
+        var dy = sd_point_y(b) - sd_point_y(a);
+        s = s + sd_isqrt(dx * dx + dy * dy);
+        i = i + 1;
+    }
+    return s;
+}
+
+# The point at distance `d` along `pl`, cut exactly as _sd_dash_subpath cuts it. Past the end it is
+# the last point.
+fn arc_at(pl, d): (i64, i64) {
+    var pts = sd_polyline_points(pl);
+    var n = sd_polyline_count(pl);
+    var rem = d;
+    var i = 0;
+    while (i < n - 1) {
+        var a = load64(pts + i * 8);
+        var b = load64(pts + (i + 1) * 8);
+        var ax = sd_point_x(a);
+        var ay = sd_point_y(a);
+        var dx = sd_point_x(b) - ax;
+        var dy = sd_point_y(b) - ay;
+        var seg = sd_isqrt(dx * dx + dy * dy);
+        if (seg > rem) { return (ax + (dx * rem) / seg, ay + (dy * rem) / seg); }
+        rem = rem - seg;
+        i = i + 1;
+    }
+    var l = load64(pts + (n - 1) * 8);
+    return (sd_point_x(l), sd_point_y(l));
+}
+
+# Coverage of the pixel the point at distance `d` along `pl` falls in.
+fn cov_at_arc(cv, pl, d): i64 {
+    var x, y = arc_at(pl, d);
+    return sd_canvas_coverage_at(cv, sd_asr(x, SD_SHIFT), sd_asr(y, SD_SHIFT));
+}
+
+# ---- strokes ----------------------------------------------------------------------------------
+fn dashed(w, h, mode, path, width, cap, join, pat, n, off): i64 {
+    var cv = aa_canvas(w, h, mode);
+    sd_canvas_stroke_path_dash(cv, path, width, cap, join, 4 * SD_ONE, pat, n, off);
+    return cv;
+}
+
+fn solid(w, h, mode, path, width, cap, join): i64 {
+    var cv = aa_canvas(w, h, mode);
+    sd_canvas_stroke_path_ex(cv, path, width, cap, join, 4 * SD_ONE);
+    return cv;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var ONE = SD_ONE;
+    var BU = SD_CAP_BUTT;
+    var RO = SD_CAP_ROUND;
+    var SQ = SD_CAP_SQUARE;
+    var MI = SD_JOIN_MITER;
+    var JR = SD_JOIN_ROUND;
+    var BV = SD_JOIN_BEVEL;
+    var SUB = SD_AA_SUBSCANLINE;
+    var AREA = SD_AA_AREA;
+    g_arena = arena_new_growable(16777216);
+
+    # ── A) ALLOCATION: the dash buffer is lazy, then 0 B a call ────  (FIRST: cold figures)
+    # A solid styled stroke first, so the fill/stroke scratch and the edge batch are already warm
+    # and the figure below is the dash buffer ALONE. Every path here is built BEFORE the hook goes
+    # in: an SdPath is the caller's, on the seam, and would otherwise land on the arena.
+    var kw = sd_canvas_new(24, 8);
+    sd_canvas_stroke_path_ex(kw, hline(ONE, 9 * ONE, 4 * ONE), 2 * ONE, BU, MI, 4 * ONE);
+    check(_sd_dash_run, 0);                                       # 1 — nothing allocated yet
+    var kp = pat2(4 * ONE, 4 * ONE);
+    var kl = hline(0, 16 * ONE, 4 * ONE);
+    var ksq = square(2 * ONE, 2 * ONE, 20 * ONE, 6 * ONE);
+    var kc = sd_canvas_new(24, 8);
+    var g0 = alloc_used();
+    check(sd_canvas_stroke_path_dash(kc, kl, 2 * ONE, BU, MI, 4 * ONE, kp, 2, 0), SADISH_OK); # 2
+    check(alloc_used() - g0, 65536 + 8192 + 64);                  # 3 — MEASURED: 73,792 B, once
+    check(_sd_dash_cap, 8192);                                    # 4
+    g0 = alloc_used();
+    sd_canvas_stroke_path_dash(kc, kl, 2 * ONE, BU, MI, 4 * ONE, kp, 2, 0);
+    check(alloc_used() - g0, 0);                                  # 5 — warm: 0 B
+    # ...and 0 B on a consumer's hook too: a straight-line dash allocates no path, no point.
+    var ka = arena_used(g_arena);
+    check(sd_alloc_set(&hook_alloc), 0);                          # 6
+    g0 = alloc_used();
+    sd_canvas_stroke_path_dash(kc, kl, 2 * ONE, BU, MI, 4 * ONE, kp, 2, 0);
+    sd_canvas_stroke_path_dash(kc, ksq, 2 * ONE, SQ, MI, 4 * ONE, kp, 2, ONE);
+    check(alloc_used() - g0, 0);                                  # 7
+    check(arena_used(g_arena) - ka, 0);                           # 8
+    check(sd_alloc_set(0), &hook_alloc);                          # 9
+    check(_sd_dash_trunc, 0);                                     # 10
+
+    # ── B) [4, 4] ON A 16-px HORIZONTAL LINE AT INTEGER COORDINATES ────
+    # "M 0,4 L 16,4" at width 2: the band is x in [0, 16], y in [3, 5] — rows 3 and 4 whole, and
+    # every dash boundary on a pixel edge. Every pixel of the canvas is written out below.
+    var line = hline(0, 16 * ONE, 4 * ONE);
+    var p44 = pat2(4 * ONE, 4 * ONE);
+    var ink = "####....####........";
+    var gap = "....................";
+    var mode = SUB;
+    var abad = 0;
+    var a_sub = 0;
+    while (mode <= AREA) {
+        var ac = dashed(20, 8, mode, line, 2 * ONE, BU, MI, p44, 2, 0);
+        abad = abad + row_bad(ac, 3, ink) + row_bad(ac, 4, ink);
+        abad = abad + row_bad(ac, 0, gap) + row_bad(ac, 1, gap) + row_bad(ac, 2, gap);
+        abad = abad + row_bad(ac, 5, gap) + row_bad(ac, 6, gap) + row_bad(ac, 7, gap);
+        if (mode == SUB) { a_sub = ac; }
+        mode = mode + 1;
+    }
+    check(abad, 0);                                               # 11 — both engines, exactly
+    check(cov_sum(a_sub), 8 * 255 * 2);                           # 12 — 8 ink columns, 2 rows
+
+    # ── C) THE OFFSET SHIFTS THE PHASE ────
+    # offset 4 starts in the gap; 12 is the same phase one period on; -4 the same going back.
+    var shifted = "....####....####....";
+    var b4 = dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p44, 2, 4 * ONE);
+    check(row_bad(b4, 3, shifted) + row_bad(b4, 4, shifted), 0);  # 13
+    check(lit_rows(b4, 0, 3) + lit_rows(b4, 5, 8), 0);            # 14
+    check(cov_diff(b4, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p44, 2, 12 * ONE)), 0); # 15
+    check(cov_diff(b4, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p44, 2, 804 * ONE)), 0); # 16
+    check(cov_diff(b4, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p44, 2, 0 - 4 * ONE)), 0); # 17
+    check(cov_diff(b4, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p44, 2, 0 - 796 * ONE)), 0); # 18
+    check(cov_diff(a_sub, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p44, 2, 8 * ONE)), 0); # 19
+    check(cov_diff(a_sub, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p44, 2, 0 - 8 * ONE)), 0); # 20
+    # a fractional offset moves the boundary by a fraction of a pixel, not a whole one
+    var bh = dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p44, 2, ONE >> 1);
+    check(sd_canvas_coverage_at(bh, 3, 3), 127);                  # 21 — the dash ends at x = 3.5
+    check(sd_canvas_coverage_at(bh, 7, 3), 127);                  # 22 — the next starts at 7.5
+    check(sd_canvas_coverage_at(bh, 4, 3), 0);                    # 23
+    check(sd_canvas_coverage_at(bh, 2, 3), 255);                  # 24
+
+    # ── D) AN ODD COUNT IS THE ARRAY TWICE ────
+    var p3 = pat1(3 * ONE);
+    var p33 = pat2(3 * ONE, 3 * ONE);
+    var c1 = dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p3, 1, 0);
+    check(cov_diff(c1, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p33, 2, 0)), 0); # 25
+    check(cov_sum(c1) > 0, 1);                                    # 26
+    var p312 = pat_set(pat_set(pat_set(pat_new(3), 0, 3 * ONE), 1, ONE), 2, 2 * ONE);
+    var p312x2 = pat_new(6);
+    var ck = 0;
+    while (ck < 6) {
+        pat_set(p312x2, ck, load64(p312 + (ck % 3) * 8));
+        ck = ck + 1;
+    }
+    var c3 = dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p312, 3, 0);
+    check(cov_diff(c3, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p312x2, 6, 0)), 0); # 27
+    check(cov_diff(c3, c1) > 0, 1);                               # 28 — a different figure
+    # ⚠ AND NOT the array read once: [3, 1, 2] is on 3 off 1 on 2 off 3 on 1 off 2 and repeats every
+    # 12 px, where a 3-entry pattern read once would repeat every 6.
+    check(cov_diff(c3, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p312, 3, 6 * ONE)) > 0, 1); # 29
+    check(cov_diff(c3, dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p312, 3, 12 * ONE)), 0); # 30
+
+    # ── E) NO PATTERN IS SOLID — sd_canvas_stroke_path_ex's BYTES, EVERY CAP/JOIN PAIR ────
+    var zz = pat2(0, 0);
+    var sq_path = square(4 * ONE, 4 * ONE, 28 * ONE, 20 * ONE);
+    var dbad = 0;
+    var dret = 0;
+    var dcap = BU;
+    while (dcap <= SQ) {
+        var djoin = MI;
+        while (djoin <= BV) {
+            var ref = solid(32, 24, SUB, sq_path, 4 * ONE, dcap, djoin);
+            var d0 = aa_canvas(32, 24, SUB);
+            dret = dret + sd_canvas_stroke_path_dash(d0, sq_path, 4 * ONE, dcap, djoin, 4 * ONE,
+              0, 2, 0);
+            dbad = dbad + cov_diff(d0, ref);                          # pattern == 0
+            var d1 = aa_canvas(32, 24, SUB);
+            dret = dret + sd_canvas_stroke_path_dash(d1, sq_path, 4 * ONE, dcap, djoin, 4 * ONE,
+              p44, 0, 0);
+            dbad = dbad + cov_diff(d1, ref);                          # n == 0
+            var d2 = aa_canvas(32, 24, SUB);
+            dret = dret + sd_canvas_stroke_path_dash(d2, sq_path, 4 * ONE, dcap, djoin, 4 * ONE,
+              p44, 0 - 3, 0);
+            dbad = dbad + cov_diff(d2, ref);                          # n < 0
+            var d3 = aa_canvas(32, 24, SUB);
+            dret = dret + sd_canvas_stroke_path_dash(d3, sq_path, 4 * ONE, dcap, djoin, 4 * ONE,
+              zz, 2, 7 * ONE);
+            dbad = dbad + cov_diff(d3, ref);                          # every entry 0
+            var d4 = aa_canvas(32, 24, SUB);
+            dret = dret + sd_canvas_stroke_path_dash(d4, sq_path, 4 * ONE, dcap, djoin, 4 * ONE,
+              pat1(0), 1, 0);
+            dbad = dbad + cov_diff(d4, ref);                          # [0] -> [0, 0]
+            djoin = djoin + 1;
+        }
+        dcap = dcap + 1;
+    }
+    check(dbad, 0);                                               # 31 — nine pairs, five ways
+    check(dret, 0);                                               # 32 — SADISH_OK, 45 times
+
+    # ── F) A NEGATIVE ENTRY IS SADISH_ERR_BOUNDS, WITH NOTHING DRAWN ────
+    var ec = aa_canvas(32, 24, SUB);
+    sd_canvas_stroke_path_ex(ec, sq_path, 4 * ONE, BU, MI, 4 * ONE);  # pre-ink it
+    var ekeep = aa_canvas(32, 24, SUB);
+    memcpy(sd_canvas_coverage(ekeep), sd_canvas_coverage(ec), 32 * 24);
+    var eneg1 = pat2(4 * ONE, 0 - ONE);
+    var eneg0 = pat2(0 - 1, 4 * ONE);
+    var ebig2 = pat2(4611686018427387904, 4611686018427387904);       # 2 x 2^62: the sum wraps
+    var ebig1 = pat1(4611686018427387904);                            # odd: the doubling wraps
+    check(sd_canvas_stroke_path_dash(ec, line, 2 * ONE, BU, MI, 4 * ONE, eneg1, 2, 0),
+      SADISH_ERR_BOUNDS);                                         # 33
+    check(cov_diff(ec, ekeep), 0);                                # 34 — untouched
+    check(sd_canvas_stroke_path_dash(ec, line, 2 * ONE, BU, MI, 4 * ONE, eneg0, 2, 0),
+      SADISH_ERR_BOUNDS);                                         # 35 — entry 0 too
+    # a period that overflows i64 is the same refusal — as a sum, and as an odd count's doubling
+    check(sd_canvas_stroke_path_dash(ec, line, 2 * ONE, BU, MI, 4 * ONE, ebig2, 2, 0),
+      SADISH_ERR_BOUNDS);                                         # 36
+    check(sd_canvas_stroke_path_dash(ec, line, 2 * ONE, BU, MI, 4 * ONE, ebig1, 1, 0),
+      SADISH_ERR_BOUNDS);                                         # 37
+    check(cov_diff(ec, ekeep), 0);                                # 38
+    # the other refusals, shared with _ex
+    check(sd_canvas_stroke_path_dash(0, line, 2 * ONE, BU, MI, 4 * ONE, p44, 2, 0),
+      SADISH_ERR_BOUNDS);                                         # 39
+    check(sd_canvas_stroke_path_dash(ec, 0, 2 * ONE, BU, MI, 4 * ONE, p44, 2, 0),
+      SADISH_ERR_EMPTY_PATH);                                     # 40
+    check(sd_canvas_stroke_path_dash(ec, sd_path_new(), 2 * ONE, BU, MI, 4 * ONE, p44, 2, 0),
+      SADISH_ERR_EMPTY_PATH);                                     # 41
+    check(sd_canvas_stroke_path_dash(ec, line, 2 * ONE, 0 - 1, MI, 4 * ONE, p44, 2, 0),
+      SADISH_ERR_BOUNDS);                                         # 42
+    check(sd_canvas_stroke_path_dash(ec, line, 2 * ONE, 3, MI, 4 * ONE, p44, 2, 0),
+      SADISH_ERR_BOUNDS);                                         # 43
+    check(sd_canvas_stroke_path_dash(ec, line, 2 * ONE, BU, 0 - 1, 4 * ONE, p44, 2, 0),
+      SADISH_ERR_BOUNDS);                                         # 44
+    check(sd_canvas_stroke_path_dash(ec, line, 2 * ONE, BU, 3, 4 * ONE, p44, 2, 0),
+      SADISH_ERR_BOUNDS);                                         # 45
+    check(sd_canvas_stroke_path_dash(ec, line, 0, BU, MI, 4 * ONE, p44, 2, 0), SADISH_OK); # 46
+    check(sd_canvas_stroke_path_dash(ec, line, 1, BU, MI, 4 * ONE, p44, 2, 0), SADISH_OK); # 47
+    check(sd_canvas_stroke_path_dash(ec, line, 0 - 4 * ONE, BU, MI, 4 * ONE, p44, 2, 0),
+      SADISH_OK);                                                 # 48
+    check(cov_diff(ec, ekeep), 0);                                # 49 — width <= 0 drew nothing
+
+    # ── G) A ZERO-LENGTH ON-DASH IS A DOT: ROUND, SQUARE — AND NOTHING UNDER BUTT ────
+    # [0, 4] on the 16-px line puts dots at x = 0, 4, 8, 12, 16. The reference is five lone movetos,
+    # which take the SAME lone-point branch _sd_sb_subpath gives a subpath with no length.
+    var p04 = pat2(0, 4 * ONE);
+    var dots = sd_path_new();
+    var fk = 0;
+    while (fk <= 4) {
+        sd_path_moveto(dots, fk * 4 * ONE, 4 * ONE);
+        fk = fk + 1;
+    }
+    var fbad = 0;
+    mode = SUB;
+    while (mode <= AREA) {
+        fbad = fbad + cov_diff(dashed(20, 12, mode, line, 2 * ONE, RO, MI, p04, 2, 0),
+          solid(20, 12, mode, dots, 2 * ONE, RO, MI));
+        fbad = fbad + cov_diff(dashed(20, 12, mode, line, 2 * ONE, SQ, MI, p04, 2, 0),
+          solid(20, 12, mode, dots, 2 * ONE, SQ, MI));
+        fbad = fbad + cov_sum(dashed(20, 12, mode, line, 2 * ONE, BU, MI, p04, 2, 0));
+        mode = mode + 1;
+    }
+    check(fbad, 0);                                               # 50 — dots, both engines
+    var fro = dashed(20, 12, SUB, line, 2 * ONE, RO, MI, p04, 2, 0);
+    var fsq = dashed(20, 12, SUB, line, 2 * ONE, SQ, MI, p04, 2, 0);
+    check(cov_sum(fro) > 0, 1);                                   # 51 — the dots are really there
+    check(cov_diff(fro, fsq) > 0, 1);                             # 52 — a disc is not a square
+    var dotrow = "#..##..##..##..##...";
+    check(row_bad(fsq, 3, dotrow) + row_bad(fsq, 4, dotrow), 0);  # 53 — five 2x2 squares
+    check(lit_rows(fsq, 0, 3) + lit_rows(fsq, 5, 12), 0);         # 54
+    # a zero-length gap is not a boundary you can see: [4, 0] is solid ink
+    check(cov_diff(dashed(20, 12, SUB, line, 2 * ONE, BU, MI, pat2(4 * ONE, 0), 2, 0),
+        solid(20, 12, SUB, line, 2 * ONE, BU, MI)), 0);           # 55
+
+    # ── H) A CLOSED SQUARE DASHES AROUND ITS CLOSE, AND MEETS ITSELF WITH A JOIN ────
+    # The square (4,4)-(28,28) at width 4 has perimeter 96. [16, 16] at offset 8 puts on-dashes at
+    # d = [0,8), [24,40), [56,72), [88,96) — and the last runs THROUGH d = 96, the moveto point,
+    # into the first, so (4,4) is an INTERIOR vertex of one dash and takes the MITER join.
+    var gsq = square(4 * ONE, 4 * ONE, 28 * ONE, 28 * ONE);
+    var p1616 = pat2(16 * ONE, 16 * ONE);
+    # the same three dashes, spelled out, in the order the walk emits them (the wrap last)
+    var gref = sd_path_new();
+    sd_path_moveto(gref, 28 * ONE, 4 * ONE);
+    sd_path_lineto(gref, 28 * ONE, 20 * ONE);
+    sd_path_moveto(gref, 20 * ONE, 28 * ONE);
+    sd_path_lineto(gref, 4 * ONE, 28 * ONE);
+    sd_path_moveto(gref, 4 * ONE, 12 * ONE);
+    sd_path_lineto(gref, 4 * ONE, 4 * ONE);
+    sd_path_lineto(gref, 12 * ONE, 4 * ONE);
+    var gbad = 0;
+    mode = SUB;
+    while (mode <= AREA) {
+        gbad = gbad + cov_diff(dashed(34, 34, mode, gsq, 4 * ONE, BU, MI, p1616, 2, 8 * ONE),
+          solid(34, 34, mode, gref, 4 * ONE, BU, MI));
+        mode = mode + 1;
+    }
+    check(gbad, 0);                                               # 56 — the wrap, both engines
+    var gd = dashed(34, 34, SUB, gsq, 4 * ONE, BU, MI, p1616, 2, 8 * ONE);
+    check(sd_canvas_coverage_at(gd, 2, 2), 255);                  # 57 — the miter fills the corner
+    check(sd_canvas_coverage_at(gd, 3, 3), 255);                  # 58
+    # the same two dashes stroked APART leave that corner empty: two butt caps, not a join
+    var gapart = sd_path_new();
+    sd_path_moveto(gapart, 4 * ONE, 12 * ONE);
+    sd_path_lineto(gapart, 4 * ONE, 4 * ONE);
+    sd_path_moveto(gapart, 4 * ONE, 4 * ONE);
+    sd_path_lineto(gapart, 12 * ONE, 4 * ONE);
+    var ga = solid(34, 34, SUB, gapart, 4 * ONE, BU, MI);
+    check(sd_canvas_coverage_at(ga, 2, 2), 0);                    # 59 — the notch two caps leave
+    check(sd_canvas_coverage_at(ga, 3, 3), 0);                    # 60
+    check(cov_diff(gd, ga) > 0, 1);                               # 61
+    # a GAP that ends exactly at the moveto point does not wrap: the first dash is its own piece,
+    # capped at both ends. [16, 16] at offset 0 leaves d = [80, 96) a gap.
+    var gref0 = sd_path_new();
+    sd_path_moveto(gref0, 28 * ONE, 12 * ONE);
+    sd_path_lineto(gref0, 28 * ONE, 28 * ONE);
+    sd_path_moveto(gref0, 12 * ONE, 28 * ONE);
+    sd_path_lineto(gref0, 4 * ONE, 28 * ONE);
+    sd_path_lineto(gref0, 4 * ONE, 20 * ONE);
+    sd_path_moveto(gref0, 4 * ONE, 4 * ONE);
+    sd_path_lineto(gref0, 20 * ONE, 4 * ONE);
+    check(cov_diff(dashed(34, 34, SUB, gsq, 4 * ONE, BU, MI, p1616, 2, 0),
+        solid(34, 34, SUB, gref0, 4 * ONE, BU, MI)), 0);          # 62
+    check(cov_diff(dashed(34, 34, SUB, gsq, 4 * ONE, BU, MI, p1616, 2, 0),
+        dashed(34, 34, SUB, gsq, 4 * ONE, BU, MI, p1616, 2, 96 * ONE)), 0); # 63 — one period on
+    # a DASH that ends exactly at the moveto point takes its end cap there, and there is no head
+    # to wrap into: offset 16 puts on-dashes at d = [16,32), [48,64), [80,96).
+    var gref16 = sd_path_new();
+    sd_path_moveto(gref16, 20 * ONE, 4 * ONE);
+    sd_path_lineto(gref16, 28 * ONE, 4 * ONE);
+    sd_path_lineto(gref16, 28 * ONE, 12 * ONE);
+    sd_path_moveto(gref16, 28 * ONE, 28 * ONE);
+    sd_path_lineto(gref16, 12 * ONE, 28 * ONE);
+    sd_path_moveto(gref16, 4 * ONE, 20 * ONE);
+    sd_path_lineto(gref16, 4 * ONE, 4 * ONE);
+    check(cov_diff(dashed(34, 34, SUB, gsq, 4 * ONE, BU, MI, p1616, 2, 16 * ONE),
+        solid(34, 34, SUB, gref16, 4 * ONE, BU, MI)), 0);         # 64
+    check(sd_canvas_coverage_at(dashed(34, 34, SUB, gsq, 4 * ONE, BU, MI, p1616, 2, 16 * ONE),
+        2, 2), 0);                                                # 65 — a cap, so no corner
+
+    # ── I) A DASHED CUBIC: no gap inside an on-dash, no ink inside an off-gap ────
+    # The dash walk runs on the FLATTENED run, so the test walks the same polyline with the same
+    # arithmetic (arc_at) to find where each dash and gap sits, then reads the raster there.
+    var cur = scurve();
+    var cpl = sd_path_flatten(cur, ONE >> 2);
+    check(sd_polyline_count(cpl), 13);                            # 66 — MEASURED: 12 chords
+    var clen = poly_len(cpl);
+    check(clen, 4285212);                                         # 67 — MEASURED: 65.387 px
+    var p1010 = pat2(10 * ONE, 10 * ONE);
+    var hc = dashed(64, 64, SUB, cur, 4 * ONE, BU, MI, p1010, 2, 0);
+    var hmin = 255;
+    var hgap = 0;
+    var hd = 0;
+    while (hd + 20 * ONE < clen) {
+        var q = 1;
+        while (q <= 3) {                       # 1/4, 1/2 and 3/4 of the on-dash
+            var v = cov_at_arc(hc, cpl, hd + (q * 10 * ONE) / 4);
+            if (v < hmin) { hmin = v; }
+            q = q + 1;
+        }
+        hgap = hgap + cov_at_arc(hc, cpl, hd + 15 * ONE);             # the middle of the gap
+        hd = hd + 20 * ONE;
+    }
+    check(hmin, 255);                                             # 68 — no gap inside a dash
+    check(hgap, 0);                                               # 69 — no ink inside a gap
+    # SQUARE caps extend hw past each end and still leave the gap's middle clear
+    var hsq = dashed(64, 64, SUB, cur, 4 * ONE, SQ, MI, p1010, 2, 0);
+    var hgap2 = 0;
+    hd = 0;
+    while (hd + 20 * ONE < clen) {
+        hgap2 = hgap2 + cov_at_arc(hsq, cpl, hd + 15 * ONE);
+        hd = hd + 20 * ONE;
+    }
+    check(hgap2, 0);                                              # 70
+    check(cov_sum(hsq) > cov_sum(hc), 1);                         # 71 — the caps really extend
+    # and a dash never reaches past the solid stroke it is cut from
+    check(cov_over(hc, solid(64, 64, SUB, cur, 4 * ONE, BU, MI)), 0); # 72 — MEASURED
+    check(cov_over(hsq, solid(64, 64, SUB, cur, 4 * ONE, SQ, MI)), 0); # 73
+    check(cov_sum(hc) * 2 < cov_sum(solid(64, 64, SUB, cur, 4 * ONE, BU, MI)) * 3, 1); # 74
+    # ⭐ THE INSIDE-A-CURVE JOIN RULE SURVIVES THE CUT. The cusp's 150° flattened turn is rounded,
+    # not mitred, in a dash exactly as in a solid stroke: rows 0..8 stay clear of the 6 px spike a
+    # miter at limit 4 would put there.
+    var cu = cusp();
+    var icusp = dashed(60, 40, SUB, cu, 4 * ONE, BU, MI, pat2(12 * ONE, 6 * ONE), 2, 0);
+    check(lit_rows(icusp, 0, 9), 0);                              # 75
+    check(lit_rows(solid(60, 40, SUB, cu, 4 * ONE, BU, MI), 0, 9), 0); # 76
+    check(cov_sum(icusp) > 0, 1);                                 # 77
+
+    # ── J) A PATTERN LONGER THAN THE PATH IS ONE DASH, WITH NO WRAP ────
+    # 1,000 px of on over a 16 px line, a 96 px perimeter or a 65 px cubic: the solid stroke's
+    # bytes exactly, for every cap/join pair but ROUND/ROUND — which _ex sends to the 0.4.0
+    # piece-per-pass stroker (see the header of src/dash.cyr).
+    var plong = pat1(1000 * ONE);
+    var ibad = 0;
+    var icap = BU;
+    while (icap <= SQ) {
+        var ijoin = MI;
+        while (ijoin <= BV) {
+            var rr = 0;
+            if (icap == RO) {
+                if (ijoin == JR) { rr = 1; }
+            }
+            if (rr == 0) {
+                ibad = ibad + cov_diff(dashed(20, 12, SUB, line, 4 * ONE, icap, ijoin, plong, 1, 0),
+                  solid(20, 12, SUB, line, 4 * ONE, icap, ijoin));
+                ibad = ibad + cov_diff(dashed(34, 34, SUB, gsq, 4 * ONE, icap, ijoin, plong, 1, 0),
+                  solid(34, 34, SUB, gsq, 4 * ONE, icap, ijoin));
+                ibad = ibad + cov_diff(dashed(64, 64, SUB, cur, 4 * ONE, icap, ijoin, plong, 1, 0),
+                  solid(64, 64, SUB, cur, 4 * ONE, icap, ijoin));
+            }
+            ijoin = ijoin + 1;
+        }
+        icap = icap + 1;
+    }
+    check(ibad, 0);                                               # 78 — eight pairs, three paths
+    # the closed square under one dash keeps its closing JOIN — no caps anywhere
+    check(sd_canvas_coverage_at(dashed(34, 34, SUB, gsq, 4 * ONE, BU, MI, plong, 1, 0), 2, 2),
+      255);                                                       # 79 — the corner at the close
+    # ⚠ ROUND/ROUND is the documented exception: a real pattern takes the STYLED geometry, which is
+    # not the 0.4.0 stroker's per-piece MAX. MEASURED on the cubic: 28 pixels, up to 27 levels.
+    var jr1 = dashed(64, 64, SUB, cur, 4 * ONE, RO, JR, plong, 1, 0);
+    var jr2 = solid(64, 64, SUB, cur, 4 * ONE, RO, JR);
+    check(cov_diff(jr1, jr2), 28);                                # 80 — MEASURED
+    check(cov_maxdiff(jr1, jr2), 27);                             # 81 — MEASURED
+    # ...and inside ONE curve verb the join style does not apply at all, so a dashed ROUND/ROUND is
+    # a dashed ROUND/MITER here, to the byte — the styled geometry, not a round-join accident.
+    check(cov_diff(jr1, dashed(64, 64, SUB, cur, 4 * ONE, RO, MI, plong, 1, 0)), 0); # 82
+    # a gap longer than the path draws nothing at all
+    var pgap = pat2(ONE, 1000 * ONE);
+    check(cov_sum(dashed(20, 12, SUB, line, 4 * ONE, RO, MI, pgap, 2, 2 * ONE)), 0); # 83
+    check(cov_sum(dashed(34, 34, SUB, gsq, 4 * ONE, RO, MI, pgap, 2, 2 * ONE)), 0); # 84
+    check(cov_sum(dashed(64, 64, SUB, cur, 4 * ONE, RO, MI, pgap, 2, 2 * ONE)), 0); # 85
+
+    # ── K) LENGTH TRUNCATION DOES NOT CREEP ────
+    # K1. AXIS-ALIGNED, WHERE sd_isqrt IS EXACT: 1,000 one-pixel segments dash byte-identically to
+    # the 2-point chord of the same 1,000 px. Every dash boundary in both is the same raw value —
+    # zero drift over 1,000 accumulations, not "small" drift.
+    var jpoly = steps(2 * ONE, 4 * ONE, ONE, 0, 1000);
+    var jchord = hline(2 * ONE, 1002 * ONE, 4 * ONE);
+    var jp = dashed(1006, 8, SUB, jpoly, 2 * ONE, BU, MI, p44, 2, 0);
+    var jc = dashed(1006, 8, SUB, jchord, 2 * ONE, BU, MI, p44, 2, 0);
+    check(cov_diff(jp, jc), 0);                                   # 86 — exactly zero drift
+    check(cov_sum(jp), 1000 * 255);                               # 87 — 500 ink columns, 2 rows
+    check(sd_canvas_coverage_at(jp, 1001, 3), 0);                 # 88 — the last gap
+    check(sd_canvas_coverage_at(jp, 997, 3), 255);                # 89 — the last dash
+    # K2. THE BOUND, MEASURED. A (1,1) px step is sqrt(2) px, which sd_isqrt floors: the walk falls
+    # short by under 1 raw unit a segment, one-sided, so a dash boundary creeps FORWARD by under
+    # (segments) raw units. Over 1,000 of them that is 900 — 0.0137 px; a whole pixel of creep
+    # would take 65,536 segments.
+    var junit = sd_isqrt(2 * ONE * ONE);
+    check(junit, 92681);                                          # 90 — floor(sqrt(2) * 65536)
+    var jexact = sd_isqrt(2 * (1000 * ONE) * (1000 * ONE));
+    check(jexact, 92681900);                                      # 91 — the chord, in one isqrt
+    check(jexact - 1000 * junit, 900);                            # 92 — MEASURED drift, raw units
+    check(jexact - 1000 * junit < 1000, 1);                       # 93 — inside the per-segment bound
+    check(jexact - 1000 * junit < ONE, 1);                        # 94 — under one pixel
+    # and in the raster: 100 diagonal steps against their chord, dashed so a boundary lands near the
+    # far end (90 raw units of drift there), differ by at most one coverage level.
+    check(sd_isqrt(2 * (100 * ONE) * (100 * ONE)) - 100 * junit, 90); # 95 — MEASURED
+    var jd = steps(2 * ONE, 2 * ONE, ONE, ONE, 100);
+    var jdc = sd_path_new();
+    sd_path_moveto(jdc, 2 * ONE, 2 * ONE);
+    sd_path_lineto(jdc, 102 * ONE, 102 * ONE);
+    var jplong = pat2(130 * ONE, 4 * ONE);
+    var jda = dashed(106, 106, SUB, jd, 3 * ONE, BU, MI, jplong, 2, 0);
+    var jdb = dashed(106, 106, SUB, jdc, 3 * ONE, BU, MI, jplong, 2, 0);
+    check(cov_maxdiff(jda, jdb), 1);                              # 96 — MEASURED: one level
+    check(cov_sum(jda) > 0, 1);                                   # 97
+
+    # ── L) THE CHORD-LENGTH APPROXIMATION, MEASURED ────
+    # Dash lengths follow the FLATTENED polyline, which is always SHORTER than the arc, so dashes
+    # run slightly long on a curve. The shortfall is about s / (3R) for a chord of sagitta s on
+    # curvature radius R — it grows as a curve tightens and vanishes on a straight run.
+    var ncirc = circle4(32 * ONE, 32 * ONE, 20 * ONE);
+    var ncoarse = poly_len(sd_path_flatten(ncirc, ONE >> 2));
+    var nfine = poly_len(sd_path_flatten(ncirc, ONE >> 8));
+    check(sd_polyline_count(sd_path_flatten(ncirc, ONE >> 2)), 17); # 98 — 16 chords, r = 20 px
+    check(ncoarse, 8184008);                                      # 99 — MEASURED
+    check(nfine, 8236106);                                        # 100 — MEASURED, tol / 64
+    check(nfine - ncoarse, 52098);                                # 101 — 0.63 % short, 0.79 px
+    check((nfine - ncoarse) * 100 < nfine, 1);                    # 102 — under 1 % of the arc
+    check(ncoarse < nfine, 1);                                    # 103 — one-sided: always short
+    var scoarse = poly_len(sd_path_flatten(cur, ONE >> 2));
+    var sfine = poly_len(sd_path_flatten(cur, ONE >> 8));
+    check(sfine - scoarse, 12068);                                # 104 — MEASURED: 0.28 % on the S
+    check(scoarse < sfine, 1);                                    # 105
+    # a straight run has none of it at all
+    check(poly_len(sd_path_flatten(jchord, ONE >> 2)),
+      poly_len(sd_path_flatten(jchord, ONE >> 8)));               # 106
+
+    # ── M) THE CLIP ────
+    # The flush multiplies by the clip mask, so a dashed stroke is its unclipped self inside the
+    # clip rect and 0 outside.
+    var lu = dashed(20, 8, SUB, line, 2 * ONE, BU, MI, p44, 2, 0);
+    var lc = aa_canvas(20, 8, SUB);
+    sd_canvas_clip_push_rect(lc, 2, 0, 10, 8);
+    sd_canvas_stroke_path_dash(lc, line, 2 * ONE, BU, MI, 4 * ONE, p44, 2, 0);
+    var lbad = 0;
+    var ly = 0;
+    while (ly < 8) {
+        var lx = 0;
+        while (lx < 20) {
+            var want = 0;
+            if (lx >= 2) {
+                if (lx < 10) { want = sd_canvas_coverage_at(lu, lx, ly); }
+            }
+            if (sd_canvas_coverage_at(lc, lx, ly) != want) { lbad = lbad + 1; }
+            lx = lx + 1;
+        }
+        ly = ly + 1;
+    }
+    check(lbad, 0);                                               # 107
+    check(cov_sum(lc) > 0, 1);                                    # 108
+    sd_canvas_clip_pop(lc);
+    # a path clip, on the exact engine too
+    var lp = aa_canvas(64, 64, AREA);
+    sd_canvas_clip_push_path(lp, square(10 * ONE, 10 * ONE, 50 * ONE, 50 * ONE), SD_FILL_NONZERO);
+    sd_canvas_stroke_path_dash(lp, cur, 4 * ONE, BU, MI, 4 * ONE, p1010, 2, 0);
+    check(lit_rows(lp, 0, 10), 0);                                # 109
+    check(lit_rows(lp, 50, 64), 0);                               # 110
+    check(cov_sum(lp) > 0, 1);                                    # 111
+    sd_canvas_clip_pop(lp);
+
+    # ── N) THE PATTERN RESTARTS AT EVERY SUBPATH ────
+    var mp = sd_path_new();
+    sd_path_moveto(mp, 0, 2 * ONE);
+    sd_path_lineto(mp, 16 * ONE, 2 * ONE);
+    sd_path_moveto(mp, 0, 6 * ONE);
+    sd_path_lineto(mp, 16 * ONE, 6 * ONE);
+    var mc = dashed(20, 10, SUB, mp, 2 * ONE, BU, MI, p44, 2, 0);
+    check(row_bad(mc, 1, ink) + row_bad(mc, 2, ink), 0);          # 112 — subpath 1
+    check(row_bad(mc, 5, ink) + row_bad(mc, 6, ink), 0);          # 113 — subpath 2, same phase
+    check(lit_rows(mc, 0, 1) + lit_rows(mc, 3, 5) + lit_rows(mc, 7, 10), 0); # 114
+    # two closed squares in one path, both wrapping: the head of the first must not leak into the
+    # second. Each is the one-square stroke, translated.
+    var m2 = sd_path_new();
+    sd_path_moveto(m2, 4 * ONE, 4 * ONE);
+    sd_path_lineto(m2, 28 * ONE, 4 * ONE);
+    sd_path_lineto(m2, 28 * ONE, 28 * ONE);
+    sd_path_lineto(m2, 4 * ONE, 28 * ONE);
+    sd_path_close(m2);
+    sd_path_moveto(m2, 4 * ONE, 36 * ONE);
+    sd_path_lineto(m2, 28 * ONE, 36 * ONE);
+    sd_path_lineto(m2, 28 * ONE, 60 * ONE);
+    sd_path_lineto(m2, 4 * ONE, 60 * ONE);
+    sd_path_close(m2);
+    var m2c = dashed(34, 66, SUB, m2, 4 * ONE, BU, MI, p1616, 2, 8 * ONE);
+    var m2bad = 0;
+    var m2y = 0;
+    while (m2y < 32) {
+        var m2x = 0;
+        while (m2x < 34) {
+            if (sd_canvas_coverage_at(m2c, m2x, m2y) !=
+              sd_canvas_coverage_at(m2c, m2x, m2y + 32)) { m2bad = m2bad + 1; }
+            m2x = m2x + 1;
+        }
+        m2y = m2y + 1;
+    }
+    check(m2bad, 0);                                              # 115 — the second is the first
+    check(cov_diff(m2c, gd) > 0, 1);                              # 116 — and both are drawn
+    # a subpath of one point is inked only when the phase is ON where it sits
+    var mlone = sd_path_new();
+    sd_path_moveto(mlone, 8 * ONE, 5 * ONE);
+    check(cov_sum(dashed(16, 12, SUB, mlone, 4 * ONE, RO, MI, p44, 2, 0)) > 0, 1); # 117
+    check(cov_diff(dashed(16, 12, SUB, mlone, 4 * ONE, RO, MI, p44, 2, 0),
+        solid(16, 12, SUB, mlone, 4 * ONE, RO, MI)), 0);          # 118
+    check(cov_sum(dashed(16, 12, SUB, mlone, 4 * ONE, RO, MI, p44, 2, 5 * ONE)), 0); # 119 — a gap
+    check(cov_sum(dashed(16, 12, SUB, mlone, 4 * ONE, BU, MI, p44, 2, 0)), 0); # 120 — BUTT
+    # a drawing verb after CLOSE restarts at the moveto point, as the solid styled path does
+    var mz = sd_path_new();
+    sd_path_moveto(mz, 4 * ONE, 4 * ONE);
+    sd_path_lineto(mz, 28 * ONE, 4 * ONE);
+    sd_path_lineto(mz, 28 * ONE, 20 * ONE);
+    sd_path_close(mz);
+    sd_path_lineto(mz, 4 * ONE, 20 * ONE);
+    check(cov_diff(dashed(34, 26, SUB, mz, 4 * ONE, BU, MI, plong, 1, 0),
+        solid(34, 26, SUB, mz, 4 * ONE, BU, MI)), 0);             # 121
+
+    # ── O) THE BATCH LIMIT STILL FLUSHES, AND A DASHED STROKE SURVIVES IT ────
+    # SD_STROKE_BATCH_CAP bounds the batch (stroke.cyr); dashes are disjoint pieces, so flushing
+    # between them costs no ink at all.
+    var okeep = SD_STROKE_BATCH_CAP;
+    var ofull = dashed(64, 64, SUB, cur, 4 * ONE, SQ, MI, p1010, 2, 0);
+    SD_STROKE_BATCH_CAP = SD_STROKE_BATCH_MIN;
+    var osmall = dashed(64, 64, SUB, cur, 4 * ONE, SQ, MI, p1010, 2, 0);
+    SD_STROKE_BATCH_CAP = okeep;
+    check(cov_diff(ofull, osmall), 0);                            # 122
+    check(_sd_dash_trunc, 0);                                     # 123
+
+    # ── P) THE PIECE BUFFER GROWS, AND CARRIES THE CURVE FLAGS OVER ────
+    # ⭐ One dash of 9,013 points needs 9,013 slots: the buffer doubles to 16,384 (16,384 * 8 ptrs +
+    # 16,384 flag bytes = 147,456 B, once). The path is the CUSP followed by 9,000 distinct points,
+    # so the flags that make the stroker round its 150° turn are written at slots 1..12 — long
+    # before the growth at slot 8,192 — and a growth that did not copy them would mitre the cusp
+    # back into the 6 px spike stroke_style_test pins. The solid stroke runs FIRST so the run, the
+    # flags and the batch are already grown and the figure below is the piece buffer alone.
+    var pv = cusp_tail(9000, 8);
+    var pref = solid(60, 40, SUB, pv, 4 * ONE, BU, MI);
+    check(_sd_stroke_run_cap >= 16384, 1);                        # 124
+    check(lit_rows(pref, 0, 9), 0);                               # 125 — solid: the cusp is round
+    var pd = aa_canvas(60, 40, SUB);             # the canvases BEFORE the figure is measured
+    var pd2 = aa_canvas(60, 40, SUB);
+    check(sd_alloc_set(&hook_alloc), 0);                          # 126
+    var pa = arena_used(g_arena);
+    g0 = alloc_used();
+    sd_canvas_stroke_path_dash(pd, pv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0);
+    check(alloc_used() - g0, 131072 + 16384);                     # 127 — MEASURED: 147,456 B
+    check(arena_used(g_arena) - pa, 1248);                        # 128 — the cubic's mid-points
+    check(_sd_dash_cap, 16384);                                   # 129
+    check(cov_diff(pd, pref), 0);                                 # 130 — the flags crossed intact
+    check(lit_rows(pd, 0, 9), 0);                                 # 131 — and no miter spike
+    g0 = alloc_used();
+    pa = arena_used(g_arena);
+    sd_canvas_stroke_path_dash(pd2, pv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0);
+    check(alloc_used() - g0, 0);                                  # 132 — warm: 0 B of buffer
+    check(arena_used(g_arena) - pa, 1248);                        # 133 — and the mid-points again
+    check(sd_alloc_set(0), &hook_alloc);                          # 134
+    arena_reset(g_arena);
+    check(_sd_dash_trunc, 0);                                     # 135
+    var pdd = dashed(60, 40, SUB, pv, 4 * ONE, BU, MI, pat2(4 * ONE, 4 * ONE), 2, 0);
+    check(cov_diff(pdd, pref) > 0, 1);                            # 136 — and it really dashes
+
+    # ── Q) THE CUTS THE GROUPS ABOVE CANNOT REACH ────
+    # Q1. A WRAP WHOSE LAST DASH ENDS EXACTLY AT THE CLOSING POINT. With [10, 5, 3, 2] at offset 2
+    # on the 96 px perimeter the phase at d = 96 is 18 — the exact end of the on-entry [15, 18) —
+    # while the phase at d = 0 is 2, inside the on-entry [0, 10). So a dash ends AT the moveto
+    # point and another begins there: the meeting is a JOIN, and only because the arrival back at
+    # p[0] does NOT fire its zero-length handling (which would cap the dash and strand the head).
+    var q4 = pat_new(4);
+    pat_set(q4, 0, 10 * ONE);
+    pat_set(q4, 1, 5 * ONE);
+    pat_set(q4, 2, 3 * ONE);
+    pat_set(q4, 3, 2 * ONE);
+    var qd = dashed(34, 34, SUB, gsq, 4 * ONE, BU, MI, q4, 4, 2 * ONE);
+    check(sd_canvas_coverage_at(qd, 2, 2), 255);                  # 137 — the miter at the close
+    check(sd_canvas_coverage_at(qd, 3, 3), 255);                  # 138
+    # the same wrap dash (d = [93, 96) + [0, 8)) stroked as two pieces leaves that corner empty
+    var qapart = sd_path_new();
+    sd_path_moveto(qapart, 4 * ONE, 7 * ONE);
+    sd_path_lineto(qapart, 4 * ONE, 4 * ONE);
+    sd_path_moveto(qapart, 4 * ONE, 4 * ONE);
+    sd_path_lineto(qapart, 12 * ONE, 4 * ONE);
+    check(sd_canvas_coverage_at(solid(34, 34, SUB, qapart, 4 * ONE, BU, MI), 2, 2), 0); # 139
+    check(cov_sum(qd) > 0, 1);                                    # 140
+    # Q2. A NEGATIVE ENTRY THAT KEEPS THE RUNNING SUM POSITIVE. -1 raw against 4 px: only the
+    # per-entry test can refuse it — the period-overflow guard never sees a negative total.
+    var qneg = pat2(4 * ONE, 0 - 1);
+    var qc0 = aa_canvas(32, 24, SUB);
+    sd_canvas_stroke_path_ex(qc0, sq_path, 4 * ONE, BU, MI, 4 * ONE);
+    var qkeep = aa_canvas(32, 24, SUB);
+    memcpy(sd_canvas_coverage(qkeep), sd_canvas_coverage(qc0), 32 * 24);
+    check(sd_canvas_stroke_path_dash(qc0, line, 2 * ONE, BU, MI, 4 * ONE, qneg, 2, 0),
+      SADISH_ERR_BOUNDS);                                         # 141
+    check(cov_diff(qc0, qkeep), 0);                               # 142
+    # Q3. A DASH THAT BEGINS INSIDE A CURVE carries ITS OWN curve flags, not the run's at the same
+    # index. "M 2,30 L 10,30 C 50,5 10,5 50,30" with a 35 px gap first starts the dash one vertex
+    # before the cusp, so the cusp sits at piece index 1 — where the run's flags read 0 (the
+    # straight lead-in) and the piece's read 1. Reading the run's would mitre it into the spike.
+    var qlc = dashed(60, 40, SUB, leadcusp(), 4 * ONE, BU, MI, pat2(1000 * ONE, 35 * ONE), 2,
+      1000 * ONE);
+    check(lit_rows(qlc, 0, 9), 0);                                # 143 — still round
+    check(cov_sum(qlc), 30016);                                   # 144 — MEASURED
+    # Q4. THE BUFFER IS REWOUND AFTER EVERY DASH. 10,002 dashes of 0.05 px on the 1,000 px line
+    # would need 20,004 slots if the pieces piled up; one dash needs 2, so the buffer never grows
+    # past what group P left it at.
+    var qcap = _sd_dash_cap;
+    var qtiny = aa_canvas(1006, 8, SUB);
+    sd_canvas_stroke_path_dash(qtiny, jchord, 2 * ONE, BU, MI, 4 * ONE,
+      pat2(ONE / 20, ONE / 20), 2, 0);
+    check(_sd_dash_cap, qcap);                                    # 145
+    check(cov_sum(qtiny) > 100000, 1);                            # 146 — and it drew the dashes
+
+    # ── R) OUT OF MEMORY: THE PIECE BUFFER DEGRADES, IT DOES NOT OVERRUN ────
+    # One dash of 17,013 points against a 16,384-slot buffer whose growth is REFUSED (raster.cyr's
+    # _sd_grow_limit, the knob grow_edges_test drives the same path with): the dash keeps the
+    # points that fit, records it, allocates nothing and never writes past the array. The run is
+    # grown first, so the only refusal is the piece buffer's.
+    var rv = cusp_tail(17000, 64);
+    var rref = solid(60, 50, SUB, rv, 4 * ONE, BU, MI);
+    check(_sd_stroke_run_cap >= 32768, 1);                        # 147
+    check(_sd_dash_cap, 16384);                                   # 148
+    var rc = aa_canvas(60, 50, SUB);
+    # ⭐ Through the PUBLIC knob, and back to the SHIPPED ceiling after — everything above ran under
+    # it, which is what makes the MEASURED figures in groups A and P the figures a consumer sees.
+    check(sd_grow_limit_get(), SD_GROW_LIMIT_DEFAULT);            # 149
+    sd_grow_limit_set(1);
+    sd_alloc_set(&hook_alloc);                   # the cubic's mid-points go to the arena, as ever
+    g0 = alloc_used();
+    check(sd_canvas_stroke_path_dash(rc, rv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0),
+      SADISH_OK);                                                 # 150
+    check(alloc_used() - g0, 0);                                  # 151 — nothing allocated
+    check(_sd_dash_trunc, 1);                                     # 152 — and recorded
+    check(_sd_dash_cap, 16384);                                   # 153 — the block is kept
+    sd_alloc_set(0);
+    arena_reset(g_arena);
+    sd_grow_limit_set(SD_GROW_LIMIT_DEFAULT);
+    check(cov_sum(rc) > 0, 1);                                    # 154 — a prefix is drawn
+    check(cov_over(rc, rref), 0);                                 # 155 — never past the whole stroke
+    check(cov_diff(rc, rref) > 0, 1);                             # 156 — and it really is short
+    var rfull = dashed(60, 50, SUB, rv, 4 * ONE, BU, MI, plong, 1, 0);
+    check(_sd_dash_trunc, 0);                                     # 157 — the next call resets it
+    check(cov_diff(rfull, rref), 0);                              # 158 — and draws the whole thing
+
+    # ── S) ENDS, WRAPS AND PHASES — the cuts a review found the groups above could not reach ────
+    # ⛔ Every case here was a LIVE DEFECT or a surviving mutant before it was written. They are one
+    # group because they share a shape: a boundary that lands EXACTLY on a vertex the walk treats
+    # specially — the last point of an open subpath, the closing point of a closed one, or distance
+    # zero itself — where the wrong answer is invisible under SD_CAP_BUTT and only under BUTT.
+    #
+    # S1. A DASH THE PATH RAN OUT OF IS NOT A DOT. "M 2,4 L 18,4" is 16 px = one [4, 12] period, so
+    # the gap ends EXACTLY at the far end and the pattern turns on there with no path left. SVG asks
+    # for a 4 px dash; there is none to draw. Emitting the lone start point instead put a full disc
+    # (ROUND) or a 2*hw square (SQUARE) at x = 18 — 12 px into a gap the pattern declares empty.
+    var s_line = hline(2 * ONE, 18 * ONE, 4 * ONE);
+    var s_only = hline(2 * ONE, 6 * ONE, 4 * ONE);        # the one on-dash [0, 4), and nothing else
+    var p412 = pat2(4 * ONE, 12 * ONE);
+    var sbad = 0;
+    mode = SUB;
+    while (mode <= AREA) {
+        var scap = BU;
+        while (scap <= SQ) {
+            sbad = sbad + cov_diff(dashed(24, 10, mode, s_line, 4 * ONE, scap, MI, p412, 2, 0),
+              solid(24, 10, mode, s_only, 4 * ONE, scap, MI));
+            scap = scap + 1;
+        }
+        mode = mode + 1;
+    }
+    check(sbad, 0);                                               # 159 — three caps, both engines
+    check(sd_canvas_coverage_at(dashed(24, 10, SUB, s_line, 4 * ONE, RO, MI, p412, 2, 0), 17, 4),
+      0);                                                         # 160 — nothing past the dash
+    check(cov_sum(dashed(24, 10, SUB, s_line, 4 * ONE, RO, MI, p412, 2, 0)) > 0, 1); # 161
+    # the everyday case: 100 px of [10, 10] is five dashes and five gaps, not five dashes and a dot
+    var s100 = hline(4 * ONE, 104 * ONE, 6 * ONE);
+    var s5 = sd_path_new();
+    var sk = 0;
+    while (sk < 5) {
+        sd_path_moveto(s5, 4 * ONE + sk * 20 * ONE, 6 * ONE);
+        sd_path_lineto(s5, 14 * ONE + sk * 20 * ONE, 6 * ONE);
+        sk = sk + 1;
+    }
+    var s100d = dashed(112, 14, SUB, s100, 4 * ONE, RO, MI, p1010, 2, 0);
+    check(cov_diff(s100d, solid(112, 14, SUB, s5, 4 * ONE, RO, MI)), 0); # 162
+    check(sd_canvas_coverage_at(s100d, 104, 6), 0);               # 163 — the bare endpoint
+    # ⭐ THE OTHER SIDE OF THE RULE, so the fix cannot be read as "never ink at the end": a genuine
+    # zero-LENGTH on ENTRY there IS still a dot. [0, 4] on the 16-px line puts one at x = 16, and
+    # group G already reads it against a lone moveto (checks 50, 53).
+    check(sd_canvas_coverage_at(dashed(20, 12, SUB, line, 2 * ONE, RO, MI, p04, 2, 0), 16, 4) > 0,
+      1);                                                         # 164
+    check(sd_canvas_coverage_at(dashed(20, 12, SUB, line, 2 * ONE, SQ, MI, p04, 2, 0), 16, 4),
+      255);                                                       # 165
+
+    # S2. A CLOSED SUBPATH WHOSE PHASE BEGINS IN A ZERO-LENGTH OFF ENTRY. Then p[0] is not put as
+    # the head's first point — the drain at distance 0 starts the head at a CUT point instead — and
+    # that cut has to be a record of its own, because every dash after it starts at the shared one.
+    # ⛔ It was not: the head, stroked alone when the walk came back inside a gap, ran from wherever
+    # the LAST dash of the subpath began. The rect (4,4)-(32,20) under [4, 0, 4, 8] at offset 4 drew
+    # (4,12) -> (8,4), a diagonal straight across the shape's inside.
+    var srect = sd_path_new();
+    sd_path_moveto(srect, 4 * ONE, 6 * ONE);
+    sd_path_lineto(srect, 32 * ONE, 6 * ONE);
+    sd_path_lineto(srect, 32 * ONE, 22 * ONE);
+    sd_path_lineto(srect, 4 * ONE, 22 * ONE);
+    sd_path_close(srect);
+    var s4048 = pat_new(4);
+    pat_set(s4048, 0, 4 * ONE);
+    pat_set(s4048, 1, 0);
+    pat_set(s4048, 2, 4 * ONE);
+    pat_set(s4048, 3, 8 * ONE);
+    # The perimeter is 88: A(4,6) d=0, B(32,6) d=28, C(32,22) d=44, D(4,22) d=72, A d=88. ⚠ The
+    # moveto point is OFF the diagonal (x != y) on purpose — a relocation that swapped the cut's two
+    # coordinates would be invisible at (4,4). The phase at distance 0 is the zero-length off entry
+    # 1, so the head is the on-entry 2 over d = [0, 4); the walk comes back at d = 88 inside the off
+    # entry [84, 92), so the head is its own piece.
+    var sref = sd_path_new();
+    sd_path_moveto(sref, 4 * ONE, 6 * ONE);       # the HEAD, d = [0, 4)
+    sd_path_lineto(sref, 8 * ONE, 6 * ONE);
+    sd_path_moveto(sref, 16 * ONE, 6 * ONE);      # d = [12, 16)
+    sd_path_lineto(sref, 20 * ONE, 6 * ONE);
+    sd_path_moveto(sref, 20 * ONE, 6 * ONE);      # d = [16, 20)
+    sd_path_lineto(sref, 24 * ONE, 6 * ONE);
+    sd_path_moveto(sref, 32 * ONE, 6 * ONE);      # d = [28, 32), starting AT corner B
+    sd_path_lineto(sref, 32 * ONE, 10 * ONE);
+    sd_path_moveto(sref, 32 * ONE, 10 * ONE);     # d = [32, 36)
+    sd_path_lineto(sref, 32 * ONE, 14 * ONE);
+    sd_path_moveto(sref, 32 * ONE, 22 * ONE);     # d = [44, 48), starting AT corner C
+    sd_path_lineto(sref, 28 * ONE, 22 * ONE);
+    sd_path_moveto(sref, 28 * ONE, 22 * ONE);     # d = [48, 52)
+    sd_path_lineto(sref, 24 * ONE, 22 * ONE);
+    sd_path_moveto(sref, 16 * ONE, 22 * ONE);     # d = [60, 64)
+    sd_path_lineto(sref, 12 * ONE, 22 * ONE);
+    sd_path_moveto(sref, 12 * ONE, 22 * ONE);     # d = [64, 68)
+    sd_path_lineto(sref, 8 * ONE, 22 * ONE);
+    sd_path_moveto(sref, 4 * ONE, 18 * ONE);      # d = [76, 80)
+    sd_path_lineto(sref, 4 * ONE, 14 * ONE);
+    sd_path_moveto(sref, 4 * ONE, 14 * ONE);      # d = [80, 84) — where the stale head start was
+    sd_path_lineto(sref, 4 * ONE, 10 * ONE);
+    var s2bad = 0;
+    mode = SUB;
+    while (mode <= AREA) {
+        s2bad = s2bad + cov_diff(dashed(40, 28, mode, srect, 3 * ONE, BU, MI, s4048, 4, 4 * ONE),
+          solid(40, 28, mode, sref, 3 * ONE, BU, MI));
+        mode = mode + 1;
+    }
+    check(s2bad, 0);                                              # 166 — both engines, exactly
+    var s2c = dashed(40, 28, SUB, srect, 3 * ONE, BU, MI, s4048, 4, 4 * ONE);
+    check(sd_canvas_coverage_at(s2c, 6, 12), 0);                  # 167 — 4.5 px INSIDE the rect,
+    check(sd_canvas_coverage_at(s2c, 5, 7), 127);                 # 168 — and the head really is
+    check(sd_canvas_coverage_at(s2c, 4, 5), 255);                 # 169 — drawn along the top edge
+    # the same phase through an ODD count, where the doubling puts the zero at entry 1 of six:
+    # [4, 0, 8] at offset 4 is on [0,8), off, on [20,24), on [24,32) through corner B, ...
+    var s408 = pat_new(3);
+    pat_set(s408, 0, 4 * ONE);
+    pat_set(s408, 1, 0);
+    pat_set(s408, 2, 8 * ONE);
+    var sref2 = sd_path_new();
+    sd_path_moveto(sref2, 4 * ONE, 6 * ONE);      # the HEAD, d = [0, 8)
+    sd_path_lineto(sref2, 12 * ONE, 6 * ONE);
+    sd_path_moveto(sref2, 24 * ONE, 6 * ONE);     # d = [20, 24)
+    sd_path_lineto(sref2, 28 * ONE, 6 * ONE);
+    sd_path_moveto(sref2, 28 * ONE, 6 * ONE);     # d = [24, 32), THROUGH corner B at d = 28
+    sd_path_lineto(sref2, 32 * ONE, 6 * ONE);
+    sd_path_lineto(sref2, 32 * ONE, 10 * ONE);
+    sd_path_moveto(sref2, 32 * ONE, 22 * ONE);    # d = [44, 48)
+    sd_path_lineto(sref2, 28 * ONE, 22 * ONE);
+    sd_path_moveto(sref2, 28 * ONE, 22 * ONE);    # d = [48, 56)
+    sd_path_lineto(sref2, 20 * ONE, 22 * ONE);
+    sd_path_moveto(sref2, 8 * ONE, 22 * ONE);     # d = [68, 72)
+    sd_path_lineto(sref2, 4 * ONE, 22 * ONE);
+    sd_path_moveto(sref2, 4 * ONE, 22 * ONE);     # d = [72, 80)
+    sd_path_lineto(sref2, 4 * ONE, 14 * ONE);
+    check(cov_diff(dashed(40, 28, SUB, srect, 3 * ONE, BU, MI, s408, 3, 4 * ONE),
+        solid(40, 28, SUB, sref2, 3 * ONE, BU, MI)), 0);          # 170
+    check(sd_canvas_coverage_at(dashed(40, 28, SUB, srect, 3 * ONE, BU, MI, s408, 3, 4 * ONE),
+        8, 8), 0);                                                # 171 — no diagonal through it
+
+    # S3. A WRAP HEAD THAT CROSSES A CORNER. Every closed case in groups H, N and Q has a head of
+    # exactly two points, so the concatenation runs over ONE element and its ORDER cannot be seen.
+    # These two heads span a vertex, and the reference spells the wrapping piece through BOTH
+    # corners — the closing one and the head's own.
+    var ssq = square(4 * ONE, 4 * ONE, 28 * ONE, 28 * ONE);        # perimeter 96, corners at 24/48/72
+    # [32, 16] at offset 4: on [0,28) (the head, through corner B at d = 24), off, on [44,76),
+    # off, on [92,124) — the walk arrives at d = 96 INSIDE that dash, so it wraps.
+    var s3ref = sd_path_new();
+    sd_path_moveto(s3ref, 28 * ONE, 24 * ONE);    # d = [44, 76)
+    sd_path_lineto(s3ref, 28 * ONE, 28 * ONE);
+    sd_path_lineto(s3ref, 4 * ONE, 28 * ONE);
+    sd_path_lineto(s3ref, 4 * ONE, 24 * ONE);
+    sd_path_moveto(s3ref, 4 * ONE, 8 * ONE);      # the WRAP: d = [92, 96) + the head [0, 28)
+    sd_path_lineto(s3ref, 4 * ONE, 4 * ONE);      # the closing corner — a JOIN
+    sd_path_lineto(s3ref, 28 * ONE, 4 * ONE);     # the head's own corner — also a JOIN
+    sd_path_lineto(s3ref, 28 * ONE, 8 * ONE);
+    var p3216 = pat2(32 * ONE, 16 * ONE);
+    var s3bad = 0;
+    mode = SUB;
+    while (mode <= AREA) {
+        s3bad = s3bad + cov_diff(dashed(34, 34, mode, ssq, 4 * ONE, BU, MI, p3216, 2, 4 * ONE),
+          solid(34, 34, mode, s3ref, 4 * ONE, BU, MI));
+        mode = mode + 1;
+    }
+    check(s3bad, 0);                                              # 172 — both engines, exactly
+    # and again with the walk arriving EXACTLY on a boundary: [28, 6] at offset 0 ends its last
+    # on-entry at d = 96 to the raw unit, so rem is 0 at p[0] and the wrap is not fired as a turn.
+    var s3ref2 = sd_path_new();
+    sd_path_moveto(s3ref2, 28 * ONE, 14 * ONE);   # d = [34, 62)
+    sd_path_lineto(s3ref2, 28 * ONE, 28 * ONE);
+    sd_path_lineto(s3ref2, 14 * ONE, 28 * ONE);
+    sd_path_moveto(s3ref2, 8 * ONE, 28 * ONE);    # the WRAP: d = [68, 96) + the head [0, 28)
+    sd_path_lineto(s3ref2, 4 * ONE, 28 * ONE);
+    sd_path_lineto(s3ref2, 4 * ONE, 4 * ONE);
+    sd_path_lineto(s3ref2, 28 * ONE, 4 * ONE);
+    sd_path_lineto(s3ref2, 28 * ONE, 8 * ONE);
+    var s3b = dashed(34, 34, SUB, ssq, 4 * ONE, BU, MI, pat2(28 * ONE, 6 * ONE), 2, 0);
+    check(cov_diff(s3b, solid(34, 34, SUB, s3ref2, 4 * ONE, BU, MI)), 0); # 173
+    check(sd_canvas_coverage_at(s3b, 2, 2), 255);                 # 174 — the closing corner, joined
+    check(sd_canvas_coverage_at(s3b, 26, 2), 255);                # 175 — the head's own corner
+
+    # S4. AN OFFSET THAT LANDS EXACTLY ON A PATTERN-ENTRY BOUNDARY belongs to the NEXT entry, and
+    # group C can only see that under BUTT, where a stray zero-length turn at distance 0 draws
+    # nothing. Under SQUARE it is a 2x2 block of ink four px before the first dash, in a gap.
+    var s4row = "...######..######...";
+    var s4sq = dashed(20, 10, SUB, line, 2 * ONE, SQ, MI, p44, 2, 4 * ONE);
+    check(row_bad(s4sq, 3, s4row) + row_bad(s4sq, 4, s4row), 0);  # 176 — every pixel of the row
+    check(lit_rows(s4sq, 0, 3) + lit_rows(s4sq, 5, 10), 0);       # 177
+    check(sd_canvas_coverage_at(s4sq, 0, 3), 0);                  # 178 — the leading gap is EMPTY
+    var s4ro = dashed(20, 10, SUB, line, 2 * ONE, RO, MI, p44, 2, 4 * ONE);
+    check(sd_canvas_coverage_at(s4ro, 0, 3), 0);                  # 179 — and under ROUND too
+    check(cov_sum(s4ro) > 0, 1);                                  # 180
+    # the same phase one period on, and one period back, still with a cap that would show a dot
+    check(cov_diff(s4sq, dashed(20, 10, SUB, line, 2 * ONE, SQ, MI, p44, 2, 12 * ONE)), 0); # 181
+    check(cov_diff(s4sq, dashed(20, 10, SUB, line, 2 * ONE, SQ, MI, p44, 2, 0 - 4 * ONE)), 0); # 182
+    # an offset of a whole period is offset 0 — under SQUARE, where a spurious turn at 0 shows
+    check(cov_diff(dashed(20, 10, SUB, line, 2 * ONE, SQ, MI, p44, 2, 8 * ONE),
+        dashed(20, 10, SUB, line, 2 * ONE, SQ, MI, p44, 2, 0)), 0); # 183
+
+    # S5. THREE ZERO ENTRIES IN A ROW, at both guards. The drain at one position is bounded by nn
+    # turns and the phase walk by nn steps; every pattern above needs at most two of either, so
+    # neither bound was ever exercised. [0, 0, 0, 4] needs three turns at every dot, [4, 0, 0, 0]
+    # three at every dash end, and an offset inside the trailing 4 needs three STEPS to find it.
+    # ⚠ Most of the drain is self-correcting and so invisible: the segment walk re-enters at the
+    # same coordinates with rem still 0 and turns again, so a drain cut short catches up. The ONE
+    # place it cannot is the LAST vertex of an open subpath, where there is no next segment — so
+    # that is where the bound is pinned, at S5c below.
+    var s0004 = pat_new(4);
+    pat_set(s0004, 1, 0);
+    pat_set(s0004, 3, 4 * ONE);
+    check(cov_diff(dashed(20, 12, SUB, line, 2 * ONE, RO, MI, s0004, 4, 0),
+        solid(20, 12, SUB, dots, 2 * ONE, RO, MI)), 0);           # 184 — the same five dots
+    check(cov_sum(dashed(20, 12, SUB, line, 2 * ONE, RO, MI, s0004, 4, 0)) > 0, 1); # 185
+    var s4000 = pat_new(4);
+    pat_set(s4000, 0, 4 * ONE);
+    check(cov_diff(dashed(20, 12, SUB, line, 2 * ONE, RO, MI, s4000, 4, 0),
+        solid(20, 12, SUB, line, 2 * ONE, RO, MI)), 0);           # 186 — solid: the gaps are 0 long
+    check(cov_sum(dashed(20, 12, SUB, line, 2 * ONE, RO, MI, s4000, 4, 0)) > 0, 1); # 187
+    check(cov_diff(dashed(20, 12, SUB, line, 2 * ONE, RO, MI, s0004, 4, 0 - 4 * ONE),
+        dashed(20, 12, SUB, line, 2 * ONE, RO, MI, s0004, 4, 0)), 0); # 188 — one period back
+    # S5b. THE PHASE WALK'S OWN GUARD. [0, 0, 0, 4] at offset 2 has to step over THREE zero entries
+    # before it finds the entry the offset lands in — the trailing off-gap, 2 px into it. Stopping
+    # early leaves the phase in a zero-length entry with a NEGATIVE remainder, which cuts the first
+    # dash before the subpath starts. The figure is four dots, at 2, 6, 10 and 14: the last gap ends
+    # 2 px past the line, so there is none at 16.
+    var s5dots = sd_path_new();
+    var s5k = 0;
+    while (s5k < 4) {
+        sd_path_moveto(s5dots, 2 * ONE + s5k * 4 * ONE, 4 * ONE);
+        s5k = s5k + 1;
+    }
+    check(cov_diff(dashed(20, 12, SUB, line, 2 * ONE, RO, MI, s0004, 4, 2 * ONE),
+        solid(20, 12, SUB, s5dots, 2 * ONE, RO, MI)), 0);         # 189
+    check(cov_sum(dashed(20, 12, SUB, line, 2 * ONE, RO, MI, s0004, 4, 2 * ONE)) > 0, 1); # 190
+    # S5c. THE DRAIN'S BOUND, WHERE IT IS OBSERVABLE: the LAST vertex of an open subpath. [5, 0, 0,
+    # 0] on a 3-4-5 diagonal of exactly 20 px is four dashes and a zero-length on-entry at the end
+    # of each — and the one at d = 20 needs the drain's THIRD turn to fire. ⭐ It has to be a
+    # DIAGONAL under SQUARE for the difference to show: the dot is an AXIS-ALIGNED square of side
+    # 2*hw where the dash's own end cap is a rect turned along the path, so the two do not coincide
+    # (on a horizontal line they do, and the check would prove nothing).
+    var s5d = sd_path_new();
+    sd_path_moveto(s5d, 4 * ONE, 4 * ONE);
+    sd_path_lineto(s5d, 16 * ONE, 20 * ONE);      # 12-16-20: sd_isqrt is exact, and so are the cuts
+    var s5p = pat_new(4);
+    pat_set(s5p, 0, 5 * ONE);
+    var s5ref = sd_path_new();
+    sd_path_moveto(s5ref, 4 * ONE, 4 * ONE);      # the four dashes, each capped at both ends
+    sd_path_lineto(s5ref, 7 * ONE, 8 * ONE);
+    sd_path_moveto(s5ref, 7 * ONE, 8 * ONE);
+    sd_path_lineto(s5ref, 10 * ONE, 12 * ONE);
+    sd_path_moveto(s5ref, 10 * ONE, 12 * ONE);
+    sd_path_lineto(s5ref, 13 * ONE, 16 * ONE);
+    sd_path_moveto(s5ref, 13 * ONE, 16 * ONE);
+    sd_path_lineto(s5ref, 16 * ONE, 20 * ONE);
+    sd_path_moveto(s5ref, 7 * ONE, 8 * ONE);      # and the four zero-length on-entries, as dots
+    sd_path_moveto(s5ref, 10 * ONE, 12 * ONE);
+    sd_path_moveto(s5ref, 13 * ONE, 16 * ONE);
+    sd_path_moveto(s5ref, 16 * ONE, 20 * ONE);    # ⭐ the one the drain's third turn puts there
+    var s5bad = 0;
+    mode = SUB;
+    while (mode <= AREA) {
+        s5bad = s5bad + cov_diff(dashed(24, 26, mode, s5d, 4 * ONE, SQ, MI, s5p, 4, 0),
+          solid(24, 26, mode, s5ref, 4 * ONE, SQ, MI));
+        mode = mode + 1;
+    }
+    check(s5bad, 0);                                              # 191 — both engines, exactly
+    check(sd_canvas_coverage_at(dashed(24, 26, SUB, s5d, 4 * ONE, SQ, MI, s5p, 4, 0), 17, 21),
+      255);                                                       # 192 — the dot's own corner,
+    # which the rotated end cap does not reach: MEASURED 95 there without the drain's third turn.
+
+    # S6. AN OPEN SUBPATH THAT RETURNS TO ITS MOVETO POINT KEEPS ITS LAST SEGMENT. The walk shares
+    # _sd_sb_dedup with the solid stroker, and that drops a trailing duplicate of point 0 only for a
+    # CLOSED subpath — for an open one the coincidence is a real segment walking back. Applied to
+    # both, it would swallow the segment silently, and no suite read it. "M 4,4 L 28,4 L 28,20 L
+    # 4,4" without a CLOSE is three segments, the last a diagonal nothing else covers.
+    var s6 = sd_path_new();
+    sd_path_moveto(s6, 4 * ONE, 4 * ONE);
+    sd_path_lineto(s6, 28 * ONE, 4 * ONE);
+    sd_path_lineto(s6, 28 * ONE, 20 * ONE);
+    sd_path_lineto(s6, 4 * ONE, 4 * ONE);
+    var s6c = dashed(34, 26, SUB, s6, 4 * ONE, BU, MI, plong, 1, 0);
+    check(sd_canvas_coverage_at(s6c, 10, 8), 255);                # 193 — the diagonal, MEASURED
+    check(sd_canvas_coverage_at(s6c, 16, 12), 255);               # 194
+    check(sd_canvas_coverage_at(s6c, 20, 15), 255);               # 195
+    check(cov_diff(s6c, solid(34, 26, SUB, s6, 4 * ONE, BU, MI)), 0); # 196 — and it is _ex's bytes
+
+    if (g_fails == 0) {
+        var ok = "dash_test: all checks passed\n";
+        syscall(1, 1, ok, strlen(ok));
+    }
+    return g_fails;
+}

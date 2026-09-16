@@ -5,6 +5,171 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-09-15 — dashes, focal gradients, real alpha, and a cap that stops being a cliff
+
+Six items over two waves. ⛔ **Everything a 0.6.0 caller does is byte-identical for every input that
+worked in 0.6.0**: agnos's `tests/gpu/refagree.cyr` prints **BYTE-IDENTICAL on all 200 paths** against
+this `dist/`, rekha (23 suites) and dhancha (18) pass against it, and the 19 pre-0.7.0 suites pass with
+their assertions unedited apart from `area_test` group N, whose 4 assertions pin a limitation this
+release deliberately removes.
+
+### Fixed — `SD_FLATTEN_CAP` stops being a cliff: every store that DROPPED data now grows
+
+Through 0.6.0 a path over 8,192 edges filled WRONG (contours left open), a stroke run stopped at point
+8,192, `sd_path_flatten` returned 8,192 points, and a styled stroke longer than one batch met itself by
+MAX where it crossed. The fill's edge list, the crossings, the stroker's run, the curve flags and the
+styled batch now DOUBLE when full — from the GLOBAL `alloc`, never the consumer's hook (0.5.5's rule:
+a hook is an arena that gets reset) — and `sd_path_flatten`'s result doubles through `sd_alloc`,
+because it is the caller's result on the seam.
+⭐ MEASURED, a 20,000-gon disc of radius 120 px on 256x256: 0.6.0 filled **24.5 %** of its ink and left
+the centre pixel 0; 0.7.0 fills **99.997 %** of 255·πr² (AREA 99.995 %).
+⛔ INITIAL CAPACITIES ARE UNCHANGED, so every first-use figure a consumer has measured is still exact
+(fill 590,152 B, styled batch 270,592 B, an AREA styled stroke's first-ever coverage work 860,688 B),
+and growth is monotone: a process pays for its largest path once, then **0 B** a call.
+⚠ **One styled stroke is now ONE batch** (`SD_STROKE_BATCH_CAP` defaults to 0 = no limit), which
+removes the cross-batch MAX loss: MEASURED, 60 random self-crossing walks of 700–1,100 segments —
+0.6.0 split 20 (worst 118 levels), 0.7.0 is byte-identical on all 60, and on 60 more of 2,000–5,000
+segments where 0.6.0 split every one (worst 131). The flush + re-emission machinery is KEPT as the
+fallback for a set cap and for a failed growth. One batch is 5–8 % slower on a big self-crossing
+stroke (12,700-edge Lissajous: 41.3 ms vs 39.2 ms) — flushing is faster precisely because each flush
+sweeps only its own rows, which is what bought the loss.
+⚠ The `SD_AA_AREA` dispatch now falls back on TRUNCATION, not on size, so an AREA fill of exactly
+8,192 edges runs the area engine (MEASURED 41 ms, where 0.6.0's fallback took 10.9 s at 8,000 edges).
+
+### Added — `sd_grow_limit_set` / `sd_grow_limit_get`, bounded by default (`SD_GROW_LIMIT_DEFAULT` = 8 MiB)
+
+⛔⛔ **THE TRADE THIS RELEASE MAKES, SAID OUT LOUD.** Lifting the cap turns "a path over 8,192 edges
+renders wrong" into "a path over 8,192 edges costs whatever it costs" — and the scratch is
+process-lifetime on an allocator with no `free()`, so ONE pathological path makes a process keep that
+memory for life. MEASURED on this tree, rekha's hostile repro (4,096 maximally non-flat quads, one
+`sd_canvas_fill_path` on 64x64 — the shape a font file can carry): **unbounded**, it grows to
+1,048,576 entries and costs **150,602,312 B** of global heap, permanently. Under the default ceiling
+the same fill keeps its first 262,144 edges, RECORDS the truncation, and costs **83,493,448 B** — of
+which 50,135,040 B is the flatten mid-point waste rekha filed separately (below), not growth.
+⇒ Over the ceiling sadish chooses **bounded memory and a flagged, degraded fill** over correct output
+at any price; the flags are what keep the area engine off an open contour. `0` restores unbounded
+growth; the setter returns the previous value so it can be scoped, like `sd_alloc_set`.
+⚠ The ceiling bounds one REQUEST. Doubling abandons the old block, so a store that reaches it has also
+paid for every smaller block below (8 MiB + 4 + 2 + … ≈ 16 MiB).
+
+### Added — dashed strokes: `sd_canvas_stroke_path_dash` (new module `src/dash.cyr`)
+
+SVG `stroke-dasharray` / `stroke-dashoffset` over the 0.6.0 styled stroker. `pattern` is a
+caller-owned array of `n` 16.16 lengths (on, off, …), `offset` a 16.16 distance into it, any sign. An
+ODD `n` is the array read twice; `pattern == 0`, `n <= 0` or an all-zero array is
+`sd_canvas_stroke_path_ex` literally; a NEGATIVE entry or an overflowing period is
+`SADISH_ERR_BOUNDS` with nothing drawn; the pattern restarts at every subpath.
+⭐ **A dash is not a second stroker.** It is `_sd_sb_subpath` run on a PIECE of the flattened run, so
+caps at both ends of every dash, joins inside one, the miter limit, the inside-a-curve join rule, the
+clip, the `SD_AA_AREA` dispatch and one-call-one-fill all carry over. Both styled entry points now
+share one verb walk.
+⭐ **A closed subpath dashes around its closing point, and that meeting is a JOIN** — the first dash is
+deferred and concatenated onto the last. MEASURED, a 24 px square at width 4, BUTT/MITER, [16,16] at
+offset 8: the outer corner reads 255 through the join and 0 with the two dashes stroked apart.
+⛔ **A dot is a zero-length ENTRY, not a dash the path ran out of.** Where a boundary falls exactly on
+an open subpath's last vertex, the entry has positive length and no path left: nothing is drawn.
+`"M 2,4 L 18,4"` under [4,12] is one 4 px dash and a 12 px gap — not a dash and a cap-sized blot at
+x = 18. ⚠ Both of these were defects the review caught: the deferred head was stroked through a
+recycled cut-point record (a line straight across the shape's interior), and the end-of-path dot
+painted a full disc inside a declared gap.
+⚠ Dash lengths follow the FLATTENED polyline — a chord-length under-estimate of arc length, so dashes
+run long on a curve by about s/(3R): MEASURED at tol = 0.25 px, a radius-20 px circle is 0.63 % short.
+Truncation does not creep (`sd_isqrt` floors one-sidedly): 900 raw units over 1,000 diagonal segments
+= 0.0137 px, and a full pixel needs 65,536.
+**Allocation:** 73,792 B on the first dashed stroke, then 0 B a call. A process that never dashes pays
+nothing.
+
+### Added — focal radial gradients and gradient transforms (`src/paint.cyr`)
+
+`sd_gradient_radial_focal(cx, cy, r, fx, fy)` — SVG 1.1 `fx`/`fy` with focal radius 0. A focal point
+on or outside the circle is moved inside to `r - ceil(r/2^10)` along its own direction. A focal point
+at the centre is `sd_gradient_radial` byte for byte.
+⭐ **`t` is EXACT** — `floor(t·2^16)` — for `t < 256`, which is every pixel inside the circle and,
+under PAD, every pixel: the root needs ~113 bits, so it is estimated in i64 and the ~2.4 % of pixels
+landing near a `2^-16` boundary are settled by the exact sign of the polynomial in 128 bits.
+`sd_gradient_set_matrix(g, m)` — SVG `gradientTransform`; `m` maps gradient space to canvas space and
+is copied. ⭐ A transformed LINEAR gradient is still a canvas-space linear gradient, resolved once per
+blit in 128-bit arithmetic and painted by the same exact DDA, so it costs the same 14.0 ns/px.
+⭐ Translations, quarter-turns, 2^k scales and mirrors are byte-identical to moving the geometry;
+otherwise MEASURED under `rotate(30°)·scale(2)`, `floor(t·2^16)` is off by 1 at 7 linear / 20 radial /
+19 focal pixels of 2,209, never more.
+⛔ **Two matrices make the gradient render NOTHING**, both returning `SADISH_ERR_BOUNDS`: a singular
+one (SVG's own rule) and one with any entry outside ±16,384.0 (sadish's precision bound, which refuses
+perfectly invertible matrices such as a 16,384 px translation). Move the geometry, not the matrix —
+and read the return code, because an ignored one leaves an invisible paint.
+Also new: `sd_matrix_invert(m)` in `src/geom.cyr` (0 when singular), exact for identity, translations,
+2^k scales and quarter-turns. ⚠ `SD_GRADIENT_CAP_OFFSET` is gone — the stop capacity is derived and
+`+64` now holds an optional 72 B extension; the object stays 88 B, a plain gradient still costs
+exactly 4,256 B, and **a blit still allocates 0 B**, first call included.
+
+### Added — premultiplied writers, and gradient paint into them (new module `src/premul.cyr`)
+
+`sd_clear_premul`, `sd_fill_rect_premul`, `sd_canvas_blit_premul_at` / `_premul`,
+`sd_surface_rgba_at`, and `sd_canvas_blit_paint_premul_at` / `_premul`. These are the first sadish
+writers whose output has REAL alpha: a transparent clear, a translucent rect, an anti-aliased edge over
+a transparent surface, and a gradient panel with AA rounded corners over a transparent window — what a
+`SETU_SURF_PREMULTIPLIED` surface needs so agnos composites it with `gpu_shader_op` #92 op 0x01.
+⛔ **Alpha is an explicit `a`, and 0 means TRANSPARENT everywhere in the module** — the colour's alpha
+byte is never read. #92 reads byte 3 literally, and misreading it is what produced the over-bright
+ghosts this stack has paid for twice. Porting a `sd_canvas_blit_at` call means `a = 255`, not
+`sd_alpha_of(c)`.
+⭐ The arithmetic is agnos's own `cov_ref_px`, with `sd_premul`'s colour. Every output is valid
+premultiplied (`c <= a`), swept over all 32,896 valid destination pairs and every (a, cov). Against an
+f32 emulation of the kernel shaders: op 0x01 **0 mismatches over 8,421,376 inputs**; op 0x02 worst ±1.
+⭐ **ONE EVALUATION, TWO COMPOSITORS**: the straight and premultiplied gradient blits are the same
+function with a flag picking the store — same DDA, same roots, same spread, same ramp.
+`sd_canvas_blit_paint_at`'s bytes are unchanged, and an OPAQUE gradient at full coverage paints
+byte-identical pixels through both.
+⚠ With a TRANSLUCENT stop the two roundings compound: MEASURED over ALL 4,261,478,400 lane inputs, the
+signed difference premul − straight lies in **−2..+2**, narrowing to −1..+1 at full coverage — not to 0.
+⚠ Stop alpha is interpolated STRAIGHT and premultiplied AFTER, per pixel (SVG's rule). A premultiplied
+ramp would drag every transition toward the opaque stop: MEASURED, 63 levels at the midpoint.
+⚠ A gradient still cannot express a fully transparent stop — the legacy rule spends alpha 0 on OPAQUE.
+⚠ Repeated compositing of one translucent layer drifts: alpha stalls below 255 for a < 128, and 20
+fills of grey 200 at a = 10 give 98 against an analytic 110.14. A single layer stays within 1.
+
+### Fixed — a clip mask is PACKED `w*h`, on a canvas of any stride
+
+Closes `docs/development/issues/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md`.
+The mask was written `y*w + x` by all three producers and read `py*stride + px` by all three consumers
+(`sd_fill_impl`, `_sd_area_fill`, `_sd_sb_flush`); they now read it packed. ⛔ Byte-identical — every
+canvas `sd_canvas_new` makes has `stride == width`, so no caller can tell.
+⚠ **The contract, now stated in the `SdCanvas` layout comment and at each reader:** the COVERAGE buffer
+is addressed by the STRIDE and may one day be a window into a wider buffer; the CLIP MASK is a
+sadish-owned `w*h` block and is addressed PACKED, always.
+Also fixed next door: `sd_canvas_clear` zeroed one flat `w*h` run from the coverage pointer, which on a
+wrapped canvas clears neither all of the window nor only the window; it now walks rows at the stride.
+Byte-identical on every canvas `sd_canvas_new` makes.
+
+### Filed by rekha — for 0.7.1, not fixed here
+
+- `docs/development/issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md`
+  — `sd_flatten_quad` / `_cubic` keep subdividing (and allocating mid-points) past the output cap.
+  ⚠ **This release changes the shape of that cost, and not only for the better.** RE-MEASURED on this
+  tree with the same repro: 0.6.0 emitted 8,192 points for 50,200,616 B; 0.7.0 emits all 1,048,577 for
+  **83,623,976 B** in **3,133,451** allocations. Truncation is gone; the waste is not. rekha's own note
+  anticipated it — "whatever replaces the cap should still bound total flatten work".
+- `docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md`
+  — `sd_path_new` / `sd_point_new` / `sd_path_flatten` store through unchecked `sd_alloc` results, so a
+  hook that refuses faults inside sadish (SIGSEGV, rc 139).
+- `docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md` — `sd_path_new_cap`.
+
+### Verified
+
+All **25** `programs/*_test.cyr` pass: the 19 pre-0.7.0 suites (assertions unedited but for `area_test`
+group N) plus `grow_edges_test` (216), `paint_focal_test` (144), `premul_test` (148),
+`dash_test` (196), `clip_pitch_test` (106) and `paint_premul_test` (95). `fmt --check` clean, `lint` 0
+warnings, `vet` clean, `distlib` in sync with 362 top-level names and none defined twice.
+`sadish_version()` → **700**; `dist/sadish.cyr` 170,626 → 297,263 B; DCE smoke binary 16,328 → 16,728 B.
+⭐ **Every item was built, adversarially reviewed, fixed and independently re-verified, and each proves
+its tests by mutation.** The review found two real dash defects (above) that no suite had caught, and a
+clip reviewer found six coverage loads no canvas could reach — correct code that could be pushed to the
+wrong index with every suite still green; `clip_pitch_test` groups H and J close them with no source
+change. Mutation totals this release: grow 102 (85 caught), paint2 139 (125), premul 72 (63), dash
+(groups A–S, every reviewer defect pinned), clip (each reader reverted alone fails only the new suite),
+paintpremul (per-pixel clipping pinned against an independent reference after a deleted `+ x0` left all
+23 suites green).
+
 ## [0.6.0] - 2026-09-15 — the roadmap's three: styled strokes, gradient paint, exact coverage
 
 The three items the README has listed as **next** since 0.4.0 — miter/bevel joins + butt/square

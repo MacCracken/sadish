@@ -6,6 +6,10 @@
 # Both flatten curve verbs at tol = SD_ONE >> 2 into the stroker's run (the _sd_stroke_* scratch in
 # raster.cyr) and MAX-combine the stroke into the canvas coverage, so it unions with whatever the
 # canvas already holds and honours the clip.
+# ⭐ A THIRD, sd_canvas_stroke_path_dash (src/dash.cyr), is the STYLED path with its run cut into
+# dashes. It shares _sd_styled_walk below verb for verb and differs only in what a subpath is handed
+# to: _sd_sb_subpath whole, or _sd_dash_subpath piece by piece. So a dash is drawn by exactly the
+# code below, into exactly the same batch — the only arrow out of this file is _sd_sb_dispatch's.
 #
 # ⛔ ROUND/ROUND IS THE 0.4.0 STROKER, UNCHANGED. `_ex(cv, p, w, SD_CAP_ROUND, SD_JOIN_ROUND, any)`
 # returns `sd_canvas_stroke_path(cv, p, w)`, whose code moved here from raster.cyr verbatim: a
@@ -38,7 +42,7 @@
 # coverage choice made there does not reach styled strokes unless the flush is taught it — so it
 # IS taught the one that exists: on an SD_AA_AREA canvas the batch goes to _sd_area_fill
 # (src/coverage.cyr) as a nonzero MAX-combine, where touching pieces add exactly and no bridge is
-# needed. Same guard as sd_fill_impl: only a batch that cannot have dropped an edge (n < limit).
+# needed. Same guard as sd_fill_impl: only a batch that dropped no edge (_sd_sb_trunc == 0).
 #
 # SEMANTICS (styled path).
 #   · Consecutive coincident points are dropped first; a closed subpath whose last point equals
@@ -81,17 +85,23 @@
 # overflows. A miter tip lies at most miter_limit * hw from its vertex, and the walk's
 # (bx - ax) * (sy - ay) needs edge extents under ~46,000 px: SD_MITER_LIMIT_MAX = 1024.0 keeps
 # every tip in range up to hw ~ 45 px, and a join past that ratio turns within 0.11° of a reversal.
-# ⚠ BATCHES. The batch holds SD_STROKE_BATCH_CAP = 8,192 edges (horizontal ones are dropped, as the
-# fill drops them) — about 800 miter segments, 400 with round joins. A subpath that overflows it is
-# flushed mid-way; the next batch re-emits the stretch before the flush (until 2*hw + 3 px of it or
-# 16 segments, whichever comes first), and a closed subpath's closing join is followed by the same
-# stretch after its vertex 0, so every seam ALONG the path falls where one batch is complete: the
-# suite sweeps rings, irregular wiggles and blobs across lowered limits, all within 1 level of one
-# batch. ⚠ Pieces from DIFFERENT batches still meet by MAX, and where a subpath longer than a batch
-# CROSSES or returns onto itself that loss is not bounded — MEASURED on 60 random self-crossing
-# walks of 700..1,100 segments (64x64, widths 0.3..5.3 px, MITER/BEVEL) against one 16,384-edge
-# batch: 22 split, every one of them more than 3 levels off somewhere, worst 101. (The same 60 walks
-# at 300..450 segments fit one batch; at an earlier 4,096-edge cap 14 of them split, worst 93.)
+# ⭐ ONE CALL IS ONE BATCH (0.6.1). The batch and the run GROW (doubling from the global alloc, like
+# the fill's edge list), so however long the path, sd_canvas_stroke_path_ex fills every piece of it
+# in one pass. Through 0.6.0 a batch held 8,192 edges (about 800 miter segments) and a longer
+# subpath was flushed mid-way — and pieces from different batches meet by MAX, so where a subpath
+# longer than a batch CROSSES or returns onto itself that loss was not bounded. MEASURED against the
+# 0.6.0 bundle, 60 random self-crossing walks of 700..1,100 segments (64x64, widths 0.3..5.3 px,
+# BUTT/SQUARE x MITER/BEVEL) against the same walks as one batch (0.6.0 rebuilt with a 16,384-edge
+# cap): 0.6.0 split 20, each more than 3 levels off somewhere, worst 118; 0.6.1 is byte-identical to
+# the one batch on all 60, and on 60 more of 2,000..5,000 segments (0.6.0: 60 split, worst 131).
+# ⚠ THE FLUSH + RE-EMISSION IS KEPT as the fallback. It runs when SD_STROKE_BATCH_CAP is set (a
+# memory bound) or when a growth fails for want of memory: the next batch re-emits the stretch before
+# the flush (until 2*hw + 3 px of it or 16 segments, whichever comes first), and a closed subpath's
+# closing join is followed by the same stretch after its vertex 0, so every seam ALONG the path
+# falls where one batch is complete (the suite sweeps rings, wiggles, blobs and gears across lowered
+# limits, all within 1 level of one batch) — the MAX loss where a path crosses itself returns with
+# it. Out of memory, a stroke degrades to exactly 0.6.0's batches; it drops a piece only if an edge
+# arrives at a full array whose growth fails, which the reserve before every unit prevents.
 # ⚠ Single-threaded, like the fill: one edge batch and one run for the process.
 
 # ---- cap / join styles ------------------------------------------
@@ -147,21 +157,6 @@ fn sd_stroke_disc(cv, cx, cy, hw): i64 {
     return 0;
 }
 
-# Append a flatten ctx's points to the run buffer (bounded by SD_FLATTEN_CAP).
-fn sd_stroke_append(run, run_n, fctx): i64 {
-    var pts = load64(fctx + 0);
-    var n = load64(fctx + 8);
-    var i = 0;
-    while (i < n) {
-        if (run_n < SD_FLATTEN_CAP) {
-            store64(run + run_n * 8, load64(pts + i * 8));
-            run_n = run_n + 1;
-        }
-        i = i + 1;
-    }
-    return run_n;
-}
-
 # Stroke one flattened subpath run: a rect per segment + a disc per vertex.
 fn sd_stroke_run(cv, run, n, closed, hw): i64 {
     var i = 0;
@@ -209,10 +204,11 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
     if (hw <= 0) { return SADISH_OK; }
     var tol = SD_ONE >> 2;
 
-    # The stroker's OWN scratch set — `run` stays live across the fill_union passes below, which
-    # use the fill set (see the scratch block in raster.cyr).
+    # The stroker's OWN scratch set — the run stays live across the fill_union passes below, which
+    # use the fill set (see the scratch block in raster.cyr). ⚠ The run GROWS (0.6.1), so it is
+    # read as _sd_stroke_run at each use, never cached across a push.
     _sd_scratch_init();
-    var run = _sd_stroke_run;
+    _sd_run_trunc = 0;
     var run_n = 0;
     var fbuf = _sd_stroke_fbuf;
     var fctx = _sd_stroke_fctx;
@@ -226,20 +222,17 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
     while (vi < n_verbs) {
         var verb = load64(verbs + vi * 8);
         if (verb == SD_VERB_MOVETO) {
-            if (run_n > 0) { sd_stroke_run(cv, run, run_n, closed, hw); }
+            if (run_n > 0) { sd_stroke_run(cv, _sd_stroke_run, run_n, closed, hw); }
             run_n = 0;
             closed = 0;
             cur = load64(points + pi * 8);
-            store64(run + run_n * 8, cur);
+            store64(_sd_stroke_run + run_n * 8, cur);
             run_n = run_n + 1;
             pi = pi + 1;
         }
         if (verb == SD_VERB_LINETO) {
             cur = load64(points + pi * 8);
-            if (run_n < SD_FLATTEN_CAP) {
-                store64(run + run_n * 8, cur);
-                run_n = run_n + 1;
-            }
+            run_n = _sd_run_push(run_n, cur, 0);
             pi = pi + 1;
         }
         if (verb == SD_VERB_QUADTO) {
@@ -249,7 +242,7 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
             sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
-            run_n = sd_stroke_append(run, run_n, fctx);
+            run_n = _sd_run_append(run_n, fctx, 0);
             cur = qe;
             pi = pi + 2;
         }
@@ -261,7 +254,7 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
             sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
-            run_n = sd_stroke_append(run, run_n, fctx);
+            run_n = _sd_run_append(run_n, fctx, 0);
             cur = ke;
             pi = pi + 3;
         }
@@ -270,44 +263,78 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
         }
         vi = vi + 1;
     }
-    if (run_n > 0) { sd_stroke_run(cv, run, run_n, closed, hw); }
+    if (run_n > 0) { sd_stroke_run(cv, _sd_stroke_run, run_n, closed, hw); }
     return SADISH_OK;
 }
 
 # ---- styled stroking: the edge batch -----------------------------
-# Edges one batch holds before it is filled — at most SD_FLATTEN_CAP, the crossings array the flush
-# borrows from the fill. The edge array is sized from it at the first styled stroke; after that it
-# is read through _sd_sb_limit, which holds it within [SD_STROKE_BATCH_MIN, the allocated capacity],
-# so raising it later cannot write past the array and lowering it (the suite does, to force
-# flushes) cannot starve a re-emission.
-var SD_STROKE_BATCH_CAP = 8192;
+# Edges one batch may hold before it is flushed. ⭐ 0 — THE DEFAULT (0.6.1) — IS NO LIMIT: the batch
+# grows, so one sd_canvas_stroke_path_ex call is ONE fill however long its path. A positive value
+# forces a flush past that many edges (the flush + re-emission below, which is otherwise the
+# out-of-memory fallback) and so bounds the batch's memory: it is held to
+# [SD_STROKE_BATCH_MIN, SD_FLATTEN_CAP] when the FIRST styled stroke sizes the array
+# (_sd_sb_cap_for), so a consumer that wants a small batch pays for a small one — MEASURED, a first
+# styled stroke at 900: 37,248 B against the default's 270,592 B. Through 0.6.0 this was 8,192 and a
+# value raised AFTER the first stroke was held to the allocation; now the array grows to meet it.
+# Setting 8192 reproduces 0.6.0's batches exactly.
+# ⚠ It bounds the batch, not every array a stroke touches: the run and the curve flags are sized by
+# the PATH (raster.cyr's scratch), and the crossings the flush borrows follow the batch.
+var SD_STROKE_BATCH_CAP = 0;
 # Room reserved before one unit. A unit is at most 39 edges: a join (a 16-gon disc, or 3 bevel + 16
 # for a curve vertex past its tolerance), the rect (4), and an end cap or the closing join (16).
 var SD_STROKE_UNIT_EDGES = 40;
 # The smallest limit that holds what may follow a flush without another: 16 re-emitted units back
 # (<= 23 edges each — never a last unit), the unit, and a closed subpath's 16 forward: 775 edges.
+# ⚠ Since 0.6.1 a lower limit costs flushes, not ink: an edge arriving past the limit grows the
+# array rather than being dropped (_sd_sb_edge), so a starved re-emission is emitted in full and
+# only the NEXT unit flushes. MEASURED: a 2,000-sample Lissajous at a limit of 10 strokes the same
+# bytes as at 800 (programs/grow_edges_test.cyr) — at about 17x the fills.
 var SD_STROKE_BATCH_MIN = 800;
 
 # ⛔ Process-lifetime, from the GLOBAL alloc, allocated by the first styled stroke — not by
 # _sd_scratch_init, so a process that never strokes with styles never pays for it. Same reason as
 # raster.cyr's scratch: a consumer's hook is an arena that gets reset. MEASURED one-time cost
-# 270,592 B (8,192 * 32 edges + 256 trig + 8,192 curve flags); after it a straight-line styled
-# stroke costs the heap 0 B, and curves only their flatten mid-points. The flush's crossings use
-# the fill's _sd_fill_cross (SD_FLATTEN_CAP * 16): a per-fill working array, not held across a
-# call, which the flush IS — so it is borrowed, not duplicated.
+# 270,592 B (8,192 * 32 edges + 256 trig + 8,192 curve flags) at the default SD_STROKE_BATCH_CAP,
+# and only the edge part of it under a lower one (MEASURED at 900: 37,248 B); after it a
+# straight-line styled stroke costs the heap 0 B, and curves only their flatten mid-points. The
+# flush's crossings use the fill's _sd_fill_cross: a per-fill working array, not held across a call,
+# which the flush IS — so it is borrowed, not duplicated.
+# ⭐ The edges and the curve flags GROW by doubling (0.6.1), from the global alloc, like the fill's
+# list: MEASURED 524,288 B for the first batch past 8,192 edges, plus 262,144 B of crossings unless a
+# fill already grew them (every growth keeps _sd_fill_cross_cap >= _sd_sb_cap); a repeat 0 B.
+# ⚠ AND IT IS MONOTONE, AND NEVER RETURNED (lib/alloc.cyr has no free): one batch per call means the
+# batch is sized by the LONGEST path the process ever strokes, and every abandoned doubling stays
+# mapped. MEASURED, random walks of 100..25,600 segments at width 3 (BUTT/MITER, a styled stroke
+# makes 7-20 edges a segment): the batch settles at 262,144 edges and the process has asked the
+# global heap for 25,682,744 B in total, once — against 1,303,352 B over the same sweep with
+# SD_STROKE_BATCH_CAP = 8192 (of which 442,368 B is the run, which 0.6.0 truncated instead). ⇒ The
+# knob is the ceiling for a consumer that needs one; it bounds the first allocation too.
 var _sd_sb_edges = 0;   # _sd_sb_cap * 32 — (ax, ay, bx, by) per edge, a -> b in winding order
-var _sd_sb_cap = 0;     # edges the arrays hold
+var _sd_sb_cap = 0;     # edges the array holds
 var _sd_sb_n = 0;       # edges in the batch
 var _sd_sb_trig = 0;    # 16 (cos, sin) pairs — the 16-gon disc, sd_stroke_disc's angles
 # _sd_sb_inner is never read at run[0]: a subpath's first point takes a cap, or the closing join,
 # which is passed 0.
-var _sd_sb_inner = 0;   # SD_FLATTEN_CAP bytes, parallel to the run: 1 = inside a curve's flattening
+var _sd_sb_inner = 0;   # _sd_sb_inner_cap bytes, parallel to the run: 1 = inside a curve's flattening
+var _sd_sb_inner_cap = 0;
+var _sd_sb_trunc = 0;   # 1 if the batch dropped an edge (a growth failed); cleared by the flush
+var _sd_run_trunc = 0;  # 1 if THIS stroke call dropped a run point (a growth failed)
+
+# The edge array's INITIAL capacity, from SD_STROKE_BATCH_CAP: 0 (no limit) takes the full
+# SD_FLATTEN_CAP, a positive limit is held to [SD_STROKE_BATCH_MIN, SD_FLATTEN_CAP]. ⛔ Never more
+# than SD_FLATTEN_CAP, which is what _sd_scratch_init sized the borrowed crossings to — n edges make
+# at most n crossings, so the crossings >= batch invariant holds from the first stroke. A limit
+# raised later is met by growing (_sd_sb_room), which reserves the crossings first.
+fn _sd_sb_cap_for(): i64 {
+    var cap = SD_STROKE_BATCH_CAP;
+    if (cap <= 0) { return SD_FLATTEN_CAP; }
+    if (cap < SD_STROKE_BATCH_MIN) { cap = SD_STROKE_BATCH_MIN; }
+    if (cap > SD_FLATTEN_CAP) { cap = SD_FLATTEN_CAP; }
+    return cap;
+}
 
 fn _sd_sb_init(): i64 {
     if (_sd_sb_edges != 0) { return 0; }
-    var cap = SD_STROKE_BATCH_CAP;
-    if (cap < SD_STROKE_BATCH_MIN) { cap = SD_STROKE_BATCH_MIN; }
-    if (cap > SD_FLATTEN_CAP) { cap = SD_FLATTEN_CAP; }   # n edges make at most n crossings
     _sd_sb_trig = alloc(16 * 16);
     var step = 411775 / 16;          # 2*pi / 16 in 16.16, as sd_stroke_disc
     var k = 0;
@@ -317,31 +344,134 @@ fn _sd_sb_init(): i64 {
         k = k + 1;
     }
     _sd_sb_inner = alloc(SD_FLATTEN_CAP);
-    _sd_sb_cap = cap;
-    _sd_sb_edges = alloc(cap * 32);
+    _sd_sb_inner_cap = SD_FLATTEN_CAP;
+    _sd_sb_cap = _sd_sb_cap_for();
+    _sd_sb_edges = alloc(_sd_sb_cap * 32);
     return 0;
 }
 
-# The batch's edge limit: SD_STROKE_BATCH_CAP within [SD_STROKE_BATCH_MIN, _sd_sb_cap].
-fn _sd_sb_limit(): i64 {
-    var lim = SD_STROKE_BATCH_CAP;
-    if (lim < SD_STROKE_BATCH_MIN) { lim = SD_STROKE_BATCH_MIN; }
-    if (lim > _sd_sb_cap) { lim = _sd_sb_cap; }
-    return lim;
+# Grow the batch to hold at least `need` edges: crossings first, then the edges, doubling, the live
+# ones copied and the old block abandoned. Returns 1, or 0 if an allocation failed (nothing lost).
+fn _sd_sb_grow(need): i64 {
+    var nc = _sd_sb_cap;
+    while (nc < need) { nc = nc * 2; }
+    if (_sd_fill_cross_for(nc) == 0) { return 0; }
+    var blk = _sd_grow_alloc(nc * 32);
+    if (blk == 0) { return 0; }
+    memcpy(blk, _sd_sb_edges, _sd_sb_n * 32);
+    _sd_sb_edges = blk;
+    _sd_sb_cap = nc;
+    return 1;
 }
 
-# 1 if `k` more edges fit in the batch.
+# 1 if `k` more edges may go into the batch: within SD_STROKE_BATCH_CAP (when set) and within the
+# array, grown if need be. 0 tells the caller to flush first — a limit reached, or a growth that
+# failed, which is how a stroke degrades out of memory: to 0.6.0's batches, not to lost pieces.
 fn _sd_sb_room(k): i64 {
-    if (_sd_sb_n + k <= _sd_sb_limit()) { return 1; }
-    return 0;
+    var need = _sd_sb_n + k;
+    var lim = SD_STROKE_BATCH_CAP;
+    if (lim > 0) {
+        if (lim < SD_STROKE_BATCH_MIN) { lim = SD_STROKE_BATCH_MIN; }
+        if (need > lim) { return 0; }
+    }
+    if (need > _sd_sb_cap) { return _sd_sb_grow(need); }
+    return 1;
+}
+
+# Make the stroker's run hold `n` points — and, when `flags` != 0, the curve flags too — growing
+# either by doubling from the global alloc (live entries copied). Returns 1, or 0 when a growth
+# failed: the caller drops the point, as 0.6.0 did at 8,192, and _sd_run_trunc records it; this call
+# then stops trying to grow, so a subpath keeps a prefix of its points.
+fn _sd_run_fits(n, flags): i64 {
+    if (n > _sd_stroke_run_cap) {
+        if (_sd_run_grow(n) == 0) { return 0; }
+    }
+    if (flags != 0) {
+        if (n > _sd_sb_inner_cap) {
+            if (_sd_inner_grow(n) == 0) { return 0; }
+        }
+    }
+    return 1;
+}
+
+fn _sd_run_grow(n): i64 {
+    if (_sd_run_trunc != 0) { return 0; }
+    var nc = _sd_stroke_run_cap;
+    while (nc < n) { nc = nc * 2; }
+    var blk = _sd_grow_alloc(nc * 8);
+    if (blk == 0) {
+        _sd_run_trunc = 1;
+        return 0;
+    }
+    memcpy(blk, _sd_stroke_run, _sd_stroke_run_cap * 8);
+    _sd_stroke_run = blk;
+    _sd_stroke_run_cap = nc;
+    return 1;
+}
+
+# ⚠ THE COPY IS THE WHOLE OLD CAPACITY, not the run's live count, and deliberately: _sd_run_append
+# grows the flags at the point it needs slot n, and a curve's flags are written AFTERWARDS by
+# _sd_sb_mark_curve — so the byte at the old capacity's last index is, mid-curve, about to be
+# rewritten and, on a LINETO, already 0. A short copy is therefore invisible today only because
+# lib/alloc.cyr hands out freshly-mapped (zero) pages and never recycles memory; under an allocator
+# that reused a block it would be a wrong-join bug. Copying the capacity costs one pass over at most
+# the flags' own size and needs neither of those arguments.
+# (programs/grow_edges_test.cyr writes a 1 into the last slot before a growth and reads it back.)
+fn _sd_inner_grow(n): i64 {
+    if (_sd_run_trunc != 0) { return 0; }
+    var nc = _sd_sb_inner_cap;
+    while (nc < n) { nc = nc * 2; }
+    var blk = _sd_grow_alloc(nc);
+    if (blk == 0) {
+        _sd_run_trunc = 1;
+        return 0;
+    }
+    memcpy(blk, _sd_sb_inner, _sd_sb_inner_cap);
+    _sd_sb_inner = blk;
+    _sd_sb_inner_cap = nc;
+    return 1;
+}
+
+# Append a flatten ctx's points to the stroker's run (_sd_stroke_run), growing it — and, when
+# `flags` != 0, the styled path's parallel curve flags — as needed; a point that still does not fit
+# is dropped (see _sd_run_fits). Returns the new count. (0.6.1: was sd_stroke_append(run, run_n,
+# fctx), bounded by SD_FLATTEN_CAP; the run pointer is no longer a parameter because growth
+# replaces the block.)
+fn _sd_run_append(run_n, fctx, flags): i64 {
+    var pts = load64(fctx + 0);
+    var n = load64(fctx + 8);
+    var i = 0;
+    while (i < n) {
+        if (_sd_run_fits(run_n + 1, flags) != 0) {
+            store64(_sd_stroke_run + run_n * 8, load64(pts + i * 8));
+            run_n = run_n + 1;
+        }
+        i = i + 1;
+    }
+    return run_n;
+}
+
+# Append point `pt` to the run (a LINETO); with `flags` != 0 its curve flag is cleared too.
+fn _sd_run_push(run_n, pt, flags): i64 {
+    if (_sd_run_fits(run_n + 1, flags) == 0) { return run_n; }
+    store64(_sd_stroke_run + run_n * 8, pt);
+    if (flags != 0) { store8(_sd_sb_inner + run_n, 0); }
+    return run_n + 1;
 }
 
 # Append the edge a -> b. Horizontal edges cross no sub-scanline and are dropped. The unit reserve
-# keeps a batch within its limit; the limit check is the backstop that turns a broken reserve into
-# a dropped edge instead of a write past the array (the limit never exceeds the allocation).
+# (_sd_sb_room) has already made room; if an edge still arrives at a full array it grows here, and
+# only if THAT fails is the edge dropped — and _sd_sb_trunc set, so the flush does not hand an
+# incomplete list to the area engine. Never a write past the array.
 fn _sd_sb_edge(ax, ay, bx, by): i64 {
     if (ay == by) { return 0; }
-    if (_sd_sb_n >= _sd_sb_limit()) { return 0; }
+    if (_sd_sb_n >= _sd_sb_cap) {
+        if (_sd_sb_trunc != 0) { return 0; }
+        if (_sd_sb_grow(_sd_sb_n + 1) == 0) {
+            _sd_sb_trunc = 1;
+            return 0;
+        }
+    }
     var e = _sd_sb_edges + _sd_sb_n * 32;
     store64(e + 0, ax);
     store64(e + 8, ay);
@@ -365,20 +495,23 @@ fn _sd_sb_edge(ax, ay, bx, by): i64 {
 # are skipped: they would MAX a 0 into the coverage.
 fn _sd_sb_flush(cv): i64 {
     var n = _sd_sb_n;
+    var trunc = _sd_sb_trunc;
+    _sd_sb_trunc = 0;
     if (n == 0) { return 0; }
     _sd_sb_n = 0;
     var edges = _sd_sb_edges;
-    var cross = _sd_fill_cross;
+    var cross = _sd_fill_cross;         # the CURRENT block: _sd_sb_grow keeps its capacity >= n
     var w = sd_canvas_width(cv);
     var h = sd_canvas_height(cv);
     var cov = sd_canvas_coverage(cv);
     var stride = sd_canvas_stride(cv);
     # ⛔ SD_AA_AREA canvas: the exact engine, nonzero, MAX-combined through the clip. Every piece is
-    # a closed polygon, so the list is whole unless the backstop in _sd_sb_edge dropped an edge —
-    # which it only does once the batch is AT its limit, so a batch below it is provably whole and a
-    # full one takes the walk below (a dropped edge would streak the area engine to the right edge).
+    # a closed polygon, so the list is whole unless _sd_sb_edge dropped an edge — which since 0.6.1
+    # it records (_sd_sb_trunc), and only after a growth failed. A truncated batch takes the walk
+    # below (a dropped edge would streak the area engine to the right edge). Through 0.6.0 a batch
+    # AT its limit could not be told from a truncated one and always took the walk.
     if (sd_canvas_aa(cv) == SD_AA_AREA) {
-        if (n < _sd_sb_limit()) {
+        if (trunc == 0) {
             var mask = 0;
             var clipn = load64(cv + SD_CANVAS_CLIP_OFFSET);
             if (clipn != 0) { mask = load64(clipn + 0); }
@@ -492,9 +625,11 @@ fn _sd_sb_flush(cv): i64 {
             if (c > 255) { c = 255; }
             var clipnode = load64(cv + SD_CANVAS_CLIP_OFFSET);
             if (clipnode != 0) {
-                c = (c * load8(load64(clipnode + 0) + py * stride + px)) / 255;
+                # ⛔ PACKED `py * w + px` — the clip mask is a w*h block, not a window into a wider
+                # buffer, so the canvas stride is not its pitch (raster.cyr's SdCanvas layout note).
+                c = (c * load8(load64(clipnode + 0) + py * w + px)) / 255;
             }
-            var oldc = load8(cov + py * stride + px);
+            var oldc = load8(cov + py * stride + px);   # coverage: the STRIDE, not w
             if (c < oldc) { c = oldc; }
             store8(cov + py * stride + px, c);
             px = px + 1;
@@ -702,7 +837,9 @@ fn _sd_sb_seglen(run, m, j): i64 {
 
 # One unit of a de-duplicated subpath: whatever sits at vertex i (the start cap, or the join),
 # segment i's rect, and — after the LAST segment — the end cap or the closing join at vertex 0.
-fn _sd_sb_unit(run, m, closed, i, hw, cap, join, ml): i64 {
+# `inner` is the curve-flag array parallel to `run` (1 = the vertex lies inside one curve verb's
+# flattening): _sd_sb_inner for a whole path, the dash buffer's own for one dash (src/dash.cyr).
+fn _sd_sb_unit(run, inner, m, closed, i, hw, cap, join, ml): i64 {
     var bi = i + 1;
     if (bi == m) { bi = 0; }
     var a = load64(run + i * 8);
@@ -716,7 +853,7 @@ fn _sd_sb_unit(run, m, closed, i, hw, cap, join, ml): i64 {
         if (closed == 0) { _sd_sb_endcap(ax, ay, ox, oy, 0, cap, hw); }
     } else {
         var pv = load64(run + (i - 1) * 8);
-        _sd_sb_join(sd_point_x(pv), sd_point_y(pv), ax, ay, bx, by, hw, join, ml, load8(_sd_sb_inner + i));
+        _sd_sb_join(sd_point_x(pv), sd_point_y(pv), ax, ay, bx, by, hw, join, ml, load8(inner + i));
     }
     _sd_sb_rect(ax, ay, bx, by, ox, oy);
     if (bi == 0) {
@@ -732,12 +869,13 @@ fn _sd_sb_unit(run, m, closed, i, hw, cap, join, ml): i64 {
     return 0;
 }
 
-# Stroke one flattened subpath run (n points, curve flags in _sd_sb_inner) into the batch.
-fn _sd_sb_subpath(cv, run, n, closed, hw, cap, join, ml): i64 {
-    # Drop consecutive coincident points, in place (the write index never passes the read index).
-    # A kept point is inside a curve only if every point it absorbs is: where a verb's end meets
-    # a coincident curve point, the verbs' join style wins.
-    var inner = _sd_sb_inner;
+# Drop consecutive coincident points of run[0, n) IN PLACE (the write index never passes the read
+# index), and — for a closed subpath — the trailing duplicate of point 0, so a zero-length closing
+# segment makes no join. `inner` is the parallel curve-flag array, compacted with it: a kept point
+# is inside a curve only if every point it absorbs is (where a verb's end meets a coincident curve
+# point, the verbs' join style wins). Returns the count kept. ⚠ Every segment of the result has
+# non-zero length, which the dash walk (src/dash.cyr) needs as much as the join math does.
+fn _sd_sb_dedup(run, inner, n, closed): i64 {
     var m = 0;
     var k = 0;
     while (k < n) {
@@ -767,6 +905,12 @@ fn _sd_sb_subpath(cv, run, n, closed, hw, cap, join, ml): i64 {
             }
         }
     }
+    return m;
+}
+
+# Stroke one flattened subpath run (n points, curve flags in `inner`) into the batch.
+fn _sd_sb_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
+    var m = _sd_sb_dedup(run, inner, n, closed);
 
     if (m == 1) {
         if (_sd_sb_room(SD_STROKE_UNIT_EDGES) == 0) { _sd_sb_flush(cv); }
@@ -807,11 +951,11 @@ fn _sd_sb_subpath(cv, run, n, closed, hw, cap, join, ml): i64 {
                 }
             }
             while (j < i) {
-                _sd_sb_unit(run, m, closed, j, hw, cap, join, ml);
+                _sd_sb_unit(run, inner, m, closed, j, hw, cap, join, ml);
                 j = j + 1;
             }
         }
-        _sd_sb_unit(run, m, closed, i, hw, cap, join, ml);
+        _sd_sb_unit(run, inner, m, closed, i, hw, cap, join, ml);
         i = i + 1;
     }
     if (closed != 0) {
@@ -822,7 +966,7 @@ fn _sd_sb_subpath(cv, run, n, closed, hw, cap, join, ml): i64 {
             while (f < 16) {
                 if (ahead < 2 * hw + 3 * SD_ONE) {
                     if (f < s - 1) {
-                        _sd_sb_unit(run, m, closed, f, hw, cap, join, ml);
+                        _sd_sb_unit(run, inner, m, closed, f, hw, cap, join, ml);
                         ahead = ahead + _sd_sb_seglen(run, m, f);
                     }
                 }
@@ -857,6 +1001,95 @@ fn _sd_sb_mark_curve(n0, n): i64 {
     return 0;
 }
 
+# One subpath of the run, to the batch — whole (`dashed` == 0) or cut into dashes (src/dash.cyr).
+# ⚠ The ONE call that runs from this file into dash.cyr, and the reason the [lib] order reads
+# stroke.cyr then dash.cyr: dash.cyr is built ON the stroker (it cuts a run into pieces and hands
+# each back to _sd_sb_subpath), and this is the hook that lets both entry points share ONE verb
+# walk, so a flatten fix cannot reach solid strokes and miss dashed ones.
+fn _sd_sb_dispatch(cv, run_n, closed, hw, cap, join, ml, dashed): i64 {
+    if (dashed != 0) {
+        return _sd_dash_subpath(cv, _sd_stroke_run, _sd_sb_inner, run_n, closed, hw, cap, join, ml);
+    }
+    return _sd_sb_subpath(cv, _sd_stroke_run, _sd_sb_inner, run_n, closed, hw, cap, join, ml);
+}
+
+# The styled stroker's verb walk: flatten `path`'s curve verbs at tol = SD_ONE >> 2 into the
+# stroker's run (raster.cyr's scratch) with the parallel curve flags, hand each subpath to
+# _sd_sb_dispatch, and fill the batch once at the end. Both public styled entry points are this
+# walk plus their own argument checks; the caller has already run _sd_scratch_init / _sd_sb_init
+# and cleared _sd_run_trunc.
+# ⚠ The run and its curve flags GROW (0.6.1): read _sd_stroke_run at each use, never a copy taken
+# before a push.
+fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
+    var n_verbs = sd_path_verb_count(path);
+    var tol = SD_ONE >> 2;
+    var run_n = 0;
+    var fbuf = _sd_stroke_fbuf;
+    var fctx = _sd_stroke_fctx;
+
+    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
+    var points = load64(path + SD_PATH_POINTS_OFFSET);
+    var cur = 0;
+    var start = 0;
+    var vi = 0;
+    var pi = 0;
+    while (vi < n_verbs) {
+        var verb = load64(verbs + vi * 8);
+        if (verb == SD_VERB_MOVETO) {
+            if (run_n > 0) { _sd_sb_dispatch(cv, run_n, 0, hw, cap, join, ml, dashed); }
+            cur = load64(points + pi * 8);
+            start = cur;
+            store64(_sd_stroke_run + 0, cur);
+            run_n = 1;
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_LINETO) {
+            run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
+            cur = load64(points + pi * 8);
+            run_n = _sd_run_push(run_n, cur, 1);
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_QUADTO) {
+            run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
+            var qc = load64(points + pi * 8);
+            var qe = load64(points + (pi + 1) * 8);
+            store64(fctx + 0, fbuf);
+            store64(fctx + 8, 0);
+            store64(fctx + 16, SD_FLATTEN_CAP);
+            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
+            var qn0 = run_n;
+            run_n = _sd_run_append(run_n, fctx, 1);
+            _sd_sb_mark_curve(qn0, run_n);
+            cur = qe;
+            pi = pi + 2;
+        }
+        if (verb == SD_VERB_CUBICTO) {
+            run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
+            var k1 = load64(points + pi * 8);
+            var k2 = load64(points + (pi + 1) * 8);
+            var ke = load64(points + (pi + 2) * 8);
+            store64(fctx + 0, fbuf);
+            store64(fctx + 8, 0);
+            store64(fctx + 16, SD_FLATTEN_CAP);
+            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
+            var cn0 = run_n;
+            run_n = _sd_run_append(run_n, fctx, 1);
+            _sd_sb_mark_curve(cn0, run_n);
+            cur = ke;
+            pi = pi + 3;
+        }
+        if (verb == SD_VERB_CLOSE) {
+            if (run_n > 0) { _sd_sb_dispatch(cv, run_n, 1, hw, cap, join, ml, dashed); }
+            run_n = 0;
+            cur = start;
+        }
+        vi = vi + 1;
+    }
+    if (run_n > 0) { _sd_sb_dispatch(cv, run_n, 0, hw, cap, join, ml, dashed); }
+    _sd_sb_flush(cv);
+    return SADISH_OK;
+}
+
 # ================================================================
 # sd_canvas_stroke_path_ex — stroke `path` at `width` (16.16 full width) with cap style `cap`
 # (SD_CAP_BUTT | SD_CAP_ROUND | SD_CAP_SQUARE), join style `join` (SD_JOIN_MITER |
@@ -888,80 +1121,11 @@ fn sd_canvas_stroke_path_ex(cv, path, width, cap, join, miter_limit): i64 {
     var ml = miter_limit;
     if (ml < SD_ONE) { ml = SD_ONE; }
     if (ml > SD_MITER_LIMIT_MAX) { ml = SD_MITER_LIMIT_MAX; }
-    var tol = SD_ONE >> 2;
 
     # The stroker's run/fbuf/fctx (raster.cyr) stay live across the batch flushes; the batch is
     # this file's own scratch.
     _sd_scratch_init();
     _sd_sb_init();                      # the batch is empty: every call ends in _sd_sb_flush
-    var run = _sd_stroke_run;
-    var run_n = 0;
-    var fbuf = _sd_stroke_fbuf;
-    var fctx = _sd_stroke_fctx;
-
-    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
-    var points = load64(path + SD_PATH_POINTS_OFFSET);
-    var cur = 0;
-    var start = 0;
-    var vi = 0;
-    var pi = 0;
-    while (vi < n_verbs) {
-        var verb = load64(verbs + vi * 8);
-        if (verb == SD_VERB_MOVETO) {
-            if (run_n > 0) { _sd_sb_subpath(cv, run, run_n, 0, hw, cap, join, ml); }
-            cur = load64(points + pi * 8);
-            start = cur;
-            store64(run + 0, cur);
-            run_n = 1;
-            pi = pi + 1;
-        }
-        if (verb == SD_VERB_LINETO) {
-            run_n = _sd_sb_restart(run, run_n, cur);
-            cur = load64(points + pi * 8);
-            if (run_n < SD_FLATTEN_CAP) {
-                store64(run + run_n * 8, cur);
-                store8(_sd_sb_inner + run_n, 0);
-                run_n = run_n + 1;
-            }
-            pi = pi + 1;
-        }
-        if (verb == SD_VERB_QUADTO) {
-            run_n = _sd_sb_restart(run, run_n, cur);
-            var qc = load64(points + pi * 8);
-            var qe = load64(points + (pi + 1) * 8);
-            store64(fctx + 0, fbuf);
-            store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
-            var qn0 = run_n;
-            run_n = sd_stroke_append(run, run_n, fctx);
-            _sd_sb_mark_curve(qn0, run_n);
-            cur = qe;
-            pi = pi + 2;
-        }
-        if (verb == SD_VERB_CUBICTO) {
-            run_n = _sd_sb_restart(run, run_n, cur);
-            var k1 = load64(points + pi * 8);
-            var k2 = load64(points + (pi + 1) * 8);
-            var ke = load64(points + (pi + 2) * 8);
-            store64(fctx + 0, fbuf);
-            store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
-            var cn0 = run_n;
-            run_n = sd_stroke_append(run, run_n, fctx);
-            _sd_sb_mark_curve(cn0, run_n);
-            cur = ke;
-            pi = pi + 3;
-        }
-        if (verb == SD_VERB_CLOSE) {
-            if (run_n > 0) { _sd_sb_subpath(cv, run, run_n, 1, hw, cap, join, ml); }
-            run_n = 0;
-            cur = start;
-        }
-        vi = vi + 1;
-    }
-    if (run_n > 0) { _sd_sb_subpath(cv, run, run_n, 0, hw, cap, join, ml); }
-    _sd_sb_flush(cv);
-    return SADISH_OK;
+    _sd_run_trunc = 0;
+    return _sd_styled_walk(cv, path, hw, cap, join, ml, 0);
 }
