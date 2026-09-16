@@ -231,8 +231,10 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
             pi = pi + 1;
         }
         if (verb == SD_VERB_LINETO) {
-            cur = load64(points + pi * 8);
-            run_n = _sd_run_push(run_n, cur, 0);
+            if (cur != 0) {             # a drawing verb before any moveto is skipped (raster.cyr)
+                cur = load64(points + pi * 8);
+                run_n = _sd_run_push(run_n, cur, 0);
+            }
             pi = pi + 1;
         }
         if (verb == SD_VERB_QUADTO) {
@@ -241,9 +243,11 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
-            run_n = _sd_run_append(run_n, fctx, 0);
-            cur = qe;
+            if (cur != 0) {             # a curve before any moveto is skipped (see raster.cyr)
+                sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
+                run_n = _sd_run_append(run_n, fctx, 0);
+                cur = qe;
+            }
             pi = pi + 2;
         }
         if (verb == SD_VERB_CUBICTO) {
@@ -253,9 +257,11 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
-            run_n = _sd_run_append(run_n, fctx, 0);
-            cur = ke;
+            if (cur != 0) {             # a curve before any moveto is skipped (see raster.cyr)
+                sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
+                run_n = _sd_run_append(run_n, fctx, 0);
+                cur = ke;
+            }
             pi = pi + 3;
         }
         if (verb == SD_VERB_CLOSE) {
@@ -1044,12 +1050,15 @@ fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
             pi = pi + 1;
         }
         if (verb == SD_VERB_LINETO) {
-            run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
-            cur = load64(points + pi * 8);
-            run_n = _sd_run_push(run_n, cur, 1);
+            if (cur != 0) {             # a drawing verb before any moveto is skipped
+                run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
+                cur = load64(points + pi * 8);
+                run_n = _sd_run_push(run_n, cur, 1);
+            }
             pi = pi + 1;
         }
         if (verb == SD_VERB_QUADTO) {
+            if (cur == 0) { pi = pi + 2; vi = vi + 1; continue; }
             run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
             var qc = load64(points + pi * 8);
             var qe = load64(points + (pi + 1) * 8);
@@ -1064,6 +1073,7 @@ fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
             pi = pi + 2;
         }
         if (verb == SD_VERB_CUBICTO) {
+            if (cur == 0) { pi = pi + 3; vi = vi + 1; continue; }
             run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
             var k1 = load64(points + pi * 8);
             var k2 = load64(points + (pi + 1) * 8);

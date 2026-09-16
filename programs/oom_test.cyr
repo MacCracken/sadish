@@ -1,0 +1,604 @@
+# programs/oom_test.cyr — RUN test for REFUSED ALLOCATIONS in raster.cyr, present.cyr and error.cyr.
+#
+# ⭐⭐ WHAT THIS EXISTS TO PROVE. The 0.5.5 seam lets a consumer install any allocator, and the
+# natural one to install is a per-frame arena — which can RUN OUT. Through 0.7.0 a refusal inside
+# the clip pushes, the PPM sink, the presenter and the error record was a null-pointer STORE:
+# rekha's filing measured `sd_path_moveto` on a one-block budget dying with SIGSEGV, rc 139
+# (docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md).
+# This suite drives a FAILING hook in two modes — grant the first K and refuse the rest, or refuse
+# only the K-th — and sweeps K so that each site in this half of the filing is the failing one in turn.
+#
+# ⛔ THE THREE THINGS ASSERTED AT EVERY SITE, because a return code alone is not the fix:
+#   (a) the process does not fault — the suite runs to completion and prints;
+#   (b) the documented code comes back (SADISH_ERR_OOM for the clip pushes and the PPM sink,
+#       0 from the constructors);
+#   (c) NOTHING MOVED. The canvas still carries the clip it carried, that clip still pops back to
+#       the region under it, a fill through it lands the same coverage, a push retried once memory
+#       is available lands the region it always would have, and the caller's own mask is
+#       byte-for-byte untouched by a push that refused.
+#
+# ⚠ WHY GROUP A WARMS FIRST, AND WHY IT IS NOT OPTIONAL. raster.cyr's fill/stroke scratch comes
+# from the GLOBAL `alloc`, never sd_alloc — a scratch drawn from an arena that gets reset would
+# dangle on the next frame (src/alloc.cyr). A budget hook therefore CANNOT starve it, which is the
+# point: every refusal below is a refusal of the site it names. But `_sd_fill_accrow_for` grows on
+# the global heap when a canvas WIDER than any seen before arrives, so group A fills at the widest
+# width any budgeted call uses (8 px, including the temp mask canvas behind clip_push_path) before
+# the first budget is set. Without that, a budgeted call would be measuring a global-heap growth it
+# does not claim to be measuring.
+# ⚠ EVERY PATH HERE IS STRAIGHT-LINE ONLY, deliberately (group K's is emptier still — no verbs at
+# all). `sd_path_new`'s verb/point arrays and the flatten mid-points from `sd_point_new` are
+# path.cyr / geom.cyr sites — the OTHER half of the same filing — and every path is built with NO
+# HOOK ARMED, so this suite never asserts anything about someone else's fix.
+# ⚠ GROUP K IS NOT ABOUT REFUSALS. It holds the three degenerate-input answers these files document
+# in prose — the empty-path clip push, the 0-pixel PPM, the 0-area clip rect — because a comment
+# that nothing asserts is not a contract, and each of those three lines can be "simplified" into a
+# different public return with every other suite still green.
+# ⛔ NOTHING HERE TOUCHES /dev/fb0. `sd_present_open`'s first act is to open the live display, so it
+# is never called; every one of its four refusal paths is reached through `_sd_present_probe` and
+# `_sd_presenter_build`, which the 0.7.1 split gave a caller-supplied fd — here a regular file under
+# build/, whose failing ioctls leave the probe on its own 640x480x32 fallbacks. The PPM sink
+# likewise writes only under build/.
+#
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "oom_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    var sep = "  got ";
+    syscall(1, 2, sep, strlen(sep));
+    fmt_int_fd(2, got);
+    var sep2 = " want ";
+    syscall(1, 2, sep2, strlen(sep2));
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- the failing hook, in two modes ------------------------------------------------------
+# BUDGET (oom_budget k): grant the first k allocations, refuse every one after — an arena that has
+#   run out, which is the shape of the failure the 0.5.5 seam makes reachable.
+# FAIL-ONLY (oom_fail_only k): refuse the k-th allocation and grant everything else — the sweep
+#   that isolates ONE site. ⛔ Not the same test: where a function checks two blocks in a row, the
+#   budget mode lets the SECOND check mask a missing first one (MEASURED: with
+#   sd_surface_write_ppm's header check deleted, budget 0 still returns SADISH_ERR_OOM, because the
+#   refused RGB block catches it one line later; fail-only 1 stores through the null header).
+# The arena is 4 MiB and this suite hands out under 1.3 MB of it, so it never chains a chunk — a
+# chunk would come from the global allocator and spoil the exact global-heap deltas in A, H, J and K.
+var g_arena = 0;
+var g_mode = 0;
+var g_k = 0;
+var g_seen = 0;
+var g_grants = 0;
+var g_refusals = 0;
+
+fn oom_hook(n): i64 {
+    g_seen = g_seen + 1;
+    var refuse = 0;
+    if (g_mode == 0) {
+        if (g_seen > g_k) { refuse = 1; }
+    } else {
+        if (g_seen == g_k) { refuse = 1; }
+    }
+    if (refuse != 0) {
+        g_refusals = g_refusals + 1;
+        return 0;
+    }
+    g_grants = g_grants + 1;
+    return arena_alloc(g_arena, n);
+}
+
+fn oom_arm(mode, k): i64 {
+    g_mode = mode;
+    g_k = k;
+    g_seen = 0;
+    g_grants = 0;
+    g_refusals = 0;
+    sd_alloc_set(&oom_hook);
+    return 0;
+}
+
+# Install the hook granting exactly `k` allocations; the (k+1)-th and every later one is refused.
+fn oom_budget(k): i64 {
+    return oom_arm(0, k);
+}
+
+# Install the hook refusing ONLY the k-th allocation (1-based); every other one is granted.
+fn oom_fail_only(k): i64 {
+    return oom_arm(1, k);
+}
+
+# Restore the global allocator.
+fn oom_restore(): i64 {
+    sd_alloc_set(0);
+    return 0;
+}
+
+# ---- shapes and probes -------------------------------------------------------------------
+# A closed whole-pixel rect — straight edges only, so a fill of it allocates nothing at all.
+fn oom_rect_path(x0, y0, x1, y1): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, x0 * SD_ONE, y0 * SD_ONE);
+    sd_path_lineto(p, x1 * SD_ONE, y0 * SD_ONE);
+    sd_path_lineto(p, x1 * SD_ONE, y1 * SD_ONE);
+    sd_path_lineto(p, x0 * SD_ONE, y1 * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+# A PACKED w*h clip mask, 255 inside [x0,x1) x [y0,y1) — from the GLOBAL alloc on purpose, so the
+# budget hook never sees it and group C can hand sd_clip_push_mask a shape whose bytes it owns.
+fn oom_mask(w, h, x0, y0, x1, y1): i64 {
+    var m = alloc(w * h);
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var v = 0;
+            if (x >= x0) {
+                if (x < x1) {
+                    if (y >= y0) {
+                        if (y < y1) { v = 255; }
+                    }
+                }
+            }
+            store8(m + y * w + x, v);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return m;
+}
+
+fn oom_byte_sum(p, n): i64 {
+    var s = 0;
+    var i = 0;
+    while (i < n) {
+        s = s + load8(p + i);
+        i = i + 1;
+    }
+    return s;
+}
+
+# Total coverage of a canvas — one number that moves if any pixel of a clipped fill moves.
+fn oom_cov_sum(cv): i64 {
+    var w = sd_canvas_width(cv);
+    var h = sd_canvas_height(cv);
+    var s = 0;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            s = s + sd_canvas_coverage_at(cv, x, y);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return s;
+}
+
+# Clear, fill, and report the total coverage — the canvas's clip state, read out as a number.
+fn oom_fill_sum(cv, p): i64 {
+    sd_canvas_clear(cv);
+    sd_canvas_fill_path(cv, p, SD_FILL_NONZERO);
+    return oom_cov_sum(cv);
+}
+
+fn oom_slurp(path, buf, cap): i64 {
+    var fd = syscall(2, path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var n = syscall(0, fd, buf, cap);
+    syscall(3, fd);
+    return n;
+}
+
+fn oom_diff(a, b, n): i64 {
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var FULL = 8 * 8 * 255;      # 16,320 — an unclipped 8x8 fill
+    var R44  = 4 * 4 * 255;      #  4,080 — clipped to [2,6) x [2,6)
+    var R22  = 2 * 2 * 255;      #  1,020 — clipped to [4,6) x [4,6)
+
+    # ── A) WARM THE GLOBAL-HEAP SCRATCH, AND BASELINE EVERY NUMBER BELOW ──────────────
+    var cv = sd_canvas_new(8, 8);
+    var full = oom_rect_path(0, 0, 8, 8);
+    var inner = oom_rect_path(4, 4, 8, 8);
+    check(sd_alloc_get(), 0);                                          # 1 — no hook yet
+    check(sd_canvas_fill_path(cv, full, SD_FILL_NONZERO), SADISH_OK);   # 2 — first fill: scratch + accrow
+    var g0 = alloc_used();
+    check(oom_fill_sum(cv, full), FULL);                               # 3
+    check(alloc_used() - g0, 0);                                       # 4 — warm: a fill costs the heap 0 B
+    g_arena = arena_new_growable(4194304);
+    check(g_arena != 0, 1);                                            # 5
+
+    # ── B) sd_canvas_clip_push_rect — the w*h mask, then the 16 B node ─────────────
+    check(sd_canvas_clip_push_rect(cv, 2, 2, 6, 6), SADISH_OK);        # 6
+    check(oom_fill_sum(cv, full), R44);                                # 7 — the region to be preserved
+    # K = 0: the MASK is refused. Through 0.7.0 sd_alloc's 0 was written through by the rect loop.
+    oom_budget(0);
+    check(sd_canvas_clip_push_rect(cv, 4, 4, 8, 8), SADISH_ERR_OOM);   # 8
+    check(g_grants, 0);                                                # 9
+    check(g_refusals, 1);                                              # 10 — one attempt, not a retry loop
+    oom_restore();
+    check(oom_fill_sum(cv, full), R44);                                # 11 — the clip under it is intact
+    # K = 1: the mask is granted, the NODE is refused — rekha's raster.cyr:736.
+    oom_budget(1);
+    check(sd_canvas_clip_push_rect(cv, 4, 4, 8, 8), SADISH_ERR_OOM);   # 12
+    check(g_grants, 1);                                                # 13
+    check(g_refusals, 1);                                              # 14
+    oom_restore();
+    check(oom_fill_sum(cv, full), R44);                                # 15 — still intact
+    # K = 2: the same push now succeeds and lands EXACTLY the region the refusals would have.
+    oom_budget(2);
+    check(sd_canvas_clip_push_rect(cv, 4, 4, 8, 8), SADISH_OK);        # 16
+    check(g_grants, 2);                                                # 17
+    check(g_refusals, 0);                                              # 18
+    oom_restore();
+    check(oom_fill_sum(cv, full), R22);                                # 19 — [2,6) ∩ [4,8) = [4,6)
+    check(sd_canvas_clip_pop(cv), SADISH_OK);                          # 20
+    check(oom_fill_sum(cv, full), R44);                                # 21 — pops back to the previous region
+    check(sd_canvas_clip_pop(cv), SADISH_OK);                          # 22
+    check(oom_fill_sum(cv, full), FULL);                               # 23 — and all the way to unclipped
+
+    # ── C) sd_clip_push_mask — A REFUSAL MUST NOT CONSUME THE CALLER'S MASK ───────────
+    # The node is taken BEFORE the in-place intersection (0.7.1). Checking it after the multiply
+    # would stop the fault and still leave `shape` multiplied by a clip it was never pushed under.
+    check(sd_canvas_clip_push_rect(cv, 2, 2, 6, 6), SADISH_OK);        # 24
+    check(oom_fill_sum(cv, full), R44);                                # 25
+    var m = oom_mask(8, 8, 0, 0, 4, 4);
+    check(oom_byte_sum(m, 64), 16 * 255);                              # 26 — 4x4 of 255
+    oom_budget(0);
+    check(sd_clip_push_mask(cv, m), SADISH_ERR_OOM);                   # 27
+    oom_restore();
+    check(oom_byte_sum(m, 64), 16 * 255);                              # 28 ⭐ the mask is untouched
+    check(oom_fill_sum(cv, full), R44);                                # 29 — and so is the clip
+    # Granted, the very same call intersects and pushes: [0,4) ∩ [2,6) = [2,4), 2x2 = 4 px.
+    oom_budget(1);
+    check(sd_clip_push_mask(cv, m), SADISH_OK);                        # 30
+    oom_restore();
+    check(oom_byte_sum(m, 64), 4 * 255);                               # 31 — NOW it is intersected
+    check(oom_fill_sum(cv, full), 4 * 255);                            # 32
+    check(sd_canvas_clip_pop(cv), SADISH_OK);                          # 33
+    check(oom_fill_sum(cv, full), R44);                                # 34
+    # The two argument guards, with no hook in sight.
+    check(sd_clip_push_mask(cv, 0), SADISH_ERR_OOM);                   # 35 — a refused caller mask
+    check(sd_clip_push_mask(0, m), SADISH_ERR_BOUNDS);                 # 36 — a null canvas
+    check(oom_fill_sum(cv, full), R44);                                # 37 — neither pushed anything
+
+    # ── D) sd_canvas_clip_push_path — the temp canvas, its coverage, then the node ────
+    # K = 0 and K = 1 both refuse inside sd_canvas_new, which returns 0; 0.7.0 then loaded the
+    # coverage pointer out of that 0 (sd_canvas_coverage) and faulted.
+    oom_budget(0);
+    check(sd_canvas_clip_push_path(cv, inner, SD_FILL_NONZERO), SADISH_ERR_OOM);  # 38
+    check(g_grants, 0);                                                # 39 — the 48 B header
+    oom_restore();
+    oom_budget(1);
+    check(sd_canvas_clip_push_path(cv, inner, SD_FILL_NONZERO), SADISH_ERR_OOM);  # 40
+    check(g_grants, 1);                                                # 41 — the w*h coverage
+    oom_restore();
+    oom_budget(2);
+    check(sd_canvas_clip_push_path(cv, inner, SD_FILL_NONZERO), SADISH_ERR_OOM);  # 42
+    # ⭐ Check 43 is the load-bearing one: the canvas took two, the straight-line fill asks the
+    # hook for NOTHING, so the only allocation left to refuse is the clip node.
+    check(g_grants, 2);                                                # 43
+    check(g_refusals, 1);                                              # 44
+    oom_restore();
+    check(oom_fill_sum(cv, full), R44);                                # 45 — three refusals, clip intact
+    oom_budget(3);
+    check(sd_canvas_clip_push_path(cv, inner, SD_FILL_NONZERO), SADISH_OK);       # 46
+    check(g_grants, 3);                                                # 47
+    oom_restore();
+    check(oom_fill_sum(cv, full), R22);                                # 48 — the same [4,6) region
+    check(sd_canvas_clip_pop(cv), SADISH_OK);                          # 49
+    check(oom_fill_sum(cv, full), R44);                                # 50
+    check(sd_canvas_clip_pop(cv), SADISH_OK);                          # 51
+    check(oom_fill_sum(cv, full), FULL);                               # 52
+
+    # ── E) sd_surface_write_ppm — A REFUSAL MUST NOT TRUNCATE THE TARGET FILE ────────
+    # The open is O_TRUNC, so 0.7.0's order (open, then allocate) would have replaced a readable
+    # PPM with a 0-byte file on the way to the fault. 0.7.1 takes both blocks first.
+    var s = sd_surface_new(4, 2);
+    sd_plot(s, 0, 0, sd_rgb(255, 0, 0));
+    sd_plot(s, 1, 0, sd_rgb(0, 255, 0));
+    var ppm = "build/oom_test.ppm";
+    check(sd_surface_write_ppm(s, ppm), SADISH_OK);                    # 53
+    var ref = alloc(256);
+    var got = alloc(256);
+    var nref = oom_slurp(ppm, ref, 256);
+    check(nref, 11 + 4 * 2 * 3);                                       # 54 — "P6\n4 2\n255\n" + 24 RGB
+    # ⚠ FAIL-ONLY, not a budget: with the header check deleted and a BUDGET of 0, the refused RGB
+    # block catches the failure one line later and the call still returns SADISH_ERR_OOM. Refusing
+    # only the header — the RGB block available — is what actually isolates it.
+    oom_fail_only(1);
+    check(sd_surface_write_ppm(s, ppm), SADISH_ERR_OOM);               # 55 — the 32 B header block
+    check(g_grants, 0);                                                # 56 — it stopped there
+    oom_restore();
+    check(oom_slurp(ppm, got, 256), nref);                             # 57 ⭐ not truncated
+    check(oom_diff(ref, got, nref), 0);                                # 58 ⭐ byte-for-byte the old file
+    oom_fail_only(2);
+    check(sd_surface_write_ppm(s, ppm), SADISH_ERR_OOM);               # 59 — the w*h*3 RGB block
+    check(g_grants, 1);                                                # 60
+    oom_restore();
+    check(oom_slurp(ppm, got, 256), nref);                             # 61
+    check(oom_diff(ref, got, nref), 0);                                # 62
+    oom_budget(2);
+    check(sd_surface_write_ppm(s, ppm), SADISH_OK);                    # 63 — granted, it writes
+    check(g_refusals, 0);                                              # 64
+    oom_restore();
+    check(oom_slurp(ppm, got, 256), nref);                             # 65
+    check(oom_diff(ref, got, nref), 0);                                # 66 — the same PPM as before
+    check(sd_surface_write_ppm(0, ppm), SADISH_ERR_BOUNDS);            # 67 — the null-surface guard
+
+    # ── F) _sd_presenter_build — NO LEAKED fd, NO HALF-BUILT PRESENTER ─────────────
+    # ⛔ A REGULAR FILE, never /dev/fb0. O_RDWR|O_CREAT|O_TRUNC = 2|64|512 = 578, mode 0644 = 420.
+    var probe = alloc(8);
+    store8(probe, 65);
+    var fd1 = syscall(2, "build/oom_test.fb", 578, 420);
+    check(fd1 >= 0, 1);                                                # 68
+    oom_budget(0);
+    check(_sd_presenter_build(fd1, 30, 22, 32, 128), 0);               # 69 — the 72 B record refused
+    oom_restore();
+    check(syscall(1, fd1, probe, 1) < 0, 1);                           # 70 ⭐ the fd was closed (EBADF)
+    var fd2 = syscall(2, "build/oom_test.fb", 578, 420);
+    check(fd2 >= 0, 1);                                                # 71
+    oom_budget(1);
+    check(_sd_presenter_build(fd2, 30, 22, 32, 128), 0);               # 72 — pitch*yres scratch refused
+    check(g_grants, 1);                                                # 73
+    oom_restore();
+    check(syscall(1, fd2, probe, 1) < 0, 1);                           # 74 ⭐ closed on this path too
+    var fd3 = syscall(2, "build/oom_test.fb", 578, 420);
+    check(fd3 >= 0, 1);                                                # 75
+    oom_budget(2);
+    var pres = _sd_presenter_build(fd3, 30, 22, 32, 128);
+    oom_restore();
+    check(pres != 0, 1);                                               # 76
+    check(load64(pres + SD_PRES_FD_OFFSET), fd3);                      # 77
+    check(load64(pres + SD_PRES_BLIT_OFFSET) != 0, 1);                 # 78 — a whole presenter, not a stub
+    check(sd_present_blit(pres, s), SADISH_OK);                        # 79 — and sd_present_blit uses it
+    check(sd_present_close(pres), SADISH_OK);                          # 80
+    check(sd_present_close(0), SADISH_OK);                             # 81 — the null guard is unchanged
+    # _sd_present_probe is the rest of sd_present_open: the two 256 B ioctl buffers, then the build
+    # above. On a REGULAR FILE both ioctls fail and leave the zeroed buffers, so the <= 0 fallbacks
+    # give 640x480x32 at a 2,560 B pitch — geometry sadish chose, not the display's, and the whole
+    # point: this reaches every allocation guard sd_present_open has without opening /dev/fb0.
+    var fd4 = syscall(2, "build/oom_test.fb", 578, 420);
+    check(fd4 >= 0, 1);                                                # 82
+    oom_fail_only(1);
+    check(_sd_present_probe(fd4), 0);                                  # 83 — vinfo refused
+    oom_restore();
+    check(syscall(1, fd4, probe, 1) < 0, 1);                           # 84 — fd closed
+    var fd5 = syscall(2, "build/oom_test.fb", 578, 420);
+    oom_fail_only(2);
+    check(_sd_present_probe(fd5), 0);                                  # 85 — finfo refused
+    check(g_grants, 1);                                                # 86
+    oom_restore();
+    check(syscall(1, fd5, probe, 1) < 0, 1);                           # 87 — fd closed
+    var fd6 = syscall(2, "build/oom_test.fb", 578, 420);
+    oom_fail_only(3);
+    check(_sd_present_probe(fd6), 0);                                  # 88 — the 72 B record refused
+    oom_restore();
+    check(syscall(1, fd6, probe, 1) < 0, 1);                           # 89 — fd closed
+    var fd7 = syscall(2, "build/oom_test.fb", 578, 420);
+    oom_fail_only(4);
+    check(_sd_present_probe(fd7), 0);                                  # 90 — the blit scratch refused
+    check(g_grants, 3);                                                # 91
+    oom_restore();
+    check(syscall(1, fd7, probe, 1) < 0, 1);                           # 92 — fd closed
+    var fd8 = syscall(2, "build/oom_test.fb", 578, 420);
+    oom_budget(4);
+    var pres2 = _sd_present_probe(fd8);
+    oom_restore();
+    check(pres2 != 0, 1);                                              # 93 — granted, a real presenter
+    check(load64(pres2 + SD_PRES_XRES_OFFSET), 640);                   # 94 — the ioctl-less fallbacks
+    check(load64(pres2 + SD_PRES_YRES_OFFSET), 480);                   # 95
+    check(load64(pres2 + SD_PRES_BPP_OFFSET), 32);                     # 96
+    check(load64(pres2 + SD_PRES_PITCH_OFFSET), 640 * 4);              # 97 — minpitch, not the file's 0
+    check(load64(pres2 + SD_PRES_BLIT_OFFSET) != 0, 1);                # 98
+    check(sd_present_close(pres2), SADISH_OK);                         # 99
+
+    # ── G) sadish_err_new — A NULL RECORD READS AS SADISH_ERR_OOM ───────────────
+    var detail = "detail";
+    oom_budget(0);
+    var enull = sadish_err_new(SADISH_ERR_BOUNDS, detail);
+    check(enull, 0);                                                   # 100 — 0, not a stored-through 0
+    check(sadish_err(SADISH_ERR_BOUNDS), 0);                           # 101 — the no-detail wrapper too
+    oom_restore();
+    check(sadish_err_code(enull), SADISH_ERR_OOM);                     # 102 ⭐ a 0 record MEANS out of memory
+    check(sadish_err_detail(enull), 0);                                # 103 ⭐ and carries no detail
+    var lbl = "oom_test: deliberate stderr sample, a null SadishErr reads as: ";
+    syscall(1, 2, lbl, strlen(lbl));
+    check(sadish_err_print_name(sadish_err_code(enull)), 0);           # 104 — and printing it cannot fault
+    syscall(1, 2, "\n", 1);
+    oom_budget(1);
+    var eok = sadish_err_new(SADISH_ERR_BOUNDS, detail);
+    oom_restore();
+    check(eok != 0, 1);                                                # 105
+    check(sadish_err_code(eok), SADISH_ERR_BOUNDS);                    # 106 — a real record is unchanged
+    check(sadish_err_detail(eok), detail);                             # 107
+
+    # ── H) _sd_fill_accrow_for — A REFUSED ACCUMULATOR MUST NOT POISON THE SCRATCH ───
+    # The accumulator is the one piece of the scratch sized by the CALL, and it comes from the
+    # global `alloc` (never the hook), so it is driven here the way grow_edges_test drives the
+    # growth ceiling: with a request the allocator really refuses. A hand-built 536,870,912 px
+    # header asks for w*8 = 4 GiB, over lib/alloc.cyr's ALLOC_MAX of 2 GiB.
+    # ⛔ Through 0.7.0 the 0 was stored and the CAPACITY RAISED ANYWAY, so every later fill — on
+    # any narrower canvas, which now "fits" — wrote its accumulator through address 0. Check 111 is
+    # an ordinary 8x8 fill, and on 0.7.0 it is a SIGSEGV.
+    check(_sd_fill_accrow_cap, 8);                                     # 108 — warmed by group A
+    var big = alloc(SD_CANVAS_SIZE);
+    store64(big + SD_CANVAS_WIDTH_OFFSET, 536870912);
+    store64(big + SD_CANVAS_HEIGHT_OFFSET, 1);
+    store64(big + SD_CANVAS_COVERAGE_OFFSET, probe);   # never addressed: the refusal returns first
+    store64(big + SD_CANVAS_STRIDE_OFFSET, 536870912);
+    store64(big + SD_CANVAS_CLIP_OFFSET, 0);
+    store64(big + SD_CANVAS_AA_OFFSET, SD_AA_SUBSCANLINE);
+    var gh = alloc_used();
+    check(sd_canvas_fill_path(big, full, SD_FILL_NONZERO), SADISH_ERR_OOM);  # 109
+    check(alloc_used() - gh, 0);                                       # 110 — and it cost the heap nothing
+    check(oom_fill_sum(cv, full), FULL);                               # 111 ⭐ the next fill still works
+    check(_sd_fill_accrow_cap, 8);                                     # 112 — the capacity was not raised
+    check(load8(probe), 65);                                           # 113 — the coverage ptr was not written
+
+    # ── I) A FILL THAT REPORTS OOM WRITES NO COVERAGE, AND ITS CALLERS SAY SO ───
+    # ⛔ THE STATE, NOT THE REQUEST. Group H drove a REAL refusal, which needs w*8 > 2 GiB; the
+    # thing under test here is what sd_fill_impl and sd_canvas_clip_push_path do once
+    # _sd_fill_accrow_for has said 0, and that state is two globals. Reaching in and setting the
+    # accumulator to 0 with its capacity left alone reproduces EXACTLY the state 0.7.0 left behind
+    # after a refused growth (0 block, capacity raised) without asking for a 256 MiB coverage
+    # buffer to get there — the one shape of canvas whose w*h the allocator grants and whose w*8 it
+    # refuses. The accumulator is restored before the group ends, and check 122 proves it; the
+    # capacity is deliberately never touched, so there is nothing to put back.
+    var save_accrow = _sd_fill_accrow;
+    check(save_accrow != 0, 1);                                        # 114
+    check(sd_canvas_clip_push_rect(cv, 2, 2, 6, 6), SADISH_OK);        # 115 — a clip to preserve
+    sd_canvas_clear(cv);
+    _sd_fill_accrow = 0;
+    check(sd_canvas_fill_path(cv, full, SD_FILL_NONZERO), SADISH_ERR_OOM);  # 116
+    check(oom_cov_sum(cv), 0);                                         # 117 — not one coverage byte written
+    check(sd_canvas_clip_push_path(cv, inner, SD_FILL_NONZERO), SADISH_ERR_OOM);  # 118 ⭐ propagated
+    _sd_fill_accrow = save_accrow;
+    check(oom_fill_sum(cv, full), R44);                                # 119 — nothing was pushed
+    check(sd_canvas_clip_pop(cv), SADISH_OK);                          # 120
+    check(oom_fill_sum(cv, full), FULL);                               # 121
+    check(_sd_fill_accrow, save_accrow);                               # 122 — the scratch is as it was
+
+    # ── J) _sd_scratch_init — A PARTIAL SCRATCH MUST NOT BE PUBLISHED ───
+    # ⛔ HOW A TEST REACHES A PATH THE HOOK CANNOT. The eight scratch blocks come from the GLOBAL
+    # alloc (0.5.5's rule), which refuses only over ALLOC_MAX = 2 GiB, and the largest of them is
+    # 262,144 B — no budget can starve it. What CAN is the capacity: SD_FLATTEN_CAP sizes five of
+    # the eight, so raising it past 268,435,456 makes each of those five a request lib/alloc.cyr
+    # really refuses. Same device programs/grow_edges_test.cyr uses on the growth ceiling — a real
+    # refusal from the real allocator, not a simulated one.
+    # ⚠ Through 0.7.0 a refusal PUBLISHED THE PARTIAL SET, and _sd_fill_ectx non-zero is the
+    # "already initialised" flag: the function never ran again and every fill for the rest of the
+    # process stored through a null edge list. The retry below is the call that could not happen.
+    # ⛔ WHAT THIS GROUP CAN AND CANNOT DRIVE, said plainly because the difference is a real one.
+    # ALLOC_MAX refuses BY SIZE, and 300,000,000 puts the SMALLEST capacity-sized block (CAP*8) over
+    # the 2 GiB line, so all five are refused together and nothing is mapped: this drives the
+    # ENSEMBLE (check 125 measures exactly that — 3 * 24 B granted, five refused), never one member.
+    # A capacity that isolated the CAP*32 edge list alone would GRANT the other four — about 4.0 GB
+    # of mappings for a test that reads none of them — so it is not taken, and the three 24 B ctx
+    # blocks no capacity can reach at all. ⇒ The eight 0-tests inside
+    # _sd_scratch_init are a CONTRACT, not eight gates — deleting any one of them leaves the other
+    # seven setting `ok = 0`, and no suite can tell. What IS held here: a refusal publishes NOTHING
+    # (124), a success publishes ALL ELEVEN globals (128-138), and the shape a deleted test would
+    # produce — a 0 published behind a status of 1 — cannot reach a store, because sd_fill_impl
+    # guards on _sd_fill_ectx itself and not on the status (checks 123 and 126 run through that
+    # line in both directions).
+    var save_cap = SD_FLATTEN_CAP;
+    _sd_fill_ectx = 0;                       # force a re-initialisation
+    SD_FLATTEN_CAP = 300000000;              # * 8 = 2,400,000,000 B, over ALLOC_MAX
+    var gk = alloc_used();
+    check(sd_canvas_fill_path(cv, full, SD_FILL_NONZERO), SADISH_ERR_OOM);   # 123
+    check(_sd_fill_ectx, 0);                                           # 124 ⭐ nothing was published
+    check(alloc_used() - gk, 3 * 24);                                  # 125 — only the three 24 B ctxs
+    SD_FLATTEN_CAP = save_cap;
+    gk = alloc_used();
+    check(sd_canvas_fill_path(cv, full, SD_FILL_NONZERO), SADISH_OK);  # 126 ⭐ the retry succeeds
+    check(alloc_used() - gk, 589896);                                  # 127 — a whole fresh scratch
+    # ⭐ THE PUBLISH BLOCK, PINNED. Eleven globals go out together or not at all; a refusal can only
+    # be observed here as a set, so what is left to hold is that a SUCCESS leaves none of them 0 and
+    # every capacity at SD_FLATTEN_CAP. An edit that published one block short fails one of these.
+    check(_sd_fill_ectx != 0, 1);                                      # 128
+    check(_sd_fill_edges != 0, 1);                                     # 129
+    check(_sd_fill_edges_cap, SD_FLATTEN_CAP);                         # 130
+    check(_sd_fill_fbuf != 0, 1);                                      # 131
+    check(_sd_fill_fctx != 0, 1);                                      # 132
+    check(_sd_fill_cross != 0, 1);                                     # 133
+    check(_sd_fill_cross_cap, SD_FLATTEN_CAP);                         # 134
+    check(_sd_stroke_run != 0, 1);                                     # 135
+    check(_sd_stroke_run_cap, SD_FLATTEN_CAP);                         # 136
+    check(_sd_stroke_fbuf != 0, 1);                                    # 137
+    check(_sd_stroke_fctx != 0, 1);                                    # 138
+    check(oom_cov_sum(cv), FULL);                                      # 139 — and it fills correctly
+
+    # ── K) THE CONTRACTS THE COMMENTS CLAIM, HELD TO — NO HOOK ARMED ───────────
+    # ⛔ Every check in this group is a DOCUMENTED answer for a degenerate input that no refusal is
+    # involved in. They are here because the three comments that state them were, until this group,
+    # the only thing holding them: each of the three lines below can be "simplified" into a
+    # different public return with all the other 25 suites still green.
+    # K1 — the EMPTY-PATH asymmetry of sd_canvas_clip_push_path. A path with no verbs is
+    # SADISH_ERR_EMPTY_PATH out of the fill and SADISH_OK out of the push, which clips everything
+    # away. MEASURED identical on 0.7.0. Widening the push's OOM propagation to `!= SADISH_OK`
+    # returns EMPTY_PATH instead, pushes nothing, and leaves the caller's next pop unbalanced.
+    var empty = sd_path_new();
+    check(sd_canvas_fill_path(cv, empty, SD_FILL_NONZERO), SADISH_ERR_EMPTY_PATH);   # 140
+    check(sd_canvas_clip_push_path(cv, empty, SD_FILL_NONZERO), SADISH_OK);          # 141 ⭐ pushed anyway
+    check(oom_fill_sum(cv, full), 0);                                  # 142 ⭐ clipped away to nothing
+    check(sd_canvas_clip_pop(cv), SADISH_OK);                          # 143
+    check(oom_fill_sum(cv, full), FULL);                               # 144 — and the stack is balanced
+    # K2 — sd_surface_write_ppm's `n > 0` carve-out. sd_alloc(0) returns 0 by lib/alloc.cyr's
+    # contract and that is NOT out of memory: a 0-pixel surface still writes its header and returns
+    # SADISH_OK (MEASURED identical on 0.7.0, 11 bytes: "P6\n0 4\n255\n").
+    var zs = alloc(SD_SURFACE_SIZE);
+    store64(zs + SD_SURFACE_WIDTH_OFFSET, 0);
+    store64(zs + SD_SURFACE_HEIGHT_OFFSET, 4);
+    store64(zs + SD_SURFACE_PIXELS_OFFSET, probe);   # never read: w = 0 rows of 0 pixels
+    store64(zs + SD_SURFACE_STRIDE_OFFSET, 0);
+    var zppm = "build/oom_test_zero.ppm";
+    # ⚠ Unlink first. A stale file from a previous run would let checks 146-147 read bytes THIS run
+    # never wrote — MEASURED: with the n > 0 guard deleted AND this line deleted, only 145 fails.
+    syscall(87, zppm);
+    check(sd_surface_write_ppm(zs, zppm), SADISH_OK);                  # 145 ⭐ not SADISH_ERR_OOM
+    check(oom_slurp(zppm, got, 256), 11);                              # 146 — the header, and only it
+    check(oom_diff(got, "P6\n0 4\n255\n", 11), 0);                     # 147 — and it is a real P6 header
+    check(load8(probe), 65);                                           # 148 — no pixel was touched
+    # K3 — and the OPPOSITE answer for the same sd_alloc(0) one file away, on purpose. A 0-area
+    # canvas is SADISH_ERR_OOM out of sd_canvas_clip_push_rect and pushes nothing. ⚠ This is the one
+    # deliberate behaviour CHANGE in this item: 0.7.0 returned SADISH_OK here and pushed a clip node
+    # whose mask pointer was address 0 (MEASURED on both trees). Only a hand-built header can ask —
+    # sd_canvas_new refuses w <= 0 and h <= 0.
+    var zc = alloc(SD_CANVAS_SIZE);
+    store64(zc + SD_CANVAS_WIDTH_OFFSET, 0);
+    store64(zc + SD_CANVAS_HEIGHT_OFFSET, 4);
+    store64(zc + SD_CANVAS_COVERAGE_OFFSET, probe);
+    store64(zc + SD_CANVAS_STRIDE_OFFSET, 0);
+    store64(zc + SD_CANVAS_CLIP_OFFSET, 0);
+    store64(zc + SD_CANVAS_AA_OFFSET, SD_AA_SUBSCANLINE);
+    check(sd_canvas_clip_push_rect(zc, 0, 0, 1, 1), SADISH_ERR_OOM);   # 149 ⭐ a CHANGE from 0.7.0
+    check(load64(zc + SD_CANVAS_CLIP_OFFSET), 0);                      # 150 — no null-masked node pushed
+
+    # ── L) NOTHING ELSE MOVED ───────────────────────────
+    # The two figures every one of the refusals above is measured against, on the global heap with
+    # no hook: a canvas is its 48 B header + w*h coverage, a rect clip its w*h mask + 16 B node.
+    var g2 = alloc_used();
+    var cv2 = sd_canvas_new(8, 8);
+    check(alloc_used() - g2, 48 + 64);                                 # 151
+    g2 = alloc_used();
+    check(sd_canvas_clip_push_rect(cv2, 2, 2, 6, 6), SADISH_OK);       # 152
+    check(alloc_used() - g2, 64 + 16);                                 # 153
+    check(oom_fill_sum(cv2, full), R44);                               # 154
+    g2 = alloc_used();
+    check(oom_fill_sum(cv2, full), R44);                               # 155
+    check(alloc_used() - g2, 0);                                       # 156 — a warm fill is still 0 B
+    check(sd_alloc_get(), 0);                                          # 157 — every scope unwound
+
+    if (g_fails == 0) {
+        var ok = "oom_test: PASS (refusals reported, state intact, no fault)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "oom_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

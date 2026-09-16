@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.7.0
+Version: 0.7.1
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -80,12 +80,31 @@ toolkit are all **consumers**, not re-implementations.
     degrades and RECORDS the truncation rather than growing without limit.
   - **Clip-mask pitch** — a mask is a packed `w*h` block on a canvas of any stride,
     stated in the layout comment and gated by `programs/clip_pitch_test.cyr`.
-- **next (0.7.1 — filed by rekha, not started):** bound the work `sd_path_flatten`
-  does past its output (MEASURED on 0.7.0: 83,623,976 B and 3.13 M allocations for
-  one hostile 4,096-quad flatten); check every `sd_alloc` result in path
-  construction, so a hook that refuses returns cleanly instead of faulting; and
-  `sd_path_new_cap` for known-size paths. See `docs/development/issues/2026-09-15-*`
-  and `docs/development/proposals/2026-09-15-*`.
+- **v0.7.1 — rekha's repairs (shipped).** All three filings closed, rendering
+  byte-identical (refagree 200/200; rekha 23 suites and dhancha 18 green):
+  - **Flattening allocates only what it emits** — the de Casteljau mids are plain
+    locals now, so a hostile 4,096-quad flatten falls from 83,623,976 B / 3.13 M
+    allocations to **3,076,136 B / 65,287**, and the recursion stops once the
+    output is full.
+  - **A per-operation flatten budget** — `SD_FLATTEN_BUDGET_DEFAULT` = 65,536
+    points, `sd_flatten_budget_set` / `_get`, `sd_flatten_degraded`. ⚠ A fill opens
+    one operation PER CURVE VERB: wrap a draw in `sd_flatten_op_begin()` /
+    `_end()` to bound it as a whole (MEASURED on that path: 16,711,680 B
+    unwrapped, **1,044,480 B** wrapped).
+  - **`sd_path_new_cap(n_verbs, n_points)`** — a path at a caller-known capacity,
+    for consumers that know the size before the first moveto.
+  - **A refused allocation is a return code, not a fault** — every `sd_alloc`
+    result in path/geom/raster/present/error is checked and propagated, a refusal
+    costs the caller nothing it had, and a starved fill returns `SADISH_ERR_OOM`
+    instead of painting a wrong picture under `SADISH_OK`.
+  - **A drawing verb before any moveto** no longer dereferences a null point
+    (SIGSEGV on 0.7.0 and 0.6.0 alike); every walk skips such verbs, as SVG does.
+- **next (candidates, none started):** inline `(x, y)` storage in `SdPath` instead
+  of `SdPoint` pointers — an ABI change rekha measured as worth 78,656 → 58,672 B
+  for the ASCII glyph set and one fewer allocation per point; separate verb/point
+  capacities on `SdPath` (the same record, same question); a premultiplied AGNOS
+  `blit#39` fast path; and `sd_present_open`'s own `/dev/fb0` allocation guards,
+  which no test can reach without writing to the live display.
 
 ## Place in the stack
 
@@ -120,7 +139,8 @@ as the hook around a text draw and blits through `sd_canvas_blit_at`), crab
 dhancha also carry a `path = "../sadish"` dev override). The complete 2D vector
 core — fill, stroke, gradient, affine transforms, clip, and analytic AA — is
 live as of **v0.4.0**; styled strokes, gradient paint and exact 2-axis coverage
-as of **v0.6.0**; dashes, focal gradients and premultiplied output as of **v0.7.0**.
+as of **v0.6.0**; dashes, focal gradients and premultiplied output as of **v0.7.0**;
+bounded flattening and checked allocations as of **v0.7.1**.
 
 ## Dependencies
 
@@ -141,7 +161,7 @@ cyrius build programs/smoke.cyr build/sadish-smoke    # link-check
 # RUN tests (each self-checks and exits non-zero on failure)
 for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present blend alloc \
          stride stroke_style paint area integration grow_edges paint_focal premul \
-         dash clip_pitch paint_premul; do
+         dash clip_pitch paint_premul flatten_bound oom; do
   cyrius build "programs/${t}_test.cyr" "build/${t}_test" && "./build/${t}_test"
 done
 ```

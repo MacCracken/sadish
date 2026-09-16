@@ -868,7 +868,10 @@ fn main(): i64 {
     g0 = alloc_used();
     sd_canvas_stroke_path_dash(pd, pv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0);
     check(alloc_used() - g0, 131072 + 16384);                     # 127 — MEASURED: 147,456 B
-    check(arena_used(g_arena) - pa, 1248);                        # 128 — the cubic's mid-points
+    # 0.7.1: the cubic's 13 EMITTED mid-points x 16 B. Was 1,248 B — 13 subdivision nodes x 6
+    # sd_pt_mid each — until the recursion started carrying coordinates and allocating only the
+    # one mid per node that reaches the output.
+    check(arena_used(g_arena) - pa, 208);                         # 128 — the cubic's mid-points
     check(_sd_dash_cap, 16384);                                   # 129
     check(cov_diff(pd, pref), 0);                                 # 130 — the flags crossed intact
     check(lit_rows(pd, 0, 9), 0);                                 # 131 — and no miter spike
@@ -876,7 +879,7 @@ fn main(): i64 {
     pa = arena_used(g_arena);
     sd_canvas_stroke_path_dash(pd2, pv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0);
     check(alloc_used() - g0, 0);                                  # 132 — warm: 0 B of buffer
-    check(arena_used(g_arena) - pa, 1248);                        # 133 — and the mid-points again
+    check(arena_used(g_arena) - pa, 208);                         # 133 — and the mid-points again
     check(sd_alloc_set(0), &hook_alloc);                          # 134
     arena_reset(g_arena);
     check(_sd_dash_trunc, 0);                                     # 135

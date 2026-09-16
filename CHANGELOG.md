@@ -5,6 +5,118 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-09-15 — the repairs rekha filed against 0.7.0
+
+Three filings from the **rekha** team, plus two faults found while closing them. ⛔ Rendering does not
+move: agnos's `refagree` prints **BYTE-IDENTICAL on all 200 paths**, the 25 pre-0.7.1 suites pass with
+their assertions unedited (one exception, below), and rekha (23 suites) and dhancha (18) pass against
+this `dist/`.
+
+### Fixed — `sd_path_flatten` stops allocating mid-points it throws away
+
+Closes `docs/development/issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md`.
+The de Casteljau recursion allocated three `SdPoint`s per quad node (six per cubic) on the seam and kept
+only the one that reached the output. It now carries its mids as plain i64 locals and allocates exactly
+the points it emits — *(points emitted − 1)* per curve, with no scratch to warm, size or grow.
+⭐ **MEASURED, rekha's own repro** (N maximally non-flat quads through `sd_path_flatten`):
+
+| quads | 0.7.0 points / bytes / allocations | 0.7.1 |
+|---:|---|---|
+| 32 | 8,192 / 457,256 / 24,483 | 8,193 / **327,208** / **8,164** |
+| 4,096 | 1,048,577 / 83,623,976 / 3,133,451 | 69,377 / **3,076,136** / **65,287** |
+
+(0.6.0 emitted 8,192 points for 50,200,616 B and silently lost the rest; 0.7.0 kept every point and paid
+83.6 MB for them.) A maximally non-flat quad falls from 765 allocations to 255, a depth-8 cubic from
+1,386 to 231. The CHANGELOG's one-quad fill costs **48 B** of mid-points where it cost 144 B, and
+`alloc_test`'s blob **160 B** where it cost 480 B — every older MEASURED mid-point figure in this repo
+read 3x high and has been corrected in place.
+
+⭐ **The recursion also stops when the output is full**, so a curve past the fill-up costs one comparison
+instead of a depth-8 subdivision — and the verdict is re-derived per entry rather than remembered,
+because raster.cyr and stroke.cyr rewind one per-curve buffer before every verb. ⛔ That second half was
+a real defect the review caught before release: without it, one starved fill inside a
+`sd_flatten_op_begin`/`_end` scope left **every later fill in that operation returning `SADISH_OK` and
+painting a blank canvas**, with the allocator fully restored.
+
+### Added — a per-operation flatten budget: `sd_flatten_budget_set` / `_get`, `sd_flatten_degraded`
+
+`SD_FLATTEN_BUDGET_DEFAULT` = **65,536 points** (0 = unbounded), the shape of 0.7.0's growth ceiling in
+the unit flattening allocates in. Over budget the remaining curves degrade to their CHORDS — no
+subdivision, no temporaries — and `sd_flatten_degraded()` says so. `sd_flatten_truncated()` reports the
+stronger case: points a flatten wanted to emit were LOST.
+⚠ **THE BUDGET IS PER OPERATION, AND A FILL OPENS ONE PER CURVE VERB.** A consumer that wants one bound
+for a whole draw must scope it. MEASURED, the 4,096-quad path through one `sd_canvas_fill_path` on
+64x64 — unwrapped **16,711,680 B in 1,044,480 allocations** (itself a 3x improvement on 0.7.0's
+50,135,040 B / 3,133,440); wrapped in `sd_flatten_op_begin()` / `_end()` **1,044,480 B in 65,280**, with
+`sd_flatten_degraded()` == 1. ⇒ rekha and dhancha should wrap a glyph draw.
+
+### Added — `sd_path_new_cap(n_verbs, n_points)`
+
+Closes `docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md`. An `SdPath` opened
+at a caller-known capacity instead of `SD_PATH_CAP` = 256 verbs + 256 points, for consumers that know the
+size before the first moveto (rekha converts a glyph outline per glyph, per label, per frame).
+⚠ `SdPath` has ONE capacity field for both arrays, so the two arguments collapse to their max, clamped
+into [`SD_PATH_CAP_MIN` = 8, `SD_PATH_CAP_MAX` = 2^28]; a capacity above the ceiling is REFUSED (0).
+Separate capacities would be an ABI change to the 48 B record, and that decision was left to the owner
+rather than taken in a patch release.
+⛔ **A capacity could overflow its own byte size**, found while building it: `sd_path_new_cap(2^61 + 1, 0)`
+wrapped `cap * 8`, both allocations succeeded, both 0-checks passed, and the result was a live path whose
+verb and point blocks were **8 B apart** — the second push wrote off the end. `SD_PATH_CAP_MAX` now bounds
+`_sd_path_alloc` before the multiply and `sd_path_grow` before it doubles.
+
+### Fixed — a refused allocation is a return code, not a fault
+
+Closes `docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md`.
+Every `sd_alloc` / `alloc` result in `path.cyr`, `geom.cyr`, `raster.cyr`, `present.cyr` and `error.cyr`
+is checked and propagated: constructors return 0, `sd_path_moveto/lineto/quadto/cubicto` return
+`SADISH_ERR_OOM` with the path's verbs, points and contents exactly as they were, and the clip pushes
+leave the previous region intact and poppable. On 0.7.0 a hook that returned 0 faulted (SIGSEGV, rc 139).
+⛔ **The rule is stronger than "does not crash": a refusal costs the caller nothing it had.**
+`sd_clip_push_mask` takes its node BEFORE the in-place mask intersection, so a refusal cannot leave the
+caller's shape multiplied by a clip it was never pushed under; `sd_surface_write_ppm` takes both buffers
+BEFORE its `O_TRUNC` open, so a refusal no longer truncates an existing file from 35 bytes to 0; the
+presenter closes its fd on all four refusal paths.
+⭐ **Two sites nobody had filed, both worse than the ones that were.** `_sd_fill_accrow_for` stored the
+refused block AND raised the capacity, so one refused request poisoned the fill scratch for the life of
+the process and the next fill on any narrower canvas wrote its accumulator through address 0.
+`_sd_scratch_init` published a PARTIAL set behind its own "already initialised" flag, so a refusal of the
+second of eight blocks meant every later fill stored through a null edge list; it is now all-or-nothing
+and the next call retries.
+⚠ `sadish_err_new` returning 0 is now a RECORD, not a fault: `sadish_err_code(0)` reads `SADISH_ERR_OOM`.
+
+### Fixed — a starved fill REPORTS instead of painting a wrong picture
+
+⛔ A refused allocation inside a curved fill left the canvas with a fraction of its ink and still returned
+`SADISH_OK`. MEASURED: a 4-cubic circle whose true ink is 312,280 coverage units paints **81,029** under a
+hook granting 5 allocations. `sd_fill_impl` now scopes the flatten's truncation verdict to the call and
+returns `SADISH_ERR_OOM` when that fill lost points; the caller's standing verdict is restored, so nothing
+a consumer was already holding is swallowed. ⚠ `programs/flatten_bound_test.cyr` #271 is the one
+pre-existing assertion this release edits — it pinned the `SADISH_OK` this fixes, in a suite shipped by
+the same release.
+⚠ **Strokes are not covered by that return**: the styled path has its own flush and the round stroker
+discards `sd_canvas_fill_union`'s result, so `sd_flatten_truncated()` stays their only witness.
+
+### Fixed — a drawing verb before any moveto no longer faults the process
+
+Found while closing the OOM filing, and not in any filing. `cur` is an `SdPoint` POINTER, 0 until the
+first moveto, and every drawing verb dereferences it: a path whose first verb is a lineto/quadto/cubicto
+was **SIGSEGV, rc 139**, on 0.7.0 and 0.6.0 alike. 0.7.1 made such a path easy to build — a refused
+`sd_path_moveto` now returns cleanly, so a caller that logs and carries on has one. Every walk (fill,
+round stroke, styled stroke, dash, `sd_path_flatten`) now skips drawing verbs until a moveto arrives,
+consuming their points so the verb and point streams stay in step. SVG calls such a path an error and
+renders nothing of it; sadish now does the same instead of dying.
+⚠ Gated by `programs/integration_test.cyr` group E, where the failure mode is the SUITE faulting rather
+than a wrong number.
+
+### Verified
+
+All **27** suites pass — 25 pre-0.7.1 with assertions unedited (bar #271 above), plus
+`flatten_bound_test` (304 checks) and `oom_test` (157). `fmt --check` clean, `lint` 0 warnings, `vet`
+clean, `distlib` in sync with no duplicate top-level names. `sadish_version()` → **701**.
+⭐ Mutation-proved as usual, including the two fixes made here: reinstating the fill's `SADISH_OK` fails
+`flatten_bound_test` #271, and removing any moveto guard kills `integration_test` with rc 139 — the
+failure mode the guard exists to prevent.
+
 ## [0.7.0] - 2026-09-15 — dashes, focal gradients, real alpha, and a cap that stops being a cliff
 
 Six items over two waves. ⛔ **Everything a 0.6.0 caller does is byte-identical for every input that

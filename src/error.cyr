@@ -28,25 +28,38 @@ enum SadishErrCode {
 # ================================================================
 
 # Create a SadishErr with code and an optional detail string (0 = none).
+# Returns the 16 B record, or 0 when sd_alloc refuses it.
+# ⛔ 0 IS A RECORD, NOT A FAULT — and this is the one place in sadish where a null pointer has a
+# MEANING. A refused 16 B block is the only way this returns 0, and the only condition that refuses
+# it is out of memory, so the null record READS as SADISH_ERR_OOM: sadish_err_code(0) is
+# SADISH_ERR_OOM and sadish_err_detail(0) is 0. ⇒ A caller handling one failure is never handed a
+# second one to handle: it may pass this result straight to the accessors without a null check.
+# Through 0.7.0 the store was unchecked — a hook that can refuse (the 0.5.5 seam's natural arena)
+# made this a null-pointer store, which is what rekha filed
+# (docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md).
 fn sadish_err_new(code, detail): i64 {
     var e = sd_alloc(16);
+    if (e == 0) { return 0; }
     store64(e, code);
     store64(e + 8, detail);
     return e;
 }
 
-# Create a SadishErr with code only (no detail).
+# Create a SadishErr with code only (no detail). 0 on a refused allocation, as sadish_err_new.
 fn sadish_err(code): i64 {
     return sadish_err_new(code, 0);
 }
 
-# Get the error code.
+# Get the error code. ⚠ A 0 record is the record sadish_err_new could not allocate, and reads as
+# SADISH_ERR_OOM (see sadish_err_new) — never a fault, never SADISH_OK.
 fn sadish_err_code(e): i64 {
+    if (e == 0) { return SADISH_ERR_OOM; }
     return load64(e);
 }
 
-# Get the detail string pointer (or 0).
+# Get the detail string pointer (or 0). A 0 record carries no detail.
 fn sadish_err_detail(e): i64 {
+    if (e == 0) { return 0; }
     return load64(e + 8);
 }
 
@@ -65,6 +78,11 @@ fn sadish_err_name(code): i64 {
 }
 
 # Print an error name to stderr (fd 2).
+# ⚠ TAKES A CODE, NOT A SadishErr RECORD — `sadish_err_print_name(sadish_err_code(e))`. Every i64
+# is a valid argument (sadish_err_name maps the unknown ones to "unknown error"), so no value can
+# fault it, including the 0 a refused sadish_err_new returns — but 0 is the CODE SADISH_OK, so
+# handing it the record instead of the code prints "ok" for an out-of-memory failure. Go through
+# sadish_err_code, which turns the null record into SADISH_ERR_OOM.
 fn sadish_err_print_name(code): i64 {
     var name = sadish_err_name(code);
     syscall(1, 2, name, strlen(name));

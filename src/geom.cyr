@@ -62,9 +62,16 @@ var SD_POINT_X_OFFSET = 0;
 var SD_POINT_Y_OFFSET = 8;
 var SD_POINT_SIZE     = 16;
 
-# @public
+# @public — a new SdPoint at (x, y), 16.16. Returns 0 IF THE ALLOCATION IS REFUSED.
+# ⚠ 0 IS A REAL RETURN VALUE (0.7.1). Through 0.7.0 this stored x/y through an unchecked sd_alloc,
+# so a hook that returns 0 — an arena that ran out is the natural hook the 0.5.5 seam invites —
+# faulted here (SIGSEGV) instead of failing; rekha filed it
+# (docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md).
+# Every caller in sadish now tests it: sd_path_moveto/lineto/quadto/cubicto return SADISH_ERR_OOM
+# WITHOUT touching the path, sd_matrix_apply returns 0, the flatten records a truncation.
 fn sd_point_new(x, y): i64 {
     var p = sd_alloc(SD_POINT_SIZE);
+    if (p == 0) { return 0; }
     store64(p + SD_POINT_X_OFFSET, x);
     store64(p + SD_POINT_Y_OFFSET, y);
     return p;
@@ -91,9 +98,13 @@ var SD_MAT_E_OFFSET = 32;
 var SD_MAT_F_OFFSET = 40;
 var SD_MATRIX_SIZE  = 48;
 
-# Low-level constructor from all six 16.16 components.
+# Low-level constructor from all six 16.16 components. Returns 0 if the allocation is refused —
+# and so, therefore, do sd_matrix_identity / _translate / _scale / _mul / _rotate / _skew, every
+# one of which is this constructor with its arguments computed (0.7.1; through 0.7.0 a refusal
+# stored six values through a null pointer).
 fn sd_matrix_new(a, b, c, d, e, f): i64 {
     var m = sd_alloc(SD_MATRIX_SIZE);
+    if (m == 0) { return 0; }
     store64(m + SD_MAT_A_OFFSET, a);
     store64(m + SD_MAT_B_OFFSET, b);
     store64(m + SD_MAT_C_OFFSET, c);
@@ -120,7 +131,11 @@ fn sd_matrix_scale(sx, sy): i64 {
 
 # @public — compose two affine transforms: result applies `n` THEN `m`
 # (i.e. result(pt) == m(n(pt))). Standard 2x3 * 2x3 affine product.
+# Returns 0 if either operand is 0 (a constructor that was refused) or the result cannot be
+# allocated — so a chain of composes propagates one refusal to its end instead of faulting.
 fn sd_matrix_mul(m, n): i64 {
+    if (m == 0) { return 0; }
+    if (n == 0) { return 0; }
     var ma = load64(m + SD_MAT_A_OFFSET);
     var mb = load64(m + SD_MAT_B_OFFSET);
     var mc = load64(m + SD_MAT_C_OFFSET);
@@ -178,7 +193,8 @@ fn _sd_geom_divround(n, b, k): i64 {
 }
 
 # @public — the inverse of affine `m` as a NEW SdMatrix (sd_alloc), or 0 when `m` is SINGULAR
-# (a*d - b*c == 0 in raw units — exactly, no tolerance) or the allocation fails.
+# (a*d - b*c == 0 in raw units — exactly, no tolerance), when `m` is 0 (a refused constructor,
+# 0.7.1), or when the allocation fails.
 #   · Each entry is the EXACT inverse's entry rounded to the nearest raw unit (2^-16), halves away
 #     from zero: the linear part is adj(m) * 2^32 / det, the translation -m^-1 (e, f) is taken from
 #     the exact rational (c*f - d*e, b*e - a*f) * 2^16 / det, never from the rounded linear part.
@@ -193,6 +209,7 @@ fn _sd_geom_divround(n, b, k): i64 {
 #     translation numerators stay < 2^63. A nearly singular m (|det| tiny) has inverse entries past
 #     i64 — wrong values, never a trap.
 fn sd_matrix_invert(m): i64 {
+    if (m == 0) { return 0; }
     var a = load64(m + SD_MAT_A_OFFSET);
     var b = load64(m + SD_MAT_B_OFFSET);
     var c = load64(m + SD_MAT_C_OFFSET);
@@ -214,7 +231,11 @@ fn sd_matrix_invert(m): i64 {
 
 # @public — apply an affine transform to a point, returning a new SdPoint.
 # (x, y) -> (a*x + c*y + e,  b*x + d*y + f). All 16.16.
+# Returns 0 when `m` or `pt` is 0 (a constructor sadish refused) or when the result point cannot
+# be allocated — it never dereferences a refused matrix (0.7.1).
 fn sd_matrix_apply(m, pt): i64 {
+    if (m == 0) { return 0; }
+    if (pt == 0) { return 0; }
     var x = sd_point_x(pt);
     var y = sd_point_y(pt);
     var a = load64(m + SD_MAT_A_OFFSET);

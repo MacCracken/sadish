@@ -170,11 +170,15 @@ fn sd_canvas_clear(cv): i64 {
 #
 # Flatten MID-POINTS (sd_pt_mid -> sd_point_new) are deliberately NOT here: they are
 # proportional to the curve work, not fixed-capacity, so they stay on the seam and the hook
-# decides where they live (MEASURED, 8x8 canvas, warm scratch: the CHANGELOG's one-quad fill —
-# moveto (0,0), quadto ctrl (8,0) → (8,8), lineto back, closed — costs 144 B of them = 9
-# mid-points x 16 B, 3 subdivisions, and the same 144 B on the next identical call; a single quad
-# only ever costs 48 x (2^d - 1) B because both de Casteljau halves carry the parent's second
-# difference / 4 and so split to the same depth).
+# decides where they live (MEASURED ON 0.7.1, 8x8 canvas, warm scratch: the CHANGELOG's one-quad
+# fill — moveto (0,0), quadto ctrl (8,0) → (8,8), lineto back, closed — costs 48 B of them = 3
+# EMITTED mid-points x 16 B in 3 allocations, and the same 48 B on the next identical call; a
+# single quad only ever costs 16 x (2^d - 1) B because both de Casteljau halves carry the parent's
+# second difference / 4 and so split to the same depth).
+# ⚠ THAT COEFFICIENT WAS 48, NOT 16, THROUGH 0.7.0, and the figure above was 144 B: the recursion
+# allocated every subdivision node's three mid-points on the seam and threw two of them away. 0.7.1
+# takes the throwaways onto a fixed per-depth scratch (src/path.cyr), so only EMITTED points are
+# allocated — rekha's filing, and the reason any older MEASURED mid-point figure reads 3x high.
 var _sd_fill_ectx = 0;         # edge builder ctx (24 B): +0 edges  +8 count  +16 cap
 var _sd_fill_edges = 0;        # _sd_fill_edges_cap * 32 — GROWS (0.6.1)
 var _sd_fill_edges_cap = 0;    # edges the current block holds (SD_FLATTEN_CAP until a path needs more)
@@ -266,20 +270,67 @@ fn _sd_grow_alloc(n): i64 {
 # (fill 458,800 + stroke 131,096), plus accrow on first use (w*8: 64 B at 8 px, 6,080 B at 760).
 # ⇒ After it, a straight-line fill costs the heap 0 B (MEASURED, 8x8 and 760x300); a stroke of the
 # closed 8x8 rect 34,432 B, all of it paths + points on the seam (was 2,789,016 B).
+#
+# Returns 1 when the scratch is ready, 0 when a block was refused.
+# ⛔ ALL OR NOTHING, AND `_sd_fill_ectx != 0` IS THE FLAG. Through 0.7.0 the eight blocks were
+# stored straight into the globals unchecked, so a refusal of the SECOND one left ectx non-zero and
+# edges 0 — this function never ran again and EVERY fill for the rest of the process stored through
+# a null edge list. The blocks now land in locals and are published together, so a partial set is
+# abandoned (the bump allocator has no free()) and the next call retries from scratch.
+# ⚠ These come from the GLOBAL `alloc`, never sd_alloc (the rule at the top of this block), so no
+# consumer hook can refuse them: `alloc` refuses only over ALLOC_MAX = 2 GiB or when brk fails, and
+# the largest block here is 262,144 B. ⇒ The one honest way to drive this path is the CAPACITY —
+# SD_FLATTEN_CAP sizes five of the eight, so raising it past 268,435,456 makes each of those five a
+# request the real allocator really refuses (programs/oom_test.cyr group J, the same device
+# grow_edges_test uses on the growth ceiling).
+# ⛔ WHAT THAT GATES, EXACTLY, because the eight 0-tests below are NOT eight gates. ALLOC_MAX
+# refuses BY SIZE, and the capacity-sized five are CAP*32, CAP*16 and three of CAP*8: group J's
+# 300,000,000 puts the SMALLEST of them over the 2 GiB line, so all five are refused together and
+# nothing is mapped (MEASURED: exactly 3 * 24 B granted, five refused, nothing published). A
+# capacity that isolated ONE — anything from 67,108,865 to 268,435,456 refuses only the CAP*32 edge
+# list — would GRANT the other four, about 4.0 GB of mappings a consumer's machine would have to
+# hand over for a test that never touches a byte of them, so it is not taken. The three 24 B ctx
+# blocks are not drivable at any capacity: lib/alloc.cyr refuses 24 B only if mmap itself fails.
+# ⇒ Deleting any ONE of the eight tests leaves the others setting `ok = 0`, so no suite can kill it:
+# they are a CONTRACT on this function, not a gate, in the same sense as the 0 that
+# _sd_fill_cross_for returns. What IS gated: that a refusal publishes nothing (check 124) and that a
+# success publishes ALL ELEVEN globals (checks 128-138). And the shape a missing test would
+# produce — a 0 published behind a status of 1 — cannot reach a store, because sd_fill_impl guards
+# on _sd_fill_ectx itself rather than on this status.
+# ⚠ The callers in stroke.cyr / dash.cyr discard this status, as they did when it was always 0; on
+# this allocator a failure here means the process could not get 262,144 B and is over before it.
 fn _sd_scratch_init(): i64 {
-    if (_sd_fill_ectx != 0) { return 0; }
-    _sd_fill_ectx = alloc(24);
-    _sd_fill_edges = alloc(SD_FLATTEN_CAP * 32);
+    if (_sd_fill_ectx != 0) { return 1; }
+    var ectx = alloc(24);
+    var edges = alloc(SD_FLATTEN_CAP * 32);
+    var fbuf = alloc(SD_FLATTEN_CAP * 8);
+    var fctx = alloc(24);
+    var cross = alloc(SD_FLATTEN_CAP * 16);
+    var srun = alloc(SD_FLATTEN_CAP * 8);
+    var sfbuf = alloc(SD_FLATTEN_CAP * 8);
+    var sfctx = alloc(24);
+    var ok = 1;
+    if (ectx == 0) { ok = 0; }
+    if (edges == 0) { ok = 0; }
+    if (fbuf == 0) { ok = 0; }
+    if (fctx == 0) { ok = 0; }
+    if (cross == 0) { ok = 0; }
+    if (srun == 0) { ok = 0; }
+    if (sfbuf == 0) { ok = 0; }
+    if (sfctx == 0) { ok = 0; }
+    if (ok == 0) { return 0; }
+    _sd_fill_ectx = ectx;
+    _sd_fill_edges = edges;
     _sd_fill_edges_cap = SD_FLATTEN_CAP;
-    _sd_fill_fbuf = alloc(SD_FLATTEN_CAP * 8);
-    _sd_fill_fctx = alloc(24);
-    _sd_fill_cross = alloc(SD_FLATTEN_CAP * 16);
+    _sd_fill_fbuf = fbuf;
+    _sd_fill_fctx = fctx;
+    _sd_fill_cross = cross;
     _sd_fill_cross_cap = SD_FLATTEN_CAP;
-    _sd_stroke_run = alloc(SD_FLATTEN_CAP * 8);
+    _sd_stroke_run = srun;
     _sd_stroke_run_cap = SD_FLATTEN_CAP;
-    _sd_stroke_fbuf = alloc(SD_FLATTEN_CAP * 8);
-    _sd_stroke_fctx = alloc(24);
-    return 0;
+    _sd_stroke_fbuf = sfbuf;
+    _sd_stroke_fctx = sfctx;
+    return 1;
 }
 
 # The crossings array for walking a list of `n` edges (a sub-scanline crosses each edge at most
@@ -335,11 +386,26 @@ fn _sd_fill_edges_grow(ectx): i64 {
 # that depends on the call, so it keeps a capacity and re-allocates from the GLOBAL alloc only
 # when a wider canvas than ever seen arrives. ⚠ The old block is abandoned (no free()) — a
 # monotone series of ever-wider canvases pays sum(w*8) once; a consumer at a fixed size pays once.
+# Returns the block, or 0 if the growth failed — THE OLD BLOCK AND CAPACITY ARE KEPT, exactly as
+# _sd_fill_cross_for keeps its own.
+# ⛔ WHY THE ROLLBACK IS THE WHOLE POINT, not tidiness. Through 0.7.0 the result was stored
+# unchecked and the capacity raised anyway, so ONE refused request POISONED the scratch for the
+# life of the process: accrow 0 with a capacity of w, and the very next fill — on any narrower
+# canvas, which now "fits" — wrote its accumulator through address 0. MEASURED on 0.7.0, a
+# hand-built 536,870,912-px-wide header (w*8 = 4 GiB, over lib/alloc.cyr's ALLOC_MAX of 2 GiB):
+# the fill of it SIGSEGVs, rc 139, and with the store moved past it the following 8x8 fill does.
+# Now the refusal is reported, sd_fill_impl returns SADISH_ERR_OOM having touched no coverage, and
+# every later fill still has the accumulator it had (programs/oom_test.cyr group H).
+# ⚠ THE CALLER IN stroke.cyr (the styled span walk) STILL DOES NOT TEST THIS 0 — it faults on a
+# refusal exactly as it did through 0.7.0, and that file is out of this change's scope. What it no
+# longer does is fault on the NEXT, perfectly ordinary fill.
 fn _sd_fill_accrow_for(w): i64 {
     if (w <= _sd_fill_accrow_cap) { return _sd_fill_accrow; }
-    _sd_fill_accrow = alloc(w * 8);
+    var blk = alloc(w * 8);
+    if (blk == 0) { return 0; }
+    _sd_fill_accrow = blk;
     _sd_fill_accrow_cap = w;
-    return _sd_fill_accrow;
+    return blk;
 }
 
 # ---- fill internals --------------------------------------------
@@ -498,8 +564,17 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     var tol = SD_ONE >> 2;
 
     # ---- build the closed-edge list (into the process-lifetime scratch) ----
+    # ⚠ A refused scratch is SADISH_ERR_OOM before a byte of coverage is touched, so the canvas is
+    # exactly as the caller left it. (Reachable only through the CAPACITY — see _sd_scratch_init.)
+    # ⛔ THE GUARD IS ON THE POINTER, NOT ON _sd_scratch_init's STATUS, and that is deliberate.
+    # _sd_fill_ectx is both the scratch's "already initialised" flag and the block the next line
+    # stores through, so testing it covers the refusal (the publish is all-or-nothing, so a refused
+    # set leaves it 0) AND anything that ever published a 0 behind a status of 1 — the one residual
+    # shape _sd_scratch_init's own 0-tests cannot be driven to prove. A status check would catch
+    # only the first. (programs/oom_test.cyr group J drives both through this line.)
     _sd_scratch_init();
     var ectx = _sd_fill_ectx;
+    if (ectx == 0) { return SADISH_ERR_OOM; }
     store64(ectx + 0, _sd_fill_edges);      # the CURRENT block: a previous fill may have grown it
     store64(ectx + 8, 0);               # per-call reset: the edge count
     store64(ectx + 16, _sd_fill_edges_cap);
@@ -507,6 +582,28 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     var fbuf = _sd_fill_fbuf;
     var fctx = _sd_fill_fctx;           # fields are (re)set before every flatten below
 
+    # ⛔ A STARVED FLATTEN IS REPORTED, NOT PAINTED OVER. sd_flatten_quad / _cubic emit their points
+    # through sd_alloc, so a consumer hook that refuses mid-curve leaves the fill with FEWER points than
+    # the curve needs — a silently wrong picture. Through 0.7.0 that case did not arise here (the
+    # refusal dereferenced 0 and killed the process); 0.7.1 made it survivable, and this makes it
+    # VISIBLE: the flatten's own truncation flag is scoped to this call, and if this fill lost a point
+    # it returns SADISH_ERR_OOM. MEASURED (programs/flatten_bound_test.cyr group M): a 4-cubic circle
+    # whose true ink is 312,280 coverage units paints 81,029 under a hook granting 5 allocations.
+    # ⚠ The canvas still holds that partial picture — the caller decides whether to clear and retry.
+    # ⚠ The flag is RESTORED for the caller afterwards (sd_flatten_truncated() is documented as sticky
+    # until the next sd_path_flatten), so scoping it here cannot swallow a verdict the caller was
+    # already holding.
+    # ⚠ Strokes are NOT covered by this return: the styled path has its own flush and the round stroker
+    # discards sd_canvas_fill_union's result, so sd_flatten_truncated() remains their only witness.
+    # ⛔ A DRAWING VERB BEFORE ANY MOVETO IS SKIPPED, not drawn from (0, 0). `cur` is an SdPoint
+    # POINTER, 0 until the first moveto, and every drawing verb dereferences it — so a path whose first
+    # verb is a lineto/quadto/cubicto used to fault the process (MEASURED on 0.7.0 and 0.6.0 alike:
+    # SIGSEGV, rc 139). SVG calls such a path an error and renders nothing of it; sadish now skips the
+    # verbs (their points are still consumed, so the verb/point streams stay in step) until a moveto
+    # arrives. ⚠ 0.7.1 made this easy to reach: a refused sd_path_moveto now returns SADISH_ERR_OOM
+    # with the path untouched, so a caller that logs and carries on builds exactly this path.
+    var flat_was = _sd_flat_trunc;      # the caller's standing verdict, restored below
+    _sd_flat_trunc = 0;                 # scoped: from here it means "THIS fill lost points"
     var verbs = load64(path + SD_PATH_VERBS_OFFSET);
     var points = load64(path + SD_PATH_POINTS_OFFSET);
     var cur = 0;
@@ -527,38 +624,48 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
         }
         if (verb == SD_VERB_LINETO) {
             var lp = load64(points + pi * 8);
-            sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(lp), sd_point_y(lp));
-            cur = lp;
-            sub_open = 1;
+            if (cur != 0) {
+                sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(lp), sd_point_y(lp));
+                cur = lp;
+                sub_open = 1;
+            }
             pi = pi + 1;
         }
         if (verb == SD_VERB_QUADTO) {
             var qc = load64(points + pi * 8);
             var qe = load64(points + (pi + 1) * 8);
+            if (cur == 0) { qe = 0; }       # no moveto yet: skip the curve, keep the streams in step
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
-            cur = sd_fill_edges_from(ectx, fctx, cur);
-            sub_open = 1;
+            if (qe != 0) {
+                sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
+                cur = sd_fill_edges_from(ectx, fctx, cur);
+                sub_open = 1;
+            }
             pi = pi + 2;
         }
         if (verb == SD_VERB_CUBICTO) {
             var k1 = load64(points + pi * 8);
             var k2 = load64(points + (pi + 1) * 8);
             var ke = load64(points + (pi + 2) * 8);
+            if (cur == 0) { ke = 0; }       # no moveto yet: skip the curve, keep the streams in step
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
-            cur = sd_fill_edges_from(ectx, fctx, cur);
-            sub_open = 1;
+            if (ke != 0) {
+                sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
+                cur = sd_fill_edges_from(ectx, fctx, cur);
+                sub_open = 1;
+            }
             pi = pi + 3;
         }
         if (verb == SD_VERB_CLOSE) {
-            sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
-            cur = sub_start;
-            sub_open = 0;
+            if (cur != 0) {
+                sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
+                cur = sub_start;
+                sub_open = 0;
+            }
         }
         vi = vi + 1;
     }
@@ -566,9 +673,14 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
         sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
     }
 
+    var flat_lost = _sd_flat_trunc;     # did THIS fill's flatten lose points?
+    if (flat_was != 0) { _sd_flat_trunc = 1; }
+    var flat_rc = SADISH_OK;
+    if (flat_lost != 0) { flat_rc = SADISH_ERR_OOM; }
+
     var n_edges = load64(ectx + 8);
     var edges = load64(ectx + 0);
-    if (n_edges == 0) { return SADISH_OK; }
+    if (n_edges == 0) { return flat_rc; }
 
     # ---- SD_AA_AREA: exact 2-axis coverage (src/coverage.cyr), opt-in per canvas ----
     # ⛔ Only a canvas holding exactly SD_AA_AREA branches here; every other value runs the 0.4.0
@@ -590,7 +702,9 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
             var mask = 0;
             var clipn = load64(cv + SD_CANVAS_CLIP_OFFSET);
             if (clipn != 0) { mask = load64(clipn + 0); }
-            return _sd_area_fill(edges, n_edges, w, h, cov, stride, mask, nonzero, combine);
+            var arc = _sd_area_fill(edges, n_edges, w, h, cov, stride, mask, nonzero, combine);
+            if (arc != SADISH_OK) { return arc; }
+            return flat_rc;
         }
     }
 
@@ -600,6 +714,10 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     var ssy = SD_FILL_SS;
     var weight = SD_ONE / ssy;         # coverage per full pixel per sub-scanline
     var accrow = _sd_fill_accrow_for(w);   # per-row fractional coverage (16.16); zeroed per row below
+    # ⚠ A refused accumulator is SADISH_ERR_OOM here, BEFORE the py/px loops — the coverage buffer
+    # is untouched, so a caller that retries on a narrower canvas gets a clean fill (the capacity
+    # was not raised; see _sd_fill_accrow_for).
+    if (accrow == 0) { return SADISH_ERR_OOM; }
     var cross = _sd_fill_cross;            # (x, dir) crossings per sub-scanline; only [0, nc) is read
     # ^ read AFTER the list is built: a growth above replaced the block, and its capacity >= n_edges
 
@@ -705,7 +823,7 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
         }
         py = py + 1;
     }
-    return SADISH_OK;
+    return flat_rc;
 }
 
 # ================================================================
@@ -880,7 +998,24 @@ fn sd_canvas_blit_gradient(cv, surface, x0, y0, c0, x1, y1, c1): i64 {
 # layout note for why a canvas's stride is the COVERAGE buffer's pitch and never the mask's.
 
 # Intersect `shape` (a PACKED w*h mask) with the current clip IN PLACE, then push it.
+# Returns SADISH_OK; SADISH_ERR_BOUNDS for a null canvas; SADISH_ERR_OOM for a null `shape` (the
+# caller's own mask allocation was refused — passed straight through so a caller may chain) or for
+# a refused 16 B node.
+# ⛔ THE NODE IS TAKEN BEFORE THE INTERSECTION, and that order is the refusal contract. Through
+# 0.7.0 the node was stored through unchecked (rekha's filing); checking it AFTER the in-place
+# multiply would have stopped the fault but still left the caller's `shape` half-consumed —
+# multiplied by a clip it was never pushed under, so a caller that retried would intersect twice.
+# With the allocation first, a refusal touches NOTHING: the canvas's clip pointer, the mask under
+# it and the caller's `shape` are byte-for-byte what they were, the previous clip is still poppable,
+# and pushing again once memory is available lands the same region it always would have.
+# ⚠ Byte-identical on every push that succeeds — nothing allocates between the two points, so the
+# node gets the same block it always got, and the multiply runs over the same bytes in the same
+# order. Gated by programs/clip_test.cyr, programs/clip_pitch_test.cyr and programs/oom_test.cyr.
 fn sd_clip_push_mask(cv, shape): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (shape == 0) { return SADISH_ERR_OOM; }
+    var node = sd_alloc(16);
+    if (node == 0) { return SADISH_ERR_OOM; }
     var w = sd_canvas_width(cv);
     var h = sd_canvas_height(cv);
     var cur = load64(cv + SD_CANVAS_CLIP_OFFSET);
@@ -893,7 +1028,6 @@ fn sd_clip_push_mask(cv, shape): i64 {
             i = i + 1;
         }
     }
-    var node = sd_alloc(16);
     store64(node + 0, shape);
     store64(node + 8, cur);
     store64(cv + SD_CANVAS_CLIP_OFFSET, node);
@@ -901,12 +1035,26 @@ fn sd_clip_push_mask(cv, shape): i64 {
 }
 
 # @public — intersect a rectangle [x0,x1) x [y0,y1) (whole pixels) into the
-# clip and push it.
+# clip and push it. Returns SADISH_OK, SADISH_ERR_BOUNDS for a null canvas, or SADISH_ERR_OOM if
+# the w*h mask or the clip node is refused — in which case NOTHING was written and the clip that
+# was on the canvas is unchanged and still poppable.
+# ⚠ A 0-AREA CANVAS NOW REPORTS SADISH_ERR_OOM, and that is a CHANGE from 0.7.0 (MEASURED on both
+# trees with a hand-built w=0 header: 0.7.0 returned SADISH_OK, 0.7.1 returns SADISH_ERR_OOM;
+# programs/oom_test.cyr group K pins it). `sd_alloc(0)` returns 0 by lib/alloc.cyr's contract, so
+# 0.7.0 pushed a clip node whose mask pointer was ADDRESS 0 and got away with it only because every
+# reader indexes w*h = 0 bytes of it. Refusing is the wanted answer here: after 0.7.1 a null pointer
+# does not enter a data structure, and the alternative is weakening sd_clip_push_mask's `shape == 0`
+# guard, which exists so a caller chaining its OWN refused mask gets a code instead of that node.
+# ⇒ Deliberately NOT the `n > 0` carve-out src/present.cyr makes for the same sd_alloc(0): there the
+# 0-pixel call still COMPLETES — a valid header-only PPM, nothing left over — while here the only
+# thing to hand back is the booby-trapped node. ⚠ Unreachable from a constructed canvas: sd_canvas_new
+# refuses w <= 0 and h <= 0, so only a hand-built header can ask this.
 fn sd_canvas_clip_push_rect(cv, x0, y0, x1, y1): i64 {
     if (cv == 0) { return SADISH_ERR_BOUNDS; }
     var w = sd_canvas_width(cv);
     var h = sd_canvas_height(cv);
     var shape = sd_alloc(w * h);
+    if (shape == 0) { return SADISH_ERR_OOM; }
     var y = 0;
     while (y < h) {
         var x = 0;
@@ -928,14 +1076,28 @@ fn sd_canvas_clip_push_rect(cv, x0, y0, x1, y1): i64 {
 }
 
 # @public — intersect a filled PATH (its coverage) into the clip and push it.
+# Returns SADISH_OK, SADISH_ERR_BOUNDS for a null canvas, SADISH_ERR_EMPTY_PATH for a null path, or
+# SADISH_ERR_OOM if the temp canvas, its coverage, or the clip node is refused — nothing pushed,
+# the existing clip unchanged.
+# ⛔ ONLY SADISH_ERR_OOM IS PROPAGATED OUT OF THE FILL, and the asymmetry is deliberate. A path
+# with no verbs fills nothing, leaves the fresh canvas's zeroed coverage as the mask and so clips
+# everything away — that is what this entry point has always done with SADISH_ERR_EMPTY_PATH and
+# callers depend on it. An OOM is different in kind: the mask would be a mask of the fill that did
+# not happen, and pushing it would silently clip away a shape the caller asked to keep.
+# ⚠ Both halves of that asymmetry are GATED, not just asserted here: programs/oom_test.cyr group K
+# pushes a verb-less path with no hook armed and reads SADISH_OK, a clip of nothing, and a pop back
+# to the previous region (MEASURED identical on 0.7.0); group I refuses the fill and reads
+# SADISH_ERR_OOM with nothing pushed. Widening this line to `fillrc != SADISH_OK` fails group K.
 fn sd_canvas_clip_push_path(cv, path, rule): i64 {
     if (cv == 0) { return SADISH_ERR_BOUNDS; }
     if (path == 0) { return SADISH_ERR_EMPTY_PATH; }
     var w = sd_canvas_width(cv);
     var h = sd_canvas_height(cv);
     var tmp = sd_canvas_new(w, h);        # fresh (unclipped) -> raw shape coverage
+    if (tmp == 0) { return SADISH_ERR_OOM; }
     sd_canvas_set_aa(tmp, sd_canvas_aa(cv));   # the mask uses the parent's coverage engine
-    sd_canvas_fill_path(tmp, path, rule);
+    var fillrc = sd_canvas_fill_path(tmp, path, rule);
+    if (fillrc == SADISH_ERR_OOM) { return SADISH_ERR_OOM; }
     return sd_clip_push_mask(cv, sd_canvas_coverage(tmp));
 }
 
@@ -951,9 +1113,9 @@ fn sd_canvas_clip_pop(cv): i64 {
 
 # ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
-# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700.
+# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700; 0.7.1 -> 701.
 # ================================================================
 # @public
 fn sadish_version(): i64 {
-    return 700;
+    return 701;
 }

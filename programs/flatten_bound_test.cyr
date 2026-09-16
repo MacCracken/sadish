@@ -1,0 +1,1600 @@
+# programs/flatten_bound_test.cyr — RUN test for 0.7.1's three path/geom repairs, all three filed
+# by rekha against 0.7.0:
+#
+#   1. THE MID-POINT WASTE + THE WORK PAST THE CAP
+#      (issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md)
+#      Through 0.7.0 every subdivision node allocated 3 (quad) or 6 (cubic) SdPoints through
+#      sd_pt_mid and threw all but one away, and the recursion went on subdividing after the output
+#      could take nothing more. MEASURED on 0.7.0: 4,096 maximally non-flat quads through one
+#      sd_path_flatten cost 83,623,976 B in 3,133,451 allocations for 1,048,577 points.
+#   2. sd_path_new_cap (proposals/2026-09-15-path-capacity-for-known-size-paths.md)
+#   3. CHECKED ALLOCATIONS in path.cyr + geom.cyr
+#      (issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md)
+#
+# ⛔⛔ THE GATE THAT MATTERS MOST IS GROUP B: every path UNDER the budget must flatten to the SAME
+# POINTS IN THE SAME ORDER as 0.7.0. This suite carries 0.7.0's recursion verbatim (ref_quad /
+# ref_cubic / ref_flatten below, SdPoint mid-points and all) and compares raw coordinate against
+# raw coordinate — so "the geometry did not move" is an assertion here, not a claim in a report.
+# The same reference is what makes the before/after allocation counts assertions too: group C
+# counts 0.7.0's calls and 0.7.1's calls on the same curve, in the same process.
+#
+# ⚠ ORDER MATTERS. Group A reads the SHIPPED budget before anything changes it; group D measures
+# exact global-heap zeros; groups G-I install hooks that refuse. Every group restores the default
+# budget and the global allocator before the next one.
+#
+# ⭐ GROUP M IS THE REPAIR PASS — six holes a review found in the first 0.7.1 draft (a capacity
+# whose byte size wrapped, a fullness flag that leaked between two outputs, verdicts left stale by
+# the empty-path return, and three things groups G/I/J asserted too weakly to hold). Each of its
+# checks failed before the repair it guards. It is a separate group so the numbering of the checks
+# that came first stays put.
+# ⭐ GROUP N IS THE SECOND ONE — the same fullness leak measured where M did not look (fill -> fill
+# inside one operation, which blanked every later fill), and the boundary M1's constant was never
+# actually held to. Same rule: every check in it failed before the repair it guards.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "flatten_bound_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# The budget the process STARTED with — captured before any group changes it, so group A pins the
+# SHIPPED default rather than a constant compared against itself.
+var g_budget0 = 0;
+
+# ---- hooks ------------------------------------------------------------------------------------
+# A counting pass-through to the global allocator: every byte sadish asks for, and every call.
+var g_bytes = 0;
+var g_calls = 0;
+
+fn hook_count(n): i64 {
+    g_calls = g_calls + 1;
+    g_bytes = g_bytes + n;
+    return alloc(n);
+}
+
+# An arena that can run out, counting attempts (g_calls) and grants (g_ok) separately — the
+# difference is how many requests were REFUSED.
+var g_arena = 0;
+var g_ok = 0;
+
+fn hook_arena(n): i64 {
+    g_calls = g_calls + 1;
+    var p = arena_alloc(g_arena, n);
+    if (p != 0) {
+        g_ok = g_ok + 1;
+        g_bytes = g_bytes + n;
+    }
+    return p;
+}
+
+# A BUDGETED hook: grants its first g_grant allocations from the global heap, then refuses every
+# one. Driving g_grant across 0..K makes each allocation site in turn the failing one.
+var g_grant = 0;
+
+fn hook_grant(n): i64 {
+    g_calls = g_calls + 1;
+    if (g_grant <= 0) { return 0; }
+    g_grant = g_grant - 1;
+    g_bytes = g_bytes + n;
+    return alloc(n);
+}
+
+# An ISOLATING hook: refuses exactly the g_skip-th allocation (1-based, counted in g_calls) and
+# grants every other one. A prefix-granting hook cannot hold a site to its OWN 0-check — the next
+# site's check catches the failure and the guard that is missing never shows. Reset g_calls before
+# each use; g_skip = 0 refuses nothing.
+var g_skip = 0;
+
+fn hook_skip(n): i64 {
+    g_calls = g_calls + 1;
+    if (g_calls == g_skip) { return 0; }
+    return alloc(n);
+}
+
+# ---- 0.7.0's flatten, verbatim ----------------------------------------------------------------
+# sd_pt_mid + sd_flat_emit into a FIXED ctx, the recursion exactly as 0.7.0 shipped it. The only
+# change is the local emit (0.7.0's grew sd_path_flatten's ctx; this one is a plain fixed buffer,
+# which is the shape every other 0.7.0 caller used).
+fn ref_mid(a, b): i64 {
+    return sd_point_new(sd_asr(sd_point_x(a) + sd_point_x(b), 1),
+      sd_asr(sd_point_y(a) + sd_point_y(b), 1));
+}
+
+fn ref_emit(ctx, pt): i64 {
+    var count = load64(ctx + 8);
+    if (count >= load64(ctx + 16)) { return 0; }
+    store64(load64(ctx + 0) + count * 8, pt);
+    store64(ctx + 8, count + 1);
+    return 0;
+}
+
+# ⛔ THE FLATNESS TESTS ARE COPIED, NOT CALLED. 0.7.1 refactored sd_quad_flat / sd_cubic_flat onto
+# a shared coordinate-level helper that the production recursion also uses — so a reference that
+# CALLED them would compare the new predicate against itself and see nothing when it changed.
+# MUTATION-PROVED: with `dy = y0 - 2*y1 - y2` in _sd_quad_flat_xy, a calling reference passes this
+# whole suite (the geometry moves in both halves at once); the copies below fail check #13.
+fn ref_quad_flat(p0, p1, p2, tol): i64 {
+    var dx = sd_point_x(p0) - 2 * sd_point_x(p1) + sd_point_x(p2);
+    var dy = sd_point_y(p0) - 2 * sd_point_y(p1) + sd_point_y(p2);
+    if (sd_abs(dx) + sd_abs(dy) <= 4 * tol) { return 1; }
+    return 0;
+}
+
+fn ref_cubic_flat(p0, p1, p2, p3, tol): i64 {
+    var d1x = sd_point_x(p0) - 2 * sd_point_x(p1) + sd_point_x(p2);
+    var d1y = sd_point_y(p0) - 2 * sd_point_y(p1) + sd_point_y(p2);
+    var d2x = sd_point_x(p1) - 2 * sd_point_x(p2) + sd_point_x(p3);
+    var d2y = sd_point_y(p1) - 2 * sd_point_y(p2) + sd_point_y(p3);
+    var m1 = sd_abs(d1x) + sd_abs(d1y);
+    var m2 = sd_abs(d2x) + sd_abs(d2y);
+    var m = m1;
+    if (m2 > m) { m = m2; }
+    if (m <= 4 * tol) { return 1; }
+    return 0;
+}
+
+fn ref_quad(ctx, p0, p1, p2, tol, depth): i64 {
+    if (depth <= 0) { return ref_emit(ctx, p2); }
+    if (ref_quad_flat(p0, p1, p2, tol) != 0) { return ref_emit(ctx, p2); }
+    var p01 = ref_mid(p0, p1);
+    var p12 = ref_mid(p1, p2);
+    var p012 = ref_mid(p01, p12);
+    ref_quad(ctx, p0, p01, p012, tol, depth - 1);
+    ref_quad(ctx, p012, p12, p2, tol, depth - 1);
+    return 0;
+}
+
+fn ref_cubic(ctx, p0, p1, p2, p3, tol, depth): i64 {
+    if (depth <= 0) { return ref_emit(ctx, p3); }
+    if (ref_cubic_flat(p0, p1, p2, p3, tol) != 0) { return ref_emit(ctx, p3); }
+    var p01 = ref_mid(p0, p1);
+    var p12 = ref_mid(p1, p2);
+    var p23 = ref_mid(p2, p3);
+    var p012 = ref_mid(p01, p12);
+    var p123 = ref_mid(p12, p23);
+    var p0123 = ref_mid(p012, p123);
+    ref_cubic(ctx, p0, p01, p012, p0123, tol, depth - 1);
+    ref_cubic(ctx, p0123, p123, p23, p3, tol, depth - 1);
+    return 0;
+}
+
+# 0.7.0's sd_path_flatten verb walk, into a ctx of `cap` entries. Returns the ctx.
+fn ref_flatten(path, tol, cap): i64 {
+    var ctx = alloc(24);
+    store64(ctx + 0, alloc(cap * 8));
+    store64(ctx + 8, 0);
+    store64(ctx + 16, cap);
+    var t = tol;
+    if (t < 1) { t = 1; }
+    var n_verbs = load64(path + SD_PATH_NVERBS_OFFSET);
+    var verbs = load64(path + SD_PATH_VERBS_OFFSET);
+    var points = load64(path + SD_PATH_POINTS_OFFSET);
+    var cur = 0;
+    var vi = 0;
+    var pi = 0;
+    while (vi < n_verbs) {
+        var verb = load64(verbs + vi * 8);
+        if (verb == SD_VERB_MOVETO) {
+            cur = load64(points + pi * 8);
+            ref_emit(ctx, cur);
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_LINETO) {
+            cur = load64(points + pi * 8);
+            ref_emit(ctx, cur);
+            pi = pi + 1;
+        }
+        if (verb == SD_VERB_QUADTO) {
+            var qc = load64(points + pi * 8);
+            var qe = load64(points + (pi + 1) * 8);
+            ref_quad(ctx, cur, qc, qe, t, SD_FLATTEN_MAX_DEPTH);
+            cur = qe;
+            pi = pi + 2;
+        }
+        if (verb == SD_VERB_CUBICTO) {
+            var k1 = load64(points + pi * 8);
+            var k2 = load64(points + (pi + 1) * 8);
+            var ke = load64(points + (pi + 2) * 8);
+            ref_cubic(ctx, cur, k1, k2, ke, t, SD_FLATTEN_MAX_DEPTH);
+            cur = ke;
+            pi = pi + 3;
+        }
+        vi = vi + 1;
+    }
+    return ctx;
+}
+
+# Raw-coordinate comparison of a polyline against a reference ctx: 0 if identical, else the number
+# of points that differ (a count mismatch reports 1,000,000 + |difference|).
+fn poly_vs_ref(pl, ctx): i64 {
+    var n = sd_polyline_count(pl);
+    var rn = load64(ctx + 8);
+    if (n != rn) { return 1000000 + sd_abs(n - rn); }
+    var pts = sd_polyline_points(pl);
+    var rpts = load64(ctx + 0);
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        var a = load64(pts + i * 8);
+        var b = load64(rpts + i * 8);
+        if (sd_point_x(a) != sd_point_x(b)) { bad = bad + 1; }
+        if (sd_point_y(a) != sd_point_y(b)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# Flatten `p` both ways at `tol` and report the difference (0 = bit-identical geometry).
+fn same_as_ref(p, tol): i64 {
+    var pl = sd_path_flatten(p, tol);
+    var ctx = ref_flatten(p, tol, 300000);
+    if (pl == 0) { return 999999; }
+    return poly_vs_ref(pl, ctx);
+}
+
+# ---- shapes -----------------------------------------------------------------------------------
+# moveto(0,0) then n x quadto(1e9, 1e9, 0, 0): every quad needs the full depth-8 subdivision.
+# This is the filing's repro, verbatim.
+fn hostile_quads(n): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0, 0);
+    var i = 0;
+    while (i < n) {
+        sd_path_quadto(p, 1000000000, 1000000000, 0, 0);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn hostile_cubics(n): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0, 0);
+    var i = 0;
+    while (i < n) {
+        sd_path_cubicto(p, 1000000000, 1000000000, 0 - 1000000000, 0 - 1000000000, 0, 0);
+        i = i + 1;
+    }
+    return p;
+}
+
+# A circle of 4 cubic arcs, radius r (16.16), centred at (cx, cy). k = 0.5522847 * r.
+fn circle_cubic(cx, cy, r): i64 {
+    var k = sd_fixed_mul(r, 36195);
+    var p = sd_path_new();
+    sd_path_moveto(p, cx + r, cy);
+    sd_path_cubicto(p, cx + r, cy + k, cx + k, cy + r, cx, cy + r);
+    sd_path_cubicto(p, cx - k, cy + r, cx - r, cy + k, cx - r, cy);
+    sd_path_cubicto(p, cx - r, cy - k, cx - k, cy - r, cx, cy - r);
+    sd_path_cubicto(p, cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+    sd_path_close(p);
+    return p;
+}
+
+# grow_edges_test.cyr's cubic_ring: a closed ring of n cubic arcs bulging 3 px out of a 24 px
+# radius — the curve path whose flattening runs furthest in the suites.
+fn cubic_ring(n): i64 {
+    var p = sd_path_new();
+    var cx = 32 * SD_ONE + 12345;
+    var cy = 32 * SD_ONE + 23456;
+    var r = 24 * SD_ONE;
+    var ro = 27 * SD_ONE;
+    var k = 0;
+    while (k < n) {
+        var a0 = (411775 * k) / n;
+        var a1 = (411775 * (k + 1)) / n;
+        var am = (a0 * 2 + a1) / 3;
+        var an = (a0 + a1 * 2) / 3;
+        if (k == 0) {
+            sd_path_moveto(p, cx + sd_fixed_mul(r, sd_cos(a0)), cy + sd_fixed_mul(r, sd_sin(a0)));
+        }
+        sd_path_cubicto(p, cx + sd_fixed_mul(ro, sd_cos(am)), cy + sd_fixed_mul(ro, sd_sin(am)),
+          cx + sd_fixed_mul(ro, sd_cos(an)), cy + sd_fixed_mul(ro, sd_sin(an)),
+          cx + sd_fixed_mul(r, sd_cos(a1)), cy + sd_fixed_mul(r, sd_sin(a1)));
+        k = k + 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+# moveto + `nlines` linetos + ONE quad — a path that spends a small budget on STRAIGHT verbs and
+# only then reaches a curve. `bulge` is how far the control point sits off the chord: 0 puts it
+# exactly on the midpoint, so the quad is FLAT at any tolerance and the recursion emits its
+# endpoint without ever consulting the budget. Group M4 is the difference between those two.
+fn lines_then_quad(nlines, bulge): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0, 0);
+    var i = 1;
+    while (i <= nlines) {
+        sd_path_lineto(p, i * SD_ONE, 0);
+        i = i + 1;
+    }
+    var x0 = nlines * SD_ONE;
+    sd_path_quadto(p, x0 + SD_ONE, bulge, x0 + 2 * SD_ONE, 0);
+    return p;
+}
+
+# The same shape with a CUBIC. bulge = 0 puts both controls on the chord at 1/3 and 2/3, so both
+# second differences are 0 and the cubic is flat at any tolerance.
+fn lines_then_cubic(nlines, bulge): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0, 0);
+    var i = 1;
+    while (i <= nlines) {
+        sd_path_lineto(p, i * SD_ONE, 0);
+        i = i + 1;
+    }
+    var x0 = nlines * SD_ONE;
+    sd_path_cubicto(p, x0 + SD_ONE, bulge, x0 + 2 * SD_ONE, bulge, x0 + 3 * SD_ONE, 0);
+    return p;
+}
+
+# A mixed path through every verb, with negative and sub-pixel coordinates.
+fn mixed_path(): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, 0 - 3 * SD_ONE - 12345, 2 * SD_ONE + 999);
+    sd_path_lineto(p, 5 * SD_ONE + 7, 0 - SD_ONE);
+    sd_path_quadto(p, 11 * SD_ONE, 0 - 9 * SD_ONE - 33, 17 * SD_ONE + 5, 4 * SD_ONE);
+    sd_path_cubicto(p, 0 - 20 * SD_ONE, 30 * SD_ONE, 40 * SD_ONE, 0 - 25 * SD_ONE - 7,
+      0 - SD_ONE, 0 - SD_ONE);
+    sd_path_lineto(p, 2 * SD_ONE, 2 * SD_ONE);
+    sd_path_quadto(p, 0, 0, 0 - 4 * SD_ONE, 6 * SD_ONE);
+    sd_path_close(p);
+    return p;
+}
+
+# ---- the synthetic ASCII set --------------------------------------------------------------
+# 95 glyph-shaped paths: 1,768 verbs and 2,498 points in total, the largest 61 verbs — the exact
+# shape rekha measured LiberationSans's printable ASCII at (proposals/2026-09-15-path-capacity…).
+# Each is moveto + a linetos + b quadtos + close around a small circle, the quads bulging outward.
+fn glyph_lines(i): i64 {
+    if (i == 0) { return 29; }
+    if (i <= 66) { return 8; }
+    return 7;
+}
+
+fn glyph_quads(i): i64 {
+    if (i == 0) { return 30; }
+    if (i <= 43) { return 9; }
+    return 8;
+}
+
+fn glyph_nverbs(i): i64 { return glyph_lines(i) + glyph_quads(i) + 2; }
+fn glyph_npoints(i): i64 { return 1 + glyph_lines(i) + 2 * glyph_quads(i); }
+
+fn glyph_into(p, i): i64 {
+    var a = glyph_lines(i);
+    var b = glyph_quads(i);
+    var n = a + b;
+    var cx = 8 * SD_ONE + (i % 7) * 4096;
+    var cy = 8 * SD_ONE + (i % 5) * 4096;
+    var r = 6 * SD_ONE + (i % 11) * 6553;
+    var ro = r + 91750;
+    var k = 0;
+    while (k < n) {
+        var a0 = (411775 * k) / n;
+        var a1 = (411775 * (k + 1)) / n;
+        var am = (a0 + a1) / 2;
+        var x1 = cx + sd_fixed_mul(r, sd_cos(a1));
+        var y1 = cy + sd_fixed_mul(r, sd_sin(a1));
+        if (k == 0) {
+            sd_path_moveto(p, cx + sd_fixed_mul(r, sd_cos(a0)), cy + sd_fixed_mul(r, sd_sin(a0)));
+        }
+        if (k < a) {
+            sd_path_lineto(p, x1, y1);
+        } else {
+            sd_path_quadto(p, cx + sd_fixed_mul(ro, sd_cos(am)),
+              cy + sd_fixed_mul(ro, sd_sin(am)), x1, y1);
+        }
+        k = k + 1;
+    }
+    sd_path_close(p);
+    return p;
+}
+
+# Do `path`'s verbs and points read back exactly as a freshly built glyph i does?
+fn glyph_matches(path, i): i64 {
+    var ref = glyph_into(sd_path_new(), i);
+    if (sd_path_verb_count(path) != sd_path_verb_count(ref)) { return 0; }
+    if (sd_path_point_count(path) != sd_path_point_count(ref)) { return 0; }
+    var va = load64(path + SD_PATH_VERBS_OFFSET);
+    var vb = load64(ref + SD_PATH_VERBS_OFFSET);
+    var k = 0;
+    while (k < sd_path_verb_count(ref)) {
+        if (load64(va + k * 8) != load64(vb + k * 8)) { return 0; }
+        k = k + 1;
+    }
+    var pa = load64(path + SD_PATH_POINTS_OFFSET);
+    var pb = load64(ref + SD_PATH_POINTS_OFFSET);
+    k = 0;
+    while (k < sd_path_point_count(ref)) {
+        var x = load64(pa + k * 8);
+        var y = load64(pb + k * 8);
+        if (sd_point_x(x) != sd_point_x(y)) { return 0; }
+        if (sd_point_y(x) != sd_point_y(y)) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+# Total coverage of a canvas.
+fn cov_sum(cv): i64 {
+    var n = sd_canvas_width(cv) * sd_canvas_height(cv);
+    var p = sd_canvas_coverage(cv);
+    var s = 0;
+    var i = 0;
+    while (i < n) {
+        s = s + load8(p + i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main(): i64 {
+    alloc_init();
+    g_budget0 = sd_flatten_budget_get();
+    var TOL = SD_ONE >> 2;    # the fill's own tolerance
+
+    # ── A) THE BUDGET KNOB ─────────────────────────
+    # ⭐ The default is a BOUND, not 0, for the same reason raster.cyr's growth ceiling is: one
+    # pathological path must not be able to spend a process's memory. 65,536 points is 7.6x the
+    # largest legitimate path in these suites (cubic_ring(3000), group B), 20x a whole ASCII label.
+    check(SD_FLATTEN_BUDGET_DEFAULT, 65536);                          # 1
+    check(g_budget0, SD_FLATTEN_BUDGET_DEFAULT);                      # 2 — the SHIPPED default
+    check(sd_flatten_budget_set(4096), SD_FLATTEN_BUDGET_DEFAULT);    # 3 — returns the PREVIOUS
+    check(sd_flatten_budget_get(), 4096);                             # 4
+    check(sd_flatten_budget_set(0 - 1), 4096);                        # 5 — negative is refused...
+    check(sd_flatten_budget_get(), 4096);                             # 6 — ...and changes nothing
+    check(sd_flatten_budget_set(0), 4096);                            # 7 — 0 is legal: unbounded
+    check(sd_flatten_budget_get(), 0);                                # 8
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 0);       # 9 — back to the default
+    check(sd_flatten_budget_get(), 65536);                            # 10
+
+    # ── B) GEOMETRY IDENTITY WITH 0.7.0 ─────────────────────
+    # ⛔ Every path under the budget flattens to the same points, in the same order, as the 0.7.0
+    # recursion carried verbatim at the top of this file. Raw coordinate against raw coordinate.
+    # B0. The SdPoint-form predicates still answer what 0.7.0's did — 0.7.1 moved their bodies onto
+    # a shared coordinate helper, and a consumer may call either form.
+    var b0 = load64(load64(mixed_path() + SD_PATH_POINTS_OFFSET) + 0);
+    var b1 = load64(load64(mixed_path() + SD_PATH_POINTS_OFFSET) + 8);
+    var b2 = load64(load64(mixed_path() + SD_PATH_POINTS_OFFSET) + 16);
+    var b3 = load64(load64(mixed_path() + SD_PATH_POINTS_OFFSET) + 24);
+    check(sd_quad_flat(b0, b1, b2, TOL), ref_quad_flat(b0, b1, b2, TOL));              # 11
+    check(sd_quad_flat(b0, b1, b2, 1 << 30), ref_quad_flat(b0, b1, b2, 1 << 30));      # 12 — flat
+    check(sd_cubic_flat(b0, b1, b2, b3, TOL), ref_cubic_flat(b0, b1, b2, b3, TOL));    # 13
+    check(sd_cubic_flat(b0, b1, b2, b3, 1 << 30),   # 14
+      ref_cubic_flat(b0, b1, b2, b3, 1 << 30));                       # 14
+    check(same_as_ref(hostile_quads(1), TOL), 0);                     # 15 — a depth-8 quad
+    check(same_as_ref(hostile_cubics(1), TOL), 0);                    # 16 — a deep cubic
+    check(same_as_ref(hostile_quads(32), TOL), 0);                    # 17 — 8,193 points
+    check(same_as_ref(hostile_cubics(32), TOL), 0);                   # 18
+    check(same_as_ref(circle_cubic(64 * SD_ONE, 64 * SD_ONE, 16 * SD_ONE), TOL), 0);        # 19
+    check(same_as_ref(circle_cubic(256 * SD_ONE, 256 * SD_ONE, 128 * SD_ONE), TOL), 0);     # 20
+    check(same_as_ref(circle_cubic(1024 * SD_ONE, 1024 * SD_ONE, 512 * SD_ONE), TOL), 0);   # 21
+    check(same_as_ref(circle_cubic(8192 * SD_ONE, 8192 * SD_ONE, 4096 * SD_ONE), TOL), 0);  # 22
+    check(same_as_ref(mixed_path(), TOL), 0);                         # 23 — every verb, negatives
+    check(same_as_ref(cubic_ring(3000), TOL), 0);                     # 24 — 8,601 points
+    # tolerance extremes: 1 raw unit, a whole pixel, and the non-positive values sd_path_flatten
+    # clamps to 1 — the clamp is where a depth-8 recursion is forced on EVERY curve.
+    check(same_as_ref(mixed_path(), 1), 0);                           # 25
+    check(same_as_ref(mixed_path(), SD_ONE), 0);                      # 26
+    check(same_as_ref(mixed_path(), 0), 0);                           # 27
+    check(same_as_ref(mixed_path(), 0 - 7), 0);                       # 28
+    check(same_as_ref(circle_cubic(0, 0, 200 * SD_ONE), 1), 0);       # 29 — origin-centred, tol 1
+    # the whole ASCII set, glyph by glyph
+    var bbad = 0;
+    var bi = 0;
+    while (bi < 95) {
+        if (same_as_ref(glyph_into(sd_path_new(), bi), TOL) != 0) { bbad = bbad + 1; }
+        bi = bi + 1;
+    }
+    check(bbad, 0);                                                   # 30 — 95 glyph paths
+    # ⭐ POINTER identity, not just coordinates: a curve's final endpoint in the output IS the
+    # path's own SdPoint, exactly as 0.7.0 left it (nothing downstream may see a copy).
+    var bp = hostile_quads(1);
+    var bpl = sd_path_flatten(bp, TOL);
+    var bn = sd_polyline_count(bpl);
+    check(bn, 257);                                                   # 31
+    check(load64(sd_polyline_points(bpl) + (bn - 1) * 8),   # 32
+      load64(load64(bp + SD_PATH_POINTS_OFFSET) + 2 * 8));            # 28 — the quad's own endpoint
+    check(load64(sd_polyline_points(bpl) + 0),   # 33
+      load64(load64(bp + SD_PATH_POINTS_OFFSET) + 0));                # 29 — the moveto's own point
+    check(sd_flatten_degraded(), 0);                                  # 34 — nothing degraded
+    check(sd_flatten_truncated(), 0);                                 # 35 — nothing lost
+
+    # ── C) THE MID-POINT COUNT: 0.7.0's AND 0.7.1's, IN ONE PROCESS ───────────
+    # A maximally non-flat quad has 255 subdivision nodes and emits 256 points. 0.7.0 allocated 3
+    # SdPoints per node = 765 and used 255 of them; 0.7.1 allocates only the one per node that
+    # reaches the output.
+    var cq = hostile_quads(1);
+    var cq0 = load64(load64(cq + SD_PATH_POINTS_OFFSET) + 0);
+    var cq1 = load64(load64(cq + SD_PATH_POINTS_OFFSET) + 8);
+    var cq2 = load64(load64(cq + SD_PATH_POINTS_OFFSET) + 16);
+    var cctx = alloc(24);
+    store64(cctx + 0, alloc(4096 * 8));
+    store64(cctx + 16, 4096);
+    store64(cctx + 8, 0);
+    g_calls = 0;
+    g_bytes = 0;
+    var prev = sd_alloc_set(&hook_count);
+    ref_quad(cctx, cq0, cq1, cq2, TOL, SD_FLATTEN_MAX_DEPTH);
+    sd_alloc_set(prev);
+    check(load64(cctx + 8), 256);                                     # 36 — 0.7.0 emits 256 points
+    check(g_calls, 765);                                              # 37 — for 765 allocations
+    check(g_bytes, 765 * 16);                                         # 38 — 12,240 B
+    store64(cctx + 8, 0);
+    g_calls = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_count);
+    sd_flatten_quad(cctx, cq0, cq1, cq2, TOL, SD_FLATTEN_MAX_DEPTH);
+    sd_alloc_set(prev);
+    check(load64(cctx + 8), 256);                                     # 39 — the same 256 points
+    check(g_calls, 255);                                              # 40 — for 255 allocations
+    check(g_bytes, 255 * 16);                                         # 41 — 4,080 B: 3.00x less
+    # the cubic: 6 mids a node through 0.7.0, 1 through 0.7.1 — 6x
+    var ck = hostile_cubics(1);
+    var ck0 = load64(load64(ck + SD_PATH_POINTS_OFFSET) + 0);
+    var ck1 = load64(load64(ck + SD_PATH_POINTS_OFFSET) + 8);
+    var ck2 = load64(load64(ck + SD_PATH_POINTS_OFFSET) + 16);
+    var ck3 = load64(load64(ck + SD_PATH_POINTS_OFFSET) + 24);
+    store64(cctx + 8, 0);
+    g_calls = 0;
+    prev = sd_alloc_set(&hook_count);
+    ref_cubic(cctx, ck0, ck1, ck2, ck3, TOL, SD_FLATTEN_MAX_DEPTH);
+    sd_alloc_set(prev);
+    var cubic_pts = load64(cctx + 8);
+    check(g_calls, (cubic_pts - 1) * 6);                              # 42 — 0.7.0: 6 a node
+    store64(cctx + 8, 0);
+    g_calls = 0;
+    prev = sd_alloc_set(&hook_count);
+    sd_flatten_cubic(cctx, ck0, ck1, ck2, ck3, TOL, SD_FLATTEN_MAX_DEPTH);
+    sd_alloc_set(prev);
+    check(load64(cctx + 8), cubic_pts);                               # 43 — the same points
+    check(g_calls, cubic_pts - 1);                                    # 44 — 0.7.1: 1 a node
+    check(cubic_pts, 232);                                            # 45 — MEASURED: 1,386 -> 231
+
+    # ── D) THE FILING'S TABLE, RE-MEASURED ────────────────────
+    # sd_path_flatten of N maximally non-flat quads under a counting hook. 0.7.0's figures are in
+    # the comment; the assertions are 0.7.1's.
+    #   quads | points 0.7.0 | 0.7.1 | bytes 0.7.0 | 0.7.1     | allocs 0.7.0 | 0.7.1
+    #      32 |        8,193 | 8,193 |     588,328 |   327,208 |       24,484 |  8,164
+    #      64 |       16,385 |16,385 |   1,242,152 |   719,912 |       48,965 | 16,325
+    #   1,024 |      262,145 |66,305 |  20,856,872 | 3,076,136 |      783,369 | 65,287
+    #   4,096 |    1,048,577 |69,377 |  83,623,976 | 3,076,136 |    3,133,451 | 65,287
+    # ⇒ At 4,096 quads: 27.2x the bytes and 48.0x the allocations, and the work no longer grows
+    # with the curve count at all (the 1,024 and 4,096 rows are the same figure — the budget).
+    var d32 = hostile_quads(32);
+    var d64 = hostile_quads(64);
+    var d1k = hostile_quads(1024);
+    var d4k = hostile_quads(4096);
+    g_calls = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_count);
+    var dpl = sd_path_flatten(d32, TOL);
+    sd_alloc_set(prev);
+    check(sd_polyline_count(dpl), 8193);                              # 46
+    check(g_bytes, 327208);                                           # 47
+    check(g_calls, 8164);                                             # 48
+    check(sd_flatten_degraded(), 0);                                  # 49 — 8,193 < 65,536
+    g_calls = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_count);
+    dpl = sd_path_flatten(d64, TOL);
+    sd_alloc_set(prev);
+    check(sd_polyline_count(dpl), 16385);                             # 50
+    check(g_bytes, 719912);                                           # 51
+    check(g_calls, 16325);                                            # 52
+    g_calls = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_count);
+    dpl = sd_path_flatten(d1k, TOL);
+    sd_alloc_set(prev);
+    check(sd_polyline_count(dpl), 66305);                             # 53 — the budget, then chords
+    check(g_bytes, 3076136);                                          # 54
+    check(g_calls, 65287);                                            # 55
+    check(sd_flatten_degraded(), 1);                                  # 56 — and it SAYS it degraded
+    g_calls = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_count);
+    dpl = sd_path_flatten(d4k, TOL);
+    sd_alloc_set(prev);
+    check(sd_polyline_count(dpl), 69377);                             # 57
+    check(g_bytes, 3076136);                                          # 58 — same as 1,024 quads
+    check(g_calls, 65287);                                            # 59 — the bound is a BOUND
+    check(sd_flatten_degraded(), 1);                                  # 60
+    check(sd_flatten_truncated(), 0);                                 # 61 — degraded is not truncated
+
+    # ── E) NO PROCESS-LIFETIME SCRATCH: A FLATTEN COSTS THE GLOBAL HEAP EXACTLY 0 ───────
+    # ⭐ The mid-point fix carries the de Casteljau temporaries as plain i64 LOCALS, so there is no
+    # per-depth scratch to allocate, warm or size — the one-time cost is 0 B, on the global heap
+    # and everywhere else, for ever. (A scratch of SdPoint records indexed by depth would also have
+    # worked — 9 levels x 5 records = 720 B from the global alloc — but it would have put those
+    # 720 B inside programs/alloc_test.cyr's group-B headline, which asserts that twenty frames of
+    # curve drawing under an arena hook cost the global heap EXACTLY 0.)
+    var ecv = sd_canvas_new(64, 64);
+    var ecircle = circle_cubic(32 * SD_ONE, 32 * SD_ONE, 20 * SD_ONE);
+    sd_canvas_fill_path(ecv, ecircle, SD_FILL_NONZERO);               # warm raster.cyr's scratch
+    g_arena = arena_new_growable(1048576);
+    check(g_arena != 0, 1);                                           # 62
+    prev = sd_alloc_set(&hook_arena);
+    var e0 = alloc_used();
+    g_bytes = 0;
+    g_calls = 0;
+    g_ok = 0;
+    sd_path_flatten(ecircle, TOL);
+    var e_first = g_bytes;
+    check(alloc_used() - e0, 0);                                      # 63 — not one global byte
+    g_bytes = 0;
+    sd_path_flatten(ecircle, TOL);
+    check(g_bytes, e_first);                                          # 64 — and the same cost again
+    check(alloc_used() - e0, 0);                                      # 65
+    g_bytes = 0;
+    sd_canvas_fill_path(ecv, ecircle, SD_FILL_NONZERO);
+    var e_fill = g_bytes;
+    check(alloc_used() - e0, 0);                                      # 66 — a curve FILL likewise
+    g_bytes = 0;
+    sd_canvas_fill_path(ecv, ecircle, SD_FILL_NONZERO);
+    check(g_bytes, e_fill);                                           # 67
+    check(sd_alloc_set(prev), &hook_arena);                           # 68
+    arena_reset(g_arena);
+
+    # ── F) A FULL OUTPUT STOPS THE SUBDIVISION ──────────────────
+    # An arena sized for out (65,536) + ctx (24) + the 8,160 mid-points of 32 quads + the polyline
+    # (16), and nothing more: the 8,193rd emit asks for a 131,072 B doubling, is refused, and the
+    # 32 REMAINING quads must then cost ZERO allocation attempts. Through 0.7.0 each of them still
+    # ran a full depth-8 subdivision: 32 x 765 = 24,480 more requests for points nothing could
+    # hold. Total attempts here: 1 out + 1 ctx + 8,160 points + 1 refused doubling + 1 polyline.
+    var fpath = hostile_quads(64);
+    var fa = arena_new(65536 + 24 + 8160 * 16 + 16);
+    check(fa != 0, 1);                                                # 69
+    var keep = g_arena;
+    g_arena = fa;
+    g_calls = 0;
+    g_ok = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_arena);
+    var fpl = sd_path_flatten(fpath, TOL);
+    sd_alloc_set(prev);
+    g_arena = keep;
+    check(fpl != 0, 1);                                               # 70 — a result, not a fault
+    check(sd_polyline_count(fpl), 8192);                              # 71 — the points that fit
+    check(sd_flatten_truncated(), 1);                                 # 72 — and it says it lost some
+    check(g_calls, 8164);                                             # 73 — ⛔ 32 quads cost NOTHING
+    check(g_calls - g_ok, 1);                                         # 74 — exactly one refusal
+    check(arena_used(fa), 65536 + 24 + 8160 * 16 + 16);               # 75 — the arena is exactly full
+    # the prefix is the SAME prefix 0.7.0 produced — stopping early changed no point
+    var fref = ref_flatten(fpath, TOL, 8192);
+    check(poly_vs_ref(fpl, fref), 0);                                 # 76
+
+    # ── G) THE BUDGET DEGRADES THE REMAINING CURVES TO THEIR CHORDS ───────────
+    # At 64 points, the first quad subdivides until the budget is spent and every quad after it
+    # emits its endpoint only. The hostile quad's endpoint is its start point (0,0), so the tail of
+    # the polyline is 31 copies of the origin — the chord of a curve that returns where it began.
+    check(sd_flatten_budget_set(64), SD_FLATTEN_BUDGET_DEFAULT);      # 77
+    var gpl = sd_path_flatten(hostile_quads(32), TOL);
+    check(sd_polyline_count(gpl), 98);                                # 78 — MEASURED
+    check(sd_flatten_degraded(), 1);                                  # 79
+    check(sd_flatten_truncated(), 0);                                 # 80 — degraded, not truncated
+    var gpts = sd_polyline_points(gpl);
+    var gbad = 0;
+    var gi = 98 - 31;
+    while (gi < 98) {
+        if (sd_point_x(load64(gpts + gi * 8)) != 0) { gbad = gbad + 1; }
+        if (sd_point_y(load64(gpts + gi * 8)) != 0) { gbad = gbad + 1; }
+        gi = gi + 1;
+    }
+    check(gbad, 0);                                                   # 81 — the tail is chords
+    # ⭐ A CHORD COSTS NO ALLOCATION AT ALL: the endpoint it emits is the path's own SdPoint. So
+    # 4,096 curves under a 64-point budget cost what ONE of them costs, plus one emit each.
+    var gbig = hostile_quads(4096);     # built OFF the hook — this figure is the flatten's
+    g_calls = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_count);
+    var gbpl = sd_path_flatten(gbig, TOL);
+    sd_alloc_set(prev);
+    check(sd_polyline_count(gbpl), 4162);                             # 82 — 1 + 66 + 4,095 chords
+    check(g_calls, 68);                                               # 83 — out + ctx + polyline +
+    #                                                                   65 mid-points, for 4,096
+    #                                                                   curves (0.7.0: 3,133,451)
+    check(sd_flatten_degraded(), 1);                                  # 84
+    # budget 0 is 0.7.0's unbounded behaviour, to the point
+    check(sd_flatten_budget_set(0), 64);                              # 85
+    var gfull = sd_path_flatten(hostile_quads(32), TOL);
+    check(sd_polyline_count(gfull), 8193);                            # 86
+    check(sd_flatten_degraded(), 0);                                  # 87
+    check(same_as_ref(hostile_quads(32), TOL), 0);                    # 88 — still 0.7.0's geometry
+    # ⚠ The budget is spent by EMITS and read before a SUBDIVISION, so a path that finishes on its
+    # last budgeted point is not degraded: the flag means "a curve was cut", never "the budget ran
+    # out". 8,193 points against a budget of 8,193 — and of 8,192 — are both whole.
+    check(sd_flatten_budget_set(8193), 0);                            # 89
+    check(sd_polyline_count(sd_path_flatten(hostile_quads(32), TOL)), 8193);   # 90
+    check(sd_flatten_degraded(), 0);                                  # 91
+    sd_flatten_budget_set(8192);
+    check(sd_polyline_count(sd_path_flatten(hostile_quads(32), TOL)), 8193);   # 92
+    check(sd_flatten_degraded(), 0);                                  # 93 — the last point was the
+    #                                                                   last emit: no node after it
+    # One point earlier it DOES bite, and the curve it bites is cut to its chord.
+    sd_flatten_budget_set(8000);
+    var gcut = sd_path_flatten(hostile_quads(32), TOL);
+    check(sd_polyline_count(gcut), 8003);                             # 94 — MEASURED
+    check(sd_flatten_degraded(), 1);                                  # 95
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 8000);    # 96
+
+    # ── H) A CONSUMER-SCOPED OPERATION BOUNDS A WHOLE FILL ──────────────
+    # raster.cyr flattens ONE CURVE VERB at a time into a fixed buffer, so each of those calls is
+    # its own operation and a 4,096-curve fill spends the budget 4,096 times over. A consumer that
+    # wants the whole fill bounded says so with sd_flatten_op_begin/end.
+    check(sd_flatten_op_begin(), 1);                                  # 97 — nesting depth
+    check(sd_flatten_op_begin(), 2);                                  # 98
+    check(sd_flatten_op_end(), 1);                                    # 99
+    check(sd_flatten_op_end(), 0);                                    # 100
+    check(sd_flatten_op_end(), 0);                                    # 101 — closing when none is
+    #                                                                   open is a no-op
+    var hpath = hostile_quads(4096);
+    var hcv = sd_canvas_new(64, 64);
+    sd_canvas_fill_path(hcv, hpath, SD_FILL_NONZERO);                 # grow the edge list first
+    var hcv2 = sd_canvas_new(64, 64);
+    g_calls = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_count);
+    sd_canvas_fill_path(hcv2, hpath, SD_FILL_NONZERO);
+    sd_alloc_set(prev);
+    check(g_bytes, 16711680);                                         # 102 — 0.7.0: 50,135,040 B
+    check(g_calls, 1044480);                                          # 103 — 0.7.0: 3,133,440
+    check(sd_flatten_degraded(), 0);                                  # 104 — per-curve: never over
+    var hcv3 = sd_canvas_new(64, 64);
+    g_calls = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_count);
+    sd_flatten_op_begin();
+    sd_canvas_fill_path(hcv3, hpath, SD_FILL_NONZERO);
+    sd_flatten_op_end();
+    sd_alloc_set(prev);
+    check(g_bytes, 1044480);                                          # 105 — 16x less again
+    check(g_calls, 65280);                                            # 106 — 48x less than 0.7.0
+    check(sd_flatten_degraded(), 1);                                  # 107 — and the consumer sees it
+    # ⚠ NOT asserted: that the two pictures differ. This path's quads start and end at the same
+    # point, so their chords are degenerate and the ink is identical (MEASURED: equal sums).
+    # Degradation is a CONTRACT breach, not necessarily a visible one — the flag is the witness.
+    check(cov_sum(hcv2), cov_sum(hcv3));                              # 108
+    # a LEGITIMATE fill inside an operation is not touched by any of this
+    var hcv4 = sd_canvas_new(64, 64);
+    sd_flatten_op_begin();
+    sd_canvas_fill_path(hcv4, circle_cubic(32 * SD_ONE, 32 * SD_ONE, 20 * SD_ONE),
+      SD_FILL_NONZERO);
+    sd_flatten_op_end();
+    check(sd_flatten_degraded(), 0);                                  # 109
+    check(cov_sum(hcv4) > 0, 1);                                      # 110
+
+    # ── I) sd_path_new_cap ─────────────────────────
+    # ⚠ ONE capacity field governs BOTH arrays, so n_verbs and n_points collapse to their max and
+    # both arrays are opened at it. The 95-glyph figure below is therefore 84,496 B and not the
+    # 78,656 B the proposal computed for separate capacities — 5,840 B (7.4 %) more, against
+    # 5.13x less than sd_path_new. Splitting the capacities is an ABI change to SdPath; the
+    # two-argument signature here is the one that would survive it.
+    var ip = sd_path_new_cap(61, 90);
+    check(ip != 0, 1);                                                # 111
+    check(load64(ip + SD_PATH_CAP_OFFSET), 90);                       # 112 — max(61, 90)
+    check(sd_path_verb_count(ip), 0);                                 # 113
+    check(sd_path_point_count(ip), 0);                                # 114
+    check(load64(ip + SD_PATH_RESERVED_OFFSET), 0);                   # 115 — layout unchanged
+    check(load64(sd_path_new_cap(0, 0) + SD_PATH_CAP_OFFSET), SD_PATH_CAP_MIN);        # 116
+    check(load64(sd_path_new_cap(0 - 9, 0 - 9) + SD_PATH_CAP_OFFSET), SD_PATH_CAP_MIN);  # 117
+    check(load64(sd_path_new_cap(3, 2) + SD_PATH_CAP_OFFSET), SD_PATH_CAP_MIN);       # 118 — floor
+    check(load64(sd_path_new_cap(9, 2) + SD_PATH_CAP_OFFSET), 9);     # 119 — above it, exact
+    check(SD_PATH_CAP_MIN, 8);                                        # 120
+    check(load64(sd_path_new() + SD_PATH_CAP_OFFSET), SD_PATH_CAP);   # 121 — sd_path_new untouched
+    # sd_path_new's cost is what rekha's alloc_test pins: 48 + 2,048 + 2,048 + 3 x 16 = 4,192 B.
+    g_bytes = 0;
+    g_calls = 0;
+    prev = sd_alloc_set(&hook_count);
+    var isp = sd_path_new();
+    sd_path_moveto(isp, 0, 0);
+    sd_path_lineto(isp, SD_ONE, 0);
+    sd_path_lineto(isp, 0, SD_ONE);
+    sd_path_close(isp);
+    sd_alloc_set(prev);
+    check(g_bytes, 4192);                                             # 122
+    check(g_calls, 6);                                                # 123 — record, 2 arrays, 3 pts
+    g_bytes = 0;
+    g_calls = 0;
+    prev = sd_alloc_set(&hook_count);
+    var isc = sd_path_new_cap(4, 3);
+    sd_path_moveto(isc, 0, 0);
+    sd_path_lineto(isc, SD_ONE, 0);
+    sd_path_lineto(isc, 0, SD_ONE);
+    sd_path_close(isc);
+    sd_alloc_set(prev);
+    check(g_bytes, 224);                                              # 124 — 48 + 64 + 64 + 48
+    check(g_calls, 6);                                                # 125 — the same 6 calls
+    check(load64(isc + SD_PATH_CAP_OFFSET), SD_PATH_CAP_MIN);         # 126 — never grew
+    # ⭐ AN UNDERESTIMATE IS STILL CORRECT: the same glyph built at cap 8 and at its exact size
+    # reads back identical, verb for verb and point for point.
+    var iunder = glyph_into(sd_path_new_cap(1, 1), 0);
+    check(glyph_matches(iunder, 0), 1);                               # 127
+    check(load64(iunder + SD_PATH_CAP_OFFSET) >= glyph_npoints(0), 1);  # 128 — it grew to fit
+    var iexact = glyph_into(sd_path_new_cap(glyph_nverbs(0), glyph_npoints(0)), 0);
+    check(glyph_matches(iexact, 0), 1);                               # 129
+    check(load64(iexact + SD_PATH_CAP_OFFSET), glyph_npoints(0));     # 130 — and never grew
+    # THE PROPOSAL'S MEASUREMENT: 95 ASCII-shaped paths, 1,768 verbs and 2,498 points in total.
+    var itv = 0;
+    var itp = 0;
+    var ii = 0;
+    while (ii < 95) {
+        itv = itv + glyph_nverbs(ii);
+        itp = itp + glyph_npoints(ii);
+        ii = ii + 1;
+    }
+    check(itv, 1768);                                                 # 131 — rekha's verb total
+    check(itp, 2498);                                                 # 132 — and point total
+    check(glyph_nverbs(0), 61);                                       # 133 — largest glyph
+    g_bytes = 0;
+    g_calls = 0;
+    prev = sd_alloc_set(&hook_count);
+    ii = 0;
+    while (ii < 95) {
+        glyph_into(sd_path_new(), ii);
+        ii = ii + 1;
+    }
+    sd_alloc_set(prev);
+    check(g_bytes, 433648);                                           # 134 — rekha's MEASURED today
+    g_bytes = 0;
+    g_calls = 0;
+    var igrew = 0;
+    prev = sd_alloc_set(&hook_count);
+    ii = 0;
+    while (ii < 95) {
+        var gp = sd_path_new_cap(glyph_nverbs(ii), glyph_npoints(ii));
+        glyph_into(gp, ii);
+        if (load64(gp + SD_PATH_CAP_OFFSET) != glyph_npoints(ii)) { igrew = igrew + 1; }
+        ii = ii + 1;
+    }
+    sd_alloc_set(prev);
+    check(g_bytes, 84496);                                            # 135 — 5.13x less
+    check(igrew, 0);                                                  # 136 — not one doubling
+    check(95 * 48 + 8 * itv + 8 * itp + 16 * itp, 78656);             # 137 — two-capacity target
+    check(95 * 48 + 16 * itp + 16 * itp, 84496);                      # 138 — what one capacity costs
+
+    # ── J) A REFUSED ALLOCATION FAILS; IT DOES NOT FAULT ───────────────
+    # ⛔ THE POINT OF THIS GROUP IS THAT IT RUNS AT ALL. On 0.7.0 the very first sweep below
+    # (sd_path_moveto under a hook that has granted its last block) died with SIGSEGV, rc 139 —
+    # rekha filed exactly that. Every K below makes a different allocation site the failing one.
+    # J1. sd_path_new / sd_path_new_cap: record, verbs, points — 3 sites.
+    var jk = 0;
+    var jbad = 0;
+    while (jk < 3) {
+        g_grant = jk;
+        prev = sd_alloc_set(&hook_grant);
+        var jp = sd_path_new();
+        sd_alloc_set(prev);
+        if (jp != 0) { jbad = jbad + 1; }
+        jk = jk + 1;
+    }
+    check(jbad, 0);                                                   # 139 — 0, 1, 2 grants -> 0
+    g_grant = 3;
+    prev = sd_alloc_set(&hook_grant);
+    var jgood = sd_path_new();
+    sd_alloc_set(prev);
+    check(jgood != 0, 1);                                             # 140 — 3 grants -> a path
+    check(load64(jgood + SD_PATH_CAP_OFFSET), SD_PATH_CAP);           # 141
+    jk = 0;
+    jbad = 0;
+    while (jk < 3) {
+        g_grant = jk;
+        prev = sd_alloc_set(&hook_grant);
+        var jc = sd_path_new_cap(61, 90);
+        sd_alloc_set(prev);
+        if (jc != 0) { jbad = jbad + 1; }
+        jk = jk + 1;
+    }
+    check(jbad, 0);                                                   # 142
+    # J2. moveto / lineto / quadto / cubicto on a path with room: the SdPoints are the only
+    # allocations, and a refusal must leave the path EXACTLY as it was — no verb without its
+    # points. (0.7.0 pushed the verb first: a refused quadto left a QUADTO verb with 0 or 1 points
+    # behind it, and every later walk read the next verb's point as its own.)
+    var jpath = sd_path_new();
+    sd_path_moveto(jpath, SD_ONE, SD_ONE);
+    var jv0 = sd_path_verb_count(jpath);
+    var jp0 = sd_path_point_count(jpath);
+    g_grant = 0;
+    prev = sd_alloc_set(&hook_grant);
+    var jr = sd_path_lineto(jpath, 2 * SD_ONE, 0);
+    sd_alloc_set(prev);
+    check(jr, SADISH_ERR_OOM);                                        # 143
+    check(sd_path_verb_count(jpath), jv0);                            # 144 — not one verb pushed
+    check(sd_path_point_count(jpath), jp0);                           # 145
+    g_grant = 0;
+    prev = sd_alloc_set(&hook_grant);
+    jr = sd_path_moveto(jpath, 2 * SD_ONE, 0);
+    sd_alloc_set(prev);
+    check(jr, SADISH_ERR_OOM);                                        # 146
+    check(sd_path_verb_count(jpath), jv0);                            # 147
+    jk = 0;
+    jbad = 0;
+    while (jk < 2) {
+        g_grant = jk;
+        prev = sd_alloc_set(&hook_grant);
+        jr = sd_path_quadto(jpath, SD_ONE, SD_ONE, 2 * SD_ONE, 2 * SD_ONE);
+        sd_alloc_set(prev);
+        if (jr != SADISH_ERR_OOM) { jbad = jbad + 1; }
+        if (sd_path_verb_count(jpath) != jv0) { jbad = jbad + 1; }
+        if (sd_path_point_count(jpath) != jp0) { jbad = jbad + 1; }
+        jk = jk + 1;
+    }
+    check(jbad, 0);                                                   # 148 — quadto: both points
+    jk = 0;
+    jbad = 0;
+    while (jk < 3) {
+        g_grant = jk;
+        prev = sd_alloc_set(&hook_grant);
+        jr = sd_path_cubicto(jpath, SD_ONE, SD_ONE, 2 * SD_ONE, 2 * SD_ONE, 3 * SD_ONE, 0);
+        sd_alloc_set(prev);
+        if (jr != SADISH_ERR_OOM) { jbad = jbad + 1; }
+        if (sd_path_verb_count(jpath) != jv0) { jbad = jbad + 1; }
+        if (sd_path_point_count(jpath) != jp0) { jbad = jbad + 1; }
+        jk = jk + 1;
+    }
+    check(jbad, 0);                                                   # 149 — cubicto: all three
+    # ⭐ AND IT IS STILL USABLE. The same path, off the hook, takes every verb and fills.
+    check(sd_path_quadto(jpath, SD_ONE, SD_ONE, 2 * SD_ONE, 2 * SD_ONE), SADISH_OK);   # 150
+    check(sd_path_cubicto(jpath, 3 * SD_ONE, 0, 4 * SD_ONE, 4 * SD_ONE, 5 * SD_ONE, SD_ONE),   # 151
+      SADISH_OK);
+    check(sd_path_close(jpath), SADISH_OK);                           # 152
+    check(sd_path_verb_count(jpath), jv0 + 3);                        # 153
+    check(sd_path_point_count(jpath), jp0 + 5);                       # 154
+    var jcv = sd_canvas_new(8, 8);
+    check(sd_canvas_fill_path(jcv, jpath, SD_FILL_NONZERO), SADISH_OK);   # 155
+    check(cov_sum(jcv) > 0, 1);                                       # 156
+    # J3. A refusal at the GROWTH: a path exactly at capacity needs 2 array blocks before its
+    # points, so grants 0 and 1 fail in sd_path_grow and 2 in sd_point_new.
+    var jfull = sd_path_new_cap(0, 0);
+    jk = 0;
+    while (jk < SD_PATH_CAP_MIN) {
+        sd_path_lineto(jfull, jk * SD_ONE, 0);
+        jk = jk + 1;
+    }
+    check(sd_path_point_count(jfull), SD_PATH_CAP_MIN);               # 157 — exactly full
+    jk = 0;
+    jbad = 0;
+    while (jk < 3) {
+        g_grant = jk;
+        prev = sd_alloc_set(&hook_grant);
+        jr = sd_path_lineto(jfull, 99 * SD_ONE, 0);
+        sd_alloc_set(prev);
+        if (jr != SADISH_ERR_OOM) { jbad = jbad + 1; }
+        if (sd_path_point_count(jfull) != SD_PATH_CAP_MIN) { jbad = jbad + 1; }
+        jk = jk + 1;
+    }
+    check(jbad, 0);                                                   # 158
+    check(sd_path_verb_count(jfull), SD_PATH_CAP_MIN);                # 159 — no stray verb
+    check(sd_path_lineto(jfull, 99 * SD_ONE, 0), SADISH_OK);          # 160 — and it still grows
+    check(load64(jfull + SD_PATH_CAP_OFFSET), SD_PATH_CAP_MIN * 2);   # 161
+    # J4. sd_point_new and every allocating sd_matrix_*.
+    g_grant = 0;
+    prev = sd_alloc_set(&hook_grant);
+    check(sd_point_new(SD_ONE, SD_ONE), 0);                           # 162
+    check(sd_matrix_identity(), 0);                                   # 163
+    check(sd_matrix_translate(SD_ONE, 0), 0);                         # 164
+    check(sd_matrix_scale(SD_ONE, SD_ONE), 0);                        # 165
+    check(sd_matrix_rotate(102944), 0);                               # 166
+    check(sd_matrix_skew(0, 0), 0);                                   # 167
+    sd_alloc_set(prev);
+    var jm = sd_matrix_scale(2 * SD_ONE, 2 * SD_ONE);
+    var jpt = sd_point_new(SD_ONE, SD_ONE);
+    g_grant = 0;
+    prev = sd_alloc_set(&hook_grant);
+    check(sd_matrix_mul(jm, jm), 0);                                  # 168
+    check(sd_matrix_invert(jm), 0);                                   # 169
+    check(sd_matrix_apply(jm, jpt), 0);                               # 170
+    sd_alloc_set(prev);
+    # a REFUSED matrix is 0, and nothing dereferences it
+    check(sd_matrix_apply(0, jpt), 0);                                # 171
+    check(sd_matrix_apply(jm, 0), 0);                                 # 172
+    check(sd_matrix_mul(0, jm), 0);                                   # 173
+    check(sd_matrix_mul(jm, 0), 0);                                   # 174
+    check(sd_matrix_invert(0), 0);                                    # 175
+    # and the working ones still work
+    var jap = sd_matrix_apply(jm, jpt);
+    check(sd_point_x(jap), 2 * SD_ONE);                               # 176
+    check(sd_point_y(jap), 2 * SD_ONE);                               # 177
+    # J5. sd_path_flatten across every K: out, ctx, the mid-points, the doubling, the polyline.
+    # No K may fault, a 0 result must say it was truncated, and a non-0 result must be whole.
+    var jfp = hostile_quads(2);
+    jk = 0;
+    jbad = 0;
+    while (jk < 40) {
+        g_grant = jk;
+        prev = sd_alloc_set(&hook_grant);
+        var jpl = sd_path_flatten(jfp, TOL);
+        sd_alloc_set(prev);
+        if (jpl == 0) {
+            if (sd_flatten_truncated() != 1) { jbad = jbad + 1; }
+        } else {
+            if (sd_polyline_count(jpl) <= 0) { jbad = jbad + 1; }
+        }
+        jk = jk + 1;
+    }
+    check(jbad, 0);                                                   # 178 — 40 failure points
+    # K = 2 grants out + ctx and refuses the first mid-point: a truncated, EMPTY-of-curve result
+    g_grant = 2;
+    prev = sd_alloc_set(&hook_grant);
+    var jtr = sd_path_flatten(jfp, TOL);
+    sd_alloc_set(prev);
+    check(jtr, 0);                                                    # 179 — the polyline itself
+    #                                                                   could not be allocated
+    check(sd_flatten_truncated(), 1);                                 # 180
+    # and a flatten after all that is whole again
+    check(sd_flatten_truncated(), 1);                                 # 181 — still the last verdict
+    var jok = sd_path_flatten(jfp, TOL);
+    check(sd_polyline_count(jok), 513);                               # 182 — 2 quads, whole
+    check(sd_flatten_truncated(), 0);                                 # 183
+    check(same_as_ref(jfp, TOL), 0);                                  # 184 — geometry intact
+
+    # ── K) THE CUBIC HALF OF THE BOUND ────────────────────────
+    # Groups F and G drive the quad recursion; the cubic has its own copy of both guards, and a
+    # guard that exists only in one of them is a guard a cubic outline walks straight past.
+    # K1. A cubic node that cannot emit must not subdivide either. The arena holds the output
+    # array, the ctx, room for mid-points and the polyline — but never the 131,072 B doubling.
+    var kpath = hostile_cubics(64);
+    var ka = arena_new(65536 + 24 + 200000 + 16);
+    check(ka != 0, 1);                                                # 185
+    var kkeep = g_arena;
+    g_arena = ka;
+    g_calls = 0;
+    g_ok = 0;
+    prev = sd_alloc_set(&hook_arena);
+    var kpl = sd_path_flatten(kpath, TOL);
+    sd_alloc_set(prev);
+    g_arena = kkeep;
+    check(kpl != 0, 1);                                               # 186
+    check(sd_polyline_count(kpl), 8192);                              # 187 — the points that fit
+    check(sd_flatten_truncated(), 1);                                 # 188
+    check(g_calls - g_ok, 1);                                         # 189 — ⛔ exactly ONE refusal:
+    #                                                                   the cubics after the full
+    #                                                                   output asked for nothing
+    check(g_calls, 8161);                                             # 190 — MEASURED
+    var kref = ref_flatten(kpath, TOL, 8192);
+    check(poly_vs_ref(kpl, kref), 0);                                 # 191 — the same prefix
+    # K2. And the cubic degrades to its chord on the budget, exactly as the quad does.
+    check(sd_flatten_budget_set(64), SD_FLATTEN_BUDGET_DEFAULT);      # 192
+    var kdeg = sd_path_flatten(hostile_cubics(32), TOL);
+    check(sd_flatten_degraded(), 1);                                  # 193
+    check(sd_polyline_count(kdeg), 98);                               # 194 — MEASURED
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 64);      # 195
+    check(sd_flatten_degraded(), 1);                                  # 196 — until the next op
+    check(same_as_ref(hostile_cubics(32), TOL), 0);                   # 197 — unbudgeted: 0.7.0's
+    check(sd_flatten_degraded(), 0);                                  # 198 — and it says so
+
+    # ── L) EVERY ALLOCATION SITE, ISOLATED ────────────────────
+    # ⛔ Group J's hook grants a PREFIX, so a site whose own 0-check is missing can still be caught
+    # by the NEXT site's check and the failure looks handled. This hook refuses exactly ONE
+    # allocation and grants every other, which is the only way to hold each site to its own guard.
+    # L1. sd_path_new: the record, the verb array, the point array — each alone.
+    var lk = 1;
+    var lbad = 0;
+    while (lk <= 3) {
+        g_calls = 0;
+        g_skip = lk;
+        prev = sd_alloc_set(&hook_skip);
+        var lp = sd_path_new();
+        sd_alloc_set(prev);
+        if (lp != 0) { lbad = lbad + 1; }
+        lk = lk + 1;
+    }
+    g_skip = 0;
+    check(lbad, 0);                                                   # 199 — 3 sites, 3 refusals
+    lk = 1;
+    lbad = 0;
+    while (lk <= 3) {
+        g_calls = 0;
+        g_skip = lk;
+        prev = sd_alloc_set(&hook_skip);
+        var lc = sd_path_new_cap(61, 90);
+        sd_alloc_set(prev);
+        if (lc != 0) { lbad = lbad + 1; }
+        lk = lk + 1;
+    }
+    g_skip = 0;
+    check(lbad, 0);                                                   # 200
+    # L2. sd_path_flatten's own three: out (#1), ctx (#2) and the polyline (the last).
+    var lfp = hostile_quads(2);
+    g_calls = 0;
+    g_skip = 1;
+    prev = sd_alloc_set(&hook_skip);
+    check(sd_path_flatten(lfp, TOL), 0);                              # 201 — out refused
+    sd_alloc_set(prev);
+    g_skip = 0;
+    check(sd_flatten_truncated(), 1);                                 # 202
+    g_calls = 0;
+    g_skip = 2;
+    prev = sd_alloc_set(&hook_skip);
+    check(sd_path_flatten(lfp, TOL), 0);                              # 203 — ctx refused
+    sd_alloc_set(prev);
+    g_skip = 0;
+    check(sd_flatten_truncated(), 1);                                 # 204
+    # L3. ⭐ A REFUSED MID-POINT STOPS THE WHOLE FLATTEN, not just that leaf. Refuse allocation #3
+    # — the first mid-point of the first quad — and grant everything after it: the result must be
+    # the moveto alone, and the flatten must have asked for exactly 4 blocks (out, ctx, the refused
+    # mid-point, the polyline). Without the stop it would go on subdividing both quads on an
+    # allocator that is now saying yes again, and emit a partial curve.
+    g_calls = 0;
+    g_skip = 3;
+    prev = sd_alloc_set(&hook_skip);
+    var lpl = sd_path_flatten(lfp, TOL);
+    sd_alloc_set(prev);
+    g_skip = 0;
+    check(lpl != 0, 1);                                               # 205
+    check(sd_polyline_count(lpl), 1);                                 # 206 — the moveto, and no more
+    check(sd_flatten_truncated(), 1);                                 # 207
+    check(g_calls, 4);                                                # 208 — out, ctx, the refusal,
+    #                                                                   the polyline. Nothing else.
+    # L4. ⛔ THE RESERVE COVERS POINTS, NOT JUST VERBS. A quadto on a path with room for its verb
+    # but not for its two points must grow BEFORE it stores anything: 7 verbs and 7 points in a
+    # capacity of 8, then a quadto whose growth is refused. If the reserve only counted verbs, the
+    # verb and the first point would already be in the path when the growth behind the SECOND
+    # point failed — the half-written path this whole group exists to prevent.
+    var lq = sd_path_new_cap(0, 0);
+    lk = 0;
+    while (lk < SD_PATH_CAP_MIN - 1) {
+        sd_path_lineto(lq, lk * SD_ONE, 0);
+        lk = lk + 1;
+    }
+    check(sd_path_verb_count(lq), 7);                                 # 209
+    check(sd_path_point_count(lq), 7);                                # 210
+    g_grant = 2;
+    prev = sd_alloc_set(&hook_grant);
+    var lr = sd_path_quadto(lq, SD_ONE, SD_ONE, 2 * SD_ONE, 2 * SD_ONE);
+    sd_alloc_set(prev);
+    check(lr, SADISH_ERR_OOM);                                        # 211
+    check(sd_path_verb_count(lq), 7);                                 # 212 — no verb was pushed
+    check(sd_path_point_count(lq), 7);                                # 213 — and no point
+    check(sd_path_quadto(lq, SD_ONE, SD_ONE, 2 * SD_ONE, 2 * SD_ONE), SADISH_OK);   # 214 — usable
+    check(sd_path_verb_count(lq), 8);                                 # 215
+    check(sd_path_point_count(lq), 9);                                # 216
+    check(load64(lq + SD_PATH_CAP_OFFSET), 16);                       # 217 — it grew for the points
+    # L5. A capacity of 0 cannot double its way to anything, so a hand-built record at 0 is REFUSED
+    # rather than spun on. (⚠ No public call can produce one — sd_path_new_cap floors at
+    # SD_PATH_CAP_MIN — so this pins the guard against a record a consumer built itself.)
+    var lz = sd_path_new_cap(16, 16);
+    store64(lz + SD_PATH_CAP_OFFSET, 0);
+    check(sd_path_lineto(lz, SD_ONE, SD_ONE), SADISH_ERR_OOM);        # 218
+    check(sd_path_verb_count(lz), 0);                                 # 219
+    check(sd_path_point_count(lz), 0);                                # 220
+    store64(lz + SD_PATH_CAP_OFFSET, 16);
+    check(sd_path_lineto(lz, SD_ONE, SD_ONE), SADISH_OK);             # 221 — and it recovers
+
+    # ── M) THE REPAIR PASS ─────────────────────
+    # ⛔ EVERY CHECK BELOW EXISTS BECAUSE A REVIEW OF 0.7.1 FOUND THE HOLE IT PINS, and every one of
+    # them failed before the repair it guards. They sit in their own group rather than inside A-L so
+    # the numbering of the checks that shipped first stays put; each says which group it strengthens.
+    #
+    # M1. THE CAPACITY CEILING (strengthens group I). sd_path_new_cap clamped only the LOW end, and
+    # `cap * 8` in _sd_path_alloc WRAPS: MEASURED before the ceiling, sd_path_new_cap(2^61 + 1, 0)
+    # returned a LIVE path whose verb and point blocks were 8 B apart — both sd_alloc calls
+    # succeeded, so both 0-checks passed — carrying a stored capacity of 2,305,843,009,213,693,953.
+    # Four movetos then all returned SADISH_OK, verbs[1] landed on top of points[0], and a block
+    # allocated after the path had its contents destroyed. Only sd_path_new_cap could reach it:
+    # sd_path_new passes a constant and the doubling cannot climb to 2^61.
+    check(SD_PATH_CAP_MAX, 268435456);                                # 222 — 2^28 entries = 2 GiB
+    check(sd_path_new_cap(268435457, 0), 0);                          # 223 — one past the ceiling
+    check(sd_path_new_cap(0, 268435457), 0);                          # 224 — either argument
+    check(sd_path_new_cap(2305843009213693953, 0), 0);                # 225 — ⛔ 2^61 + 1: THE WRAP
+    check(sd_path_new_cap(0, 2305843009213693953), 0);                # 226
+    # every wrap window a positive i64 can reach: j * 2^61 + 1 for j = 1, 2, 3 (j >= 4 is negative,
+    # and a negative estimate is the documented floor case, not a wrap).
+    var mj = 1;
+    var mbad = 0;
+    while (mj <= 3) {
+        if (sd_path_new_cap(mj * 2305843009213693952 + 1, 0) != 0) { mbad = mbad + 1; }
+        if (sd_path_new_cap(mj * 2305843009213693952 + 8, 0) != 0) { mbad = mbad + 1; }
+        mj = mj + 1;
+    }
+    check(mbad, 0);                                                   # 227 — 6 wrap windows refused
+    # ⭐ AND IT IS REFUSED BEFORE THE FIRST sd_alloc, not by an allocator that happened to say no —
+    # the wrap's whole danger was that the allocator said YES to the 8 B the multiply asked for.
+    g_calls = 0;
+    prev = sd_alloc_set(&hook_count);
+    check(sd_path_new_cap(2305843009213693953, 0), 0);                # 228
+    sd_alloc_set(prev);
+    check(g_calls, 0);                                                # 229 — not one allocation
+    # The ceiling holds on the DOUBLING too, for a capacity a consumer wrote into a record itself.
+    # ⚠ THE ASSERTION IS THE ALLOCATION COUNT, not the return code: an unguarded sd_path_grow asks
+    # the allocator for newcap * 8 = 4 GiB and gets SADISH_ERR_OOM back from lib/alloc.cyr's
+    # ALLOC_MAX anyway, so the two are indistinguishable by their answer. They differ in whether
+    # sadish ASKED — and asking is what wraps once newcap * 8 stops fitting i64.
+    var mg = sd_path_new_cap(16, 16);
+    store64(mg + SD_PATH_CAP_OFFSET, SD_PATH_CAP_MAX);
+    store64(mg + SD_PATH_NVERBS_OFFSET, SD_PATH_CAP_MAX);             # "full", so a push must grow
+    g_calls = 0;
+    prev = sd_alloc_set(&hook_count);
+    check(sd_path_lineto(mg, SD_ONE, SD_ONE), SADISH_ERR_OOM);        # 230 — refused, not wrapped
+    sd_alloc_set(prev);
+    check(g_calls, 0);                                                # 231 — and never asked
+    store64(mg + SD_PATH_CAP_OFFSET, 16);
+    store64(mg + SD_PATH_NVERBS_OFFSET, 0);
+    check(sd_path_lineto(mg, SD_ONE, SD_ONE), SADISH_OK);             # 232 — and it recovers
+
+    # M2. A NEW OUTPUT IS NOT BORN FULL (strengthens groups F and H). _sd_flat_full was a plain
+    # FLAG cleared only at nesting depth 0 — and sd_path_flatten opens a NESTED operation whenever a
+    # consumer has one open, which is the usage sd_flatten_op_begin's header prescribes. So a
+    # starved flatten's flag survived into the next, healthy one and truncated it to its
+    # straight-verb anchors, while sd_path_flatten's `_sd_flat_trunc = 0` wiped the witness:
+    # MEASURED before the repair, flatten B below emitted 1 point of 513 with truncated() AND
+    # degraded() both reading 0. Fullness is a property of the OUTPUT ARRAY; it is now recorded as
+    # the ctx that filled.
+    var mcirc = circle_cubic(32 * SD_ONE, 32 * SD_ONE, 20 * SD_ONE);
+    var mcv_ref = sd_canvas_new(64, 64);
+    sd_canvas_fill_path(mcv_ref, mcirc, SD_FILL_NONZERO);
+    var mpa = hostile_quads(2);
+    var mpb = hostile_quads(2);
+    check(sd_flatten_op_begin(), 1);                                  # 233 — the consumer's scope
+    g_calls = 0;
+    g_skip = 3;
+    prev = sd_alloc_set(&hook_skip);
+    var mapl = sd_path_flatten(mpa, TOL);
+    sd_alloc_set(prev);
+    g_skip = 0;
+    check(sd_polyline_count(mapl), 1);                                # 234 — A starved to its moveto
+    check(sd_flatten_truncated(), 1);                                 # 235
+    # ⛔ THE FILL COMES FIRST, AND THAT ORDER IS THE TEST. raster.cyr flattens into its OWN
+    # per-curve buffer, so a starved sd_path_flatten says nothing about it — but a fullness FLAG
+    # (rather than the ctx that filled) stops every curve of this fill dead and paints nothing,
+    # with the allocator back to saying yes. Put a healthy sd_path_flatten in between and the flag
+    # is cleared before the fill ever runs: the bug hides.
+    var mcv = sd_canvas_new(64, 64);
+    check(sd_canvas_fill_path(mcv, mcirc, SD_FILL_NONZERO), SADISH_OK);   # 236
+    check(cov_sum(mcv), cov_sum(mcv_ref));                            # 237 — ⛔ THE SAME INK
+    check(cov_sum(mcv) > 0, 1);                                       # 238
+    var mbpl = sd_path_flatten(mpb, TOL);
+    check(sd_polyline_count(mbpl), 513);                              # 239 — ⛔ AND B IS WHOLE
+    check(sd_flatten_truncated(), 0);                                 # 240 — and says so
+    check(poly_vs_ref(mbpl, ref_flatten(mpb, TOL, 300000)), 0);       # 241 — 0.7.0's geometry
+    check(sd_flatten_op_end(), 0);                                    # 242
+    # ⭐ AND THE CTX POINTER ALONE IS NOT ENOUGH: an arena the consumer RESETS hands the next
+    # flatten the same addresses, so a fresh ctx can BE the starved one — MEASURED, both flattens
+    # below get their ctx at arena_base + 65,536. sd_path_flatten therefore clears the verdict
+    # outright when it establishes its own ctx. Here the arena holds the output array, the ctx, 40
+    # mid-points and the polyline — enough for the gentle quad of `mnarrow`, nowhere near the 510
+    # the two hostile quads want.
+    # ⚠ THIS ONLY BITES INSIDE AN OPEN OPERATION, which is why it is wrapped: at nesting depth 0
+    # sd_flatten_op_begin clears the verdict for its own reasons and the reuse never shows. An
+    # arena that is reset per frame under a consumer that scopes its draws is exactly that shape.
+    var mnarrow = sd_path_new();
+    sd_path_moveto(mnarrow, 0, 0);
+    sd_path_quadto(mnarrow, SD_ONE, SD_ONE, 2 * SD_ONE, 0);
+    var msmall = sd_path_flatten(mnarrow, TOL);
+    var mnpts = sd_polyline_count(msmall);
+    check(mnpts > 1, 1);                                              # 243 — it is a real curve
+    var marena = arena_new(65536 + 24 + 40 * 16 + 16);
+    check(marena != 0, 1);                                            # 244
+    var mkeep = g_arena;
+    g_arena = marena;
+    sd_flatten_op_begin();
+    prev = sd_alloc_set(&hook_arena);
+    var mstarve = sd_path_flatten(mpa, TOL);                          # runs the arena dry
+    arena_reset(marena);                                              # ...and the next ctx reuses it
+    var mreuse = sd_path_flatten(mnarrow, TOL);
+    sd_alloc_set(prev);
+    sd_flatten_op_end();
+    g_arena = mkeep;
+    check(sd_flatten_truncated(), 0);                                 # 245 — the second one was whole
+    check(sd_polyline_count(mreuse), mnpts);                          # 246 — ⛔ every point of it
+
+    # M3. AN EMPTY PATH RETURNS CLEAN VERDICTS (strengthens group J). sd_path_flatten returns 0 on
+    # an empty path AND on a refused allocation, and its header says truncated() tells the two
+    # apart — but the clear sat AFTER the empty-path return, so it did not: MEASURED before the
+    # repair, a starved flatten then a flatten of an empty path returned 0 twice with truncated()
+    # reading 1 both times, and degraded() was stale across the same return.
+    var mempty = sd_path_new();
+    g_grant = 2;
+    prev = sd_alloc_set(&hook_grant);
+    sd_path_flatten(mpa, TOL);
+    sd_alloc_set(prev);
+    check(sd_flatten_truncated(), 1);                                 # 247 — the starved verdict
+    check(sd_path_flatten(mempty, TOL), 0);                           # 248 — empty: also 0...
+    check(sd_flatten_truncated(), 0);                                 # 249 — ...and DISTINGUISHABLE
+    sd_flatten_budget_set(64);
+    sd_path_flatten(hostile_quads(32), TOL);
+    sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT);
+    check(sd_flatten_degraded(), 1);                                  # 250
+    check(sd_path_flatten(mempty, TOL), 0);                           # 251
+    check(sd_flatten_degraded(), 0);                                  # 252 — a fresh operation
+    # ⚠ but INSIDE a consumer's operation an empty flatten must NOT wipe the verdict that operation
+    # has already earned — degraded belongs to the OPERATION, and the empty flatten is nested in it.
+    sd_flatten_budget_set(64);
+    sd_flatten_op_begin();
+    sd_path_flatten(hostile_quads(32), TOL);
+    check(sd_flatten_degraded(), 1);                                  # 253
+    sd_path_flatten(mempty, TOL);
+    check(sd_flatten_degraded(), 1);                                  # 254 — still the op's verdict
+    sd_flatten_op_end();
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 64);      # 255
+
+    # M4. "DEGRADED" MEANS A CURVE WAS CUT, NOT THAT THE BUDGET RAN OUT (strengthens group G).
+    # Group G pins the flag only where the budget's last point is the path's last emit. The other
+    # half of the rule is the one a maintainer can break: move the budget test ABOVE the flatness
+    # test in _sd_flat_quad_r — two compares before six loads, a plausible edit — and every byte of
+    # emitted geometry is IDENTICAL (both branches emit the same endpoint), so all 26 suites and
+    # refagree pass. What changes is that an ALREADY-FLAT curve reached after the budget is spent
+    # starts reporting itself as cut. These two checks are the difference.
+    sd_flatten_budget_set(8);
+    var mflat = sd_path_flatten(lines_then_quad(50, 0), TOL);
+    check(sd_polyline_count(mflat), 52);                              # 256 — 1 + 50 + the endpoint
+    check(sd_flatten_degraded(), 0);                                  # 257 — ⛔ NOTHING WAS CUT:
+    #                                                                   the quad was flat already
+    var mbend = sd_path_flatten(lines_then_quad(50, 1000 * SD_ONE), TOL);
+    check(sd_polyline_count(mbend), 52);                              # 258 — the same point count...
+    check(sd_flatten_degraded(), 1);                                  # 259 — ...and THIS one was cut
+    # ⛔ AND THE CUBIC HAS ITS OWN COPY OF THE GUARD, so it needs its own copy of the check — the
+    # reorder above is two independent edits, and group K's cubic checks never look at a flat curve.
+    var mflatk = sd_path_flatten(lines_then_cubic(50, 0), TOL);
+    check(sd_polyline_count(mflatk), 52);                             # 260
+    check(sd_flatten_degraded(), 0);                                  # 261 — flat: nothing was cut
+    var mbendk = sd_path_flatten(lines_then_cubic(50, 1000 * SD_ONE), TOL);
+    check(sd_polyline_count(mbendk), 52);                             # 262
+    check(sd_flatten_degraded(), 1);                                  # 263
+
+    # M5. THE BUDGET COMPARISON ITSELF (strengthens group G). `_sd_flat_used >= _sd_flat_budget`
+    # off by one (`>`) is one curve's worth of extra subdivision, and group G's three budgets
+    # (8,193 / 8,192 / 8,000) all happen to give the same point count either way. These two do not:
+    # the `>` variant at budget b behaves exactly as `>=` at b + 1, and MEASURED on hostile_quads(4)
+    # the counts at 1/2 are 5/13 and at 9/10 are 17/20.
+    var mq4 = hostile_quads(4);
+    var mk4 = hostile_cubics(4);
+    sd_flatten_budget_set(1);
+    check(sd_polyline_count(sd_path_flatten(mq4, TOL)), 5);           # 264 — off-by-one: 13
+    check(sd_polyline_count(sd_path_flatten(mk4, TOL)), 5);           # 265 — the cubic's own guard
+    sd_flatten_budget_set(9);
+    check(sd_polyline_count(sd_path_flatten(mq4, TOL)), 17);          # 266 — off-by-one: 20
+    check(sd_polyline_count(sd_path_flatten(mk4, TOL)), 17);          # 267
+    check(sd_flatten_degraded(), 1);                                  # 268
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 9);       # 269
+
+    # M6. A STARVED FILL IS FLAGGED, NOT FAULTED (strengthens group J). Group J drives 40 refusal
+    # points through sd_path_flatten and none through a FILL — but raster.cyr calls
+    # sd_flatten_quad/_cubic directly, so a refused mid-point never reaches sd_canvas_fill_path's
+    # return value. (0.7.0 did not get that far — it dereferenced the refused SdPoint: SIGSEGV.)
+    # ⭐ AND THE FILL NOW SAYS SO: sd_fill_impl scopes the flatten's truncation flag to the call and
+    # returns SADISH_ERR_OOM when this fill lost points, so a wrong picture is never announced as
+    # SADISH_OK. That was this suite's own finding — it shipped in the same release, and #271 is the
+    # assertion that changed with it (SADISH_OK -> SADISH_ERR_OOM).
+    # ⚠ sd_flatten_truncated() is still the only witness for a STROKE: the styled path has its own
+    # flush and the round stroker discards sd_canvas_fill_union's result.
+    var mfull = sd_canvas_new(64, 64);
+    sd_canvas_fill_path(mfull, mcirc, SD_FILL_NONZERO);
+    check(cov_sum(mfull), 312280);                                    # 270 — the true picture
+    var mstarved = sd_canvas_new(64, 64);
+    g_grant = 5;
+    prev = sd_alloc_set(&hook_grant);
+    var mrc = sd_canvas_fill_path(mstarved, mcirc, SD_FILL_NONZERO);
+    sd_alloc_set(prev);
+    check(mrc, SADISH_ERR_OOM);                                       # 271 — reported, not silent
+    check(cov_sum(mstarved), 81029);                                  # 272 — 26 % of the ink
+    check(sd_flatten_truncated(), 1);                                 # 273 — ⛔ the only witness
+    # ⭐ and the canvas is still a canvas: the next fill is whole again
+    var mafter = sd_canvas_new(64, 64);
+    check(sd_canvas_fill_path(mafter, mcirc, SD_FILL_NONZERO), SADISH_OK);   # 274
+    check(cov_sum(mafter), 312280);                                   # 275
+    check(sd_canvas_fill_path(mstarved, mcirc, SD_FILL_NONZERO), SADISH_OK); # 276
+    check(cov_sum(mstarved) > 81029, 1);                              # 277 — it takes ink again
+
+    # M7. EVERY SdPoint OF A BUILDER, ISOLATED (strengthens group J2). J2 drives a PREFIX-granting
+    # hook across K, so the LAST point of a builder covers for the ones before it: drop the 0-check
+    # on sd_path_cubicto's second control point and J2 still passes, because the third allocation is
+    # refused too and its check returns the OOM. MUTATION-PROVED — that mutant survived the whole
+    # suite before this group. The isolating hook refuses exactly one allocation and grants the
+    # rest, which is the only shape that holds a site to its own guard. The path has room for every
+    # verb below, so its allocations are exactly its SdPoints: g_skip = k refuses the k-th of them.
+    var m7 = sd_path_new();
+    sd_path_moveto(m7, 0, 0);
+    var m7v = sd_path_verb_count(m7);
+    var m7p = sd_path_point_count(m7);
+    mj = 1;
+    mbad = 0;
+    while (mj <= 3) {
+        g_calls = 0;
+        g_skip = mj;
+        prev = sd_alloc_set(&hook_skip);
+        var m7r = sd_path_cubicto(m7, SD_ONE, 0, 2 * SD_ONE, 0, 3 * SD_ONE, 0);
+        sd_alloc_set(prev);
+        g_skip = 0;
+        if (m7r != SADISH_ERR_OOM) { mbad = mbad + 1; }
+        if (sd_path_verb_count(m7) != m7v) { mbad = mbad + 1; }
+        if (sd_path_point_count(m7) != m7p) { mbad = mbad + 1; }
+        mj = mj + 1;
+    }
+    check(mbad, 0);                                                   # 278 — cubicto: c1, c2, end
+    mj = 1;
+    mbad = 0;
+    while (mj <= 2) {
+        g_calls = 0;
+        g_skip = mj;
+        prev = sd_alloc_set(&hook_skip);
+        var m7q = sd_path_quadto(m7, SD_ONE, 0, 2 * SD_ONE, 0);
+        sd_alloc_set(prev);
+        g_skip = 0;
+        if (m7q != SADISH_ERR_OOM) { mbad = mbad + 1; }
+        if (sd_path_verb_count(m7) != m7v) { mbad = mbad + 1; }
+        if (sd_path_point_count(m7) != m7p) { mbad = mbad + 1; }
+        mj = mj + 1;
+    }
+    check(mbad, 0);                                                   # 279 — quadto: control, end
+    g_calls = 0;
+    g_skip = 1;
+    prev = sd_alloc_set(&hook_skip);
+    check(sd_path_moveto(m7, SD_ONE, SD_ONE), SADISH_ERR_OOM);        # 280
+    sd_alloc_set(prev);
+    g_skip = 0;
+    g_calls = 0;
+    g_skip = 1;
+    prev = sd_alloc_set(&hook_skip);
+    check(sd_path_lineto(m7, SD_ONE, SD_ONE), SADISH_ERR_OOM);        # 281
+    sd_alloc_set(prev);
+    g_skip = 0;
+    check(sd_path_verb_count(m7), m7v);                               # 282 — seven refusals, and
+    check(sd_path_point_count(m7), m7p);                              # 283 — the path never moved
+    check(sd_path_cubicto(m7, SD_ONE, 0, 2 * SD_ONE, 0, 3 * SD_ONE, 0), SADISH_OK);   # 284
+    check(sd_path_point_count(m7), m7p + 3);                          # 285 — and it still builds
+
+    # ── N) THE SECOND REPAIR PASS ─────────────
+    # ⛔ Group M closed the fullness leak for flatten -> flatten and PROVED it absent for
+    # flatten -> fill (checks 236-238). A second review measured the case neither covered:
+    # FILL -> FILL. Same class, same operation, still open.
+    #
+    # N1. ONE STARVED FILL MUST NOT BLANK THE FILLS AFTER IT. raster.cyr owns ONE process-lifetime
+    # per-curve flatten buffer and REWINDS it (points, count, cap) before every curve verb — so the
+    # buffer that a refused SdPoint marked full is an empty buffer a moment later, and recording the
+    # ctx pointer alone leaves the verdict standing against it. Inside a consumer's operation
+    # nothing clears it (sd_flatten_quad's own begin is nested there, and only a depth-0 begin
+    # resets), so EVERY later fill in that operation stopped at its first leaf and painted nothing.
+    # MEASURED before _sd_flat_enter, this exact sweep with the allocator fully restored for the
+    # second fill: next = 0 at every grant from 0 to 4, SADISH_OK each time, a blank canvas each
+    # time. The starved fill's own ink is unchanged by the repair (checks 288/289 are M6's numbers),
+    # which is the point: only the fills AFTER it move.
+    var nfref = sd_canvas_new(64, 64);
+    sd_canvas_fill_path(nfref, mcirc, SD_FILL_NONZERO);
+    var nfink = cov_sum(nfref);
+    check(nfink, 312280);                                             # 286 — M6's true ink
+    var nfbad = 0;
+    var nfs3 = 0;
+    var nfs5 = 0;
+    var nfk = 0;
+    while (nfk < 7) {
+        var nfcv1 = sd_canvas_new(64, 64);
+        var nfcv2 = sd_canvas_new(64, 64);
+        var nfcv3 = sd_canvas_new(64, 64);
+        sd_flatten_op_begin();
+        g_grant = nfk;
+        prev = sd_alloc_set(&hook_grant);
+        sd_canvas_fill_path(nfcv1, mcirc, SD_FILL_NONZERO);
+        sd_alloc_set(prev);
+        # ⛔ TWO healthy fills, not one: a verdict that survived the first would have been cleared
+        # by it, and the second would hide the bug the first exposed.
+        sd_canvas_fill_path(nfcv2, mcirc, SD_FILL_NONZERO);
+        sd_canvas_fill_path(nfcv3, mcirc, SD_FILL_NONZERO);
+        sd_flatten_op_end();
+        if (cov_sum(nfcv2) != nfink) { nfbad = nfbad + 1; }
+        if (cov_sum(nfcv3) != nfink) { nfbad = nfbad + 1; }
+        if (nfk == 3) { nfs3 = cov_sum(nfcv1); }
+        if (nfk == 5) { nfs5 = cov_sum(nfcv1); }
+        nfk = nfk + 1;
+    }
+    check(nfbad, 0);                                                  # 287 — ⛔ 14 whole fills
+    check(nfs3, 27061);                                               # 288 — and the starved fill
+    check(nfs5, 81029);                                               # 289 —   itself did not move
+
+    # N2. THE VERDICT THAT MUST SURVIVE, AND THE ONE THAT MUST NOT. Fullness is re-derived from the
+    # ctx's own (count, cap), so a foreign output that REALLY has no room keeps its verdict across
+    # calls — a consumer accumulating several curves into one fixed ctx still gets the filing's "one
+    # comparison per remaining curve" — while a REWOUND ctx is a new output and starts clean. The
+    # allocation count is the witness: a stopped recursion asks for nothing, a live one asks for its
+    # leaf points. (Wrapped in an operation because at nesting depth 0 sd_flatten_op_begin clears
+    # the verdict for its own reasons and neither half would show.)
+    var nfctx = alloc(24);
+    var nfbuf = alloc(64);
+    var nfp0 = sd_point_new(0, 0);
+    var nfp1 = sd_point_new(1000000000, 1000000000);
+    var nfp2 = sd_point_new(0, 0);
+    store64(nfctx + 0, nfbuf);
+    store64(nfctx + 8, 0);
+    store64(nfctx + 16, 2);                                           # room for exactly 2 points
+    sd_flatten_op_begin();
+    prev = sd_alloc_set(&hook_count);
+    g_calls = 0;
+    sd_flatten_quad(nfctx, nfp0, nfp1, nfp2, TOL, SD_FLATTEN_MAX_DEPTH);
+    var nfc1 = g_calls;
+    g_calls = 0;
+    sd_flatten_quad(nfctx, nfp0, nfp1, nfp2, TOL, SD_FLATTEN_MAX_DEPTH);
+    var nfc2 = g_calls;
+    var nfn2 = load64(nfctx + 8);
+    store64(nfctx + 8, 0);                                            # the rewind raster.cyr does
+    g_calls = 0;
+    sd_flatten_quad(nfctx, nfp0, nfp1, nfp2, TOL, SD_FLATTEN_MAX_DEPTH);
+    var nfc3 = g_calls;
+    var nfn3 = load64(nfctx + 8);
+    sd_alloc_set(prev);
+    sd_flatten_op_end();
+    check(nfc1, 3);                                                   # 290 — 2 points in, 1 dropped
+    check(nfc2, 0);                                                   # 291 — full: nothing asked for
+    check(nfn2, 2);                                                   # 292 — and nothing emitted
+    check(nfc3, 3);                                                   # 293 — ⛔ REWOUND: alive again
+    check(nfn3, 2);                                                   # 294 — same 2 points as N2's
+
+    # N3. THE CEILING IS SADISH'S, NOT THE ALLOCATOR'S (strengthens M1). M1's checks pass with the
+    # constant raised to 2^29 — lib/alloc.cyr's ALLOC_MAX refuses 2 GiB + 8 anyway, so the return
+    # code cannot tell the two refusals apart. MUTATION-PROVED: `cap > SD_PATH_CAP_MAX * 2` survived
+    # every suite. The one observable that separates them is whether sadish ASKS: under a hook that
+    # counts and refuses, a capacity over the ceiling makes ZERO calls and a capacity AT it makes
+    # one (the 48 B record, before the arrays it can never get).
+    g_calls = 0;
+    g_grant = 0;
+    prev = sd_alloc_set(&hook_grant);
+    check(sd_path_new_cap(SD_PATH_CAP_MAX + 1, 0), 0);                # 295
+    check(g_calls, 0);                                                # 296 — ⛔ refused, not asked
+    g_calls = 0;
+    check(sd_path_new_cap(0, SD_PATH_CAP_MAX + 1), 0);                # 297 — either argument
+    check(g_calls, 0);                                                # 298
+    g_calls = 0;
+    check(sd_path_new_cap(SD_PATH_CAP_MAX, 0), 0);                    # 299 — AT the ceiling
+    check(g_calls, 1);                                                # 300 — sadish asks; alloc says no
+    sd_alloc_set(prev);
+
+    # N4. ONE CTX'S ENTRY MUST NOT WIPE ANOTHER CTX'S VERDICT — the `_sd_flat_full != ctx` guard in
+    # _sd_flat_enter, which is the whole theme of the repair stated for the clear as well as for the
+    # test. MUTATION-FOUND: dropping that line survived checks 1-300, because no in-tree caller
+    # alternates two accumulating outputs (raster.cyr and stroke.cyr each rewind one buffer per
+    # curve, so neither is ever full by count). A consumer that flattens several curves into one
+    # fixed output of its own IS that shape, and the guard is what keeps its stop from being
+    # cancelled by an unrelated flatten between two of its curves.
+    # nfctx is still full from N2 (2 of 2). The first flatten below re-discovers that — one leaf
+    # point allocated and dropped — and then a flatten into a DIFFERENT, roomy output runs before
+    # the second flatten into it; the allocation count says whether its verdict survived.
+    var nfctx2 = alloc(24);
+    var nfbuf2 = alloc(SD_FLATTEN_CAP * 8);
+    store64(nfctx2 + 0, nfbuf2);
+    store64(nfctx2 + 8, 0);
+    store64(nfctx2 + 16, SD_FLATTEN_CAP);
+    sd_flatten_op_begin();
+    prev = sd_alloc_set(&hook_count);
+    g_calls = 0;
+    sd_flatten_quad(nfctx, nfp0, nfp1, nfp2, TOL, SD_FLATTEN_MAX_DEPTH);
+    var nfc4 = g_calls;                                               # re-discovers the fullness
+    g_calls = 0;
+    sd_flatten_quad(nfctx2, nfp0, nfp1, nfp2, TOL, SD_FLATTEN_MAX_DEPTH);
+    var nfc5 = g_calls;                                               # the roomy one runs whole
+    g_calls = 0;
+    sd_flatten_quad(nfctx, nfp0, nfp1, nfp2, TOL, SD_FLATTEN_MAX_DEPTH);
+    var nfc6 = g_calls;
+    sd_alloc_set(prev);
+    sd_flatten_op_end();
+    check(nfc4, 1);                                                   # 301 — one leaf point, dropped
+    check(nfc5, 255);                                                 # 302 — and the other is not
+    check(nfc6, 0);                                                   # 303 — ⛔ STILL full afterwards
+    check(load64(nfctx + 8), 2);                                      # 304 — nothing new got in
+
+    if (g_fails == 0) {
+        var ok = "flatten_bound_test: PASS (mid-points, the bound, sd_path_new_cap, checked allocs)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "flatten_bound_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -251,8 +251,11 @@ fn main(): i64 {
     sd_canvas_fill_path(cv, blob, SD_FILL_NONZERO);
     var quad_cost2 = alloc_used() - gc;
     # The quads' flatten mid-points are proportional to the work and stay on the seam:
-    # MEASURED 480 B for this blob (30 mid-points x 16 B), identical on the second call, and far
-    # below the 328,544 B the same fill cost on 0.5.4 (16x16).
+    # MEASURED ON 0.7.1, 160 B for this blob (10 EMITTED mid-points x 16 B), identical on the
+    # second call, and far below the 328,544 B the same fill cost on 0.5.4 (16x16).
+    # ⚠ This read 480 B (30 mid-points) through 0.7.0, when the recursion also allocated the
+    # subdivision nodes' throwaway mid-points; 0.7.1 takes those onto a fixed per-depth scratch.
+    # The checks below bound the cost rather than pin it, so the figure is documentation.
     check(quad_cost > 0, 1);                                           # 43
     check(quad_cost, quad_cost2);                                      # 44
     check(quad_cost < 32768, 1);                                       # 45

@@ -18,6 +18,13 @@
 # ⚠ sd_present_blit writes to the LIVE framebuffer — never call it from a test.
 # The fb0 path is Linux-specific (raw open/ioctl/lseek/write); the AGNOS sink
 # (kernel blit#39) is a future backend beside this one.
+#
+# ⛔ REFUSED ALLOCATIONS, 0.7.1. Both sinks draw from the sd_alloc seam, which a consumer's hook may
+# REFUSE. Every block is now checked, and the rule both sinks keep is that a refusal costs the
+# caller NOTHING IT HAD: the PPM sink takes its two buffers before the O_TRUNC open, so a refusal
+# leaves the target file exactly as it was; the presenter closes the framebuffer fd on every one of
+# its four refusal paths and never returns a half-built record. Gated by programs/oom_test.cyr.
+# Closes half of docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md.
 
 # ---- PPM sink (platform-neutral) --------------------------------
 # Write the decimal ASCII of a non-negative n into buf at off; return new off.
@@ -56,21 +63,42 @@ fn sd_ppm_header(buf, w, h): i64 {
 }
 
 # @public — write the surface as a binary P6 PPM to `path`. BGRA -> RGB at
-# write time. Returns SADISH_OK, or SADISH_ERR_OTHER if the file won't open.
+# write time. Returns SADISH_OK; SADISH_ERR_BOUNDS for a null surface; SADISH_ERR_OOM if either
+# buffer is refused; SADISH_ERR_OTHER if the file won't open.
+# ⛔ BOTH BUFFERS ARE TAKEN BEFORE THE open(), and that ORDER IS THE CONTRACT, not a style choice.
+# The open is O_TRUNC: opening first and then discovering the w*h*3 block was refused would leave
+# `path` a 0-BYTE FILE where a readable PPM used to be, plus an fd to close over a write that can
+# never happen. Allocating first means a refusal touches neither the file nor any fd — the sink
+# either writes a whole PPM or leaves the previous one exactly as it was.
+# ⚠ Byte-identical and figure-identical on every write that worked: the same two blocks, the same
+# two sizes, in the same order (MEASURED, programs/stride_test.cyr #81: 384 B for a 13x9 surface —
+# 32 for the header + 352 for 351 aligned). Only a FAILING call moved.
+# ⚠ A 0-pixel surface asks sd_alloc for 0 bytes, which lib/alloc.cyr refuses by contract; that is
+# not out of memory, so the OOM test on `rgb` is guarded by n > 0 and such a call still writes a
+# header-only PPM, as it did through 0.7.0. MEASURED on both trees with a hand-built w=0 h=4 header:
+# SADISH_OK and an 11-byte file, "P6\n0 4\n255\n" (programs/oom_test.cyr group K — dropping the
+# n > 0 guard turns that call into SADISH_ERR_OOM and fails it).
+# ⇒ src/raster.cyr's sd_canvas_clip_push_rect deliberately does NOT carve the same case out, and
+# says why: a 0-pixel write COMPLETES and leaves a valid file, while a 0-area clip push could only
+# hand back a node whose mask pointer is 0.
 fn sd_surface_write_ppm(s, path): i64 {
     if (s == 0) { return SADISH_ERR_BOUNDS; }
     var w = sd_surface_width(s);
     var h = sd_surface_height(s);
     var px = sd_surface_pixels(s);
     var stride = sd_surface_stride(s);
+    var hdr = sd_alloc(32);
+    if (hdr == 0) { return SADISH_ERR_OOM; }
+    var n = w * h;
+    var rgb = sd_alloc(n * 3);
+    if (n > 0) {
+        if (rgb == 0) { return SADISH_ERR_OOM; }
+    }
     # open(path, O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, mode 0644 = 420)
     var fd = syscall(2, path, 577, 420);
     if (fd < 0) { return SADISH_ERR_OTHER; }
-    var hdr = sd_alloc(32);
     var hlen = sd_ppm_header(hdr, w, h);
     syscall(1, fd, hdr, hlen);
-    var n = w * h;
-    var rgb = sd_alloc(n * 3);
     # ⚠ Row by row at the surface's stride, not one run of w*h pixels: on a WRAPPED
     # surface the bytes between one row's end and the next row's start are not its pixels.
     var j = 0;
@@ -105,14 +133,56 @@ var SD_PRES_PITCH_OFFSET = 32;
 var SD_PRES_BLIT_OFFSET  = 64;
 var SD_PRESENTER_SIZE    = 72;
 
-# @public — open /dev/fb0 and probe geometry. Returns an SdPresenter, or 0 if
-# the framebuffer is unavailable (no device / no permission) — callers fall
-# back to sd_surface_write_ppm.
-fn sd_present_open(): i64 {
-    var fd = syscall(2, "/dev/fb0", 2, 0);   # open O_RDWR
-    if (fd < 0) { return 0; }
+# Build an SdPresenter around an ALREADY-OPEN framebuffer fd and its probed geometry.
+# Returns the presenter, or 0 if either block is refused — and on 0 THE fd IS CLOSED. A caller that
+# gets 0 therefore has nothing to clean up and nothing half-built: the 72 B record is abandoned
+# before its blit scratch pointer at +64 is ever stored, so no presenter with a null scratch can
+# reach sd_present_blit (which would memcpy through it).
+# ⛔ Split out of sd_present_open at 0.7.1 for ONE reason: sd_present_open's first act is
+# open("/dev/fb0"), and a test that ran it would be writing to the live display. Taking the fd as
+# an argument makes both refusals reachable from programs/oom_test.cyr with a regular file's fd.
+# _sd_present_probe is the only in-tree caller.
+fn _sd_presenter_build(fd, xres, yres, bpp, pitch): i64 {
+    var p = sd_alloc(SD_PRESENTER_SIZE);
+    if (p == 0) {
+        syscall(3, fd);
+        return 0;
+    }
+    store64(p + SD_PRES_FD_OFFSET, fd);
+    store64(p + SD_PRES_XRES_OFFSET, xres);
+    store64(p + SD_PRES_YRES_OFFSET, yres);
+    store64(p + SD_PRES_BPP_OFFSET, bpp);
+    store64(p + SD_PRES_PITCH_OFFSET, pitch);
+    var blit = sd_alloc(pitch * yres);
+    if (blit == 0) {
+        syscall(3, fd);
+        return 0;
+    }
+    memset(blit, 0, pitch * yres);
+    store64(p + SD_PRES_BLIT_OFFSET, blit);
+    return p;
+}
+
+# Probe an ALREADY-OPEN framebuffer fd's geometry and build its SdPresenter. Returns the
+# presenter, or 0 with the fd CLOSED if either probe buffer is refused (the two refusals inside
+# _sd_presenter_build close it too, so every 0 out of this function leaves no open fd).
+# ⚠ The ioctls are allowed to fail: a device that answers nothing leaves the zeroed buffers, and
+# the <= 0 fallbacks below are what turn that into 640x480x32. That is also what makes this entry
+# safe on a REGULAR FILE, which is the only fd programs/oom_test.cyr is willing to hand it.
+# ⛔ Split out of sd_present_open at 0.7.1 for the same reason as _sd_presenter_build: everything
+# above it in sd_present_open is open("/dev/fb0"), and a test that ran that would be writing to the
+# live display. sd_present_open is the only in-tree caller.
+fn _sd_present_probe(fd): i64 {
     var vinfo = sd_alloc(256);
+    if (vinfo == 0) {
+        syscall(3, fd);
+        return 0;
+    }
     var finfo = sd_alloc(256);
+    if (finfo == 0) {
+        syscall(3, fd);
+        return 0;
+    }
     memset(vinfo, 0, 256);
     memset(finfo, 0, 256);
     syscall(16, fd, 0x4600, vinfo);   # ioctl FBIOGET_VSCREENINFO
@@ -126,16 +196,20 @@ fn sd_present_open(): i64 {
     if (bpp  <= 0) { bpp  = 32; }
     var minpitch = xres * (bpp / 8);
     if (pitch < minpitch) { pitch = minpitch; }
-    var p = sd_alloc(SD_PRESENTER_SIZE);
-    store64(p + SD_PRES_FD_OFFSET, fd);
-    store64(p + SD_PRES_XRES_OFFSET, xres);
-    store64(p + SD_PRES_YRES_OFFSET, yres);
-    store64(p + SD_PRES_BPP_OFFSET, bpp);
-    store64(p + SD_PRES_PITCH_OFFSET, pitch);
-    var blit = sd_alloc(pitch * yres);
-    memset(blit, 0, pitch * yres);
-    store64(p + SD_PRES_BLIT_OFFSET, blit);
-    return p;
+    return _sd_presenter_build(fd, xres, yres, bpp, pitch);
+}
+
+# @public — open /dev/fb0 and probe geometry. Returns an SdPresenter, or 0 if
+# the framebuffer is unavailable (no device / no permission), or if any of the four blocks it
+# needs is refused — callers fall back to sd_surface_write_ppm.
+# ⚠ EVERY 0 LEAVES NO OPEN fd. The fd is the first thing acquired and the only thing that has to be
+# released, and all four refusal paths close it before returning. Through 0.7.0 the four blocks
+# were stored through unchecked, so a refused `vinfo` was a null-pointer memset and a refused
+# `blit` a presenter whose scratch was 0.
+fn sd_present_open(): i64 {
+    var fd = syscall(2, "/dev/fb0", 2, 0);   # open O_RDWR
+    if (fd < 0) { return 0; }
+    return _sd_present_probe(fd);
 }
 
 # @public — scale + center-letterbox `s` into the framebuffer and write it.

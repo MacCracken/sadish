@@ -673,8 +673,10 @@ fn main(): i64 {
     sd_canvas_stroke_path_ex(acv, acurve, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
     var curve_cost = arena_used(g_arena) - a0;
     check(alloc_used() - g0, 0);                                       # 7 — a curve: still 0 on the heap
-    # MEASURED 672 B: the cubic's 42 flatten mid-points x 16 B (7 subdivisions), on the seam, per call.
-    check(curve_cost, 672);                                            # 8
+    # MEASURED 112 B: the cubic's 7 EMITTED flatten mid-points x 16 B (7 subdivisions), on the
+    # seam, per call. Was 672 B through 0.7.0, when each of those 7 nodes allocated all SIX of its
+    # de Casteljau mids and threw five away.
+    check(curve_cost, 112);                                            # 8
     a0 = arena_used(g_arena);
     sd_canvas_stroke_path_ex(acv, acurve, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
     check(arena_used(g_arena) - a0, curve_cost);                       # 9 — identical on the next call

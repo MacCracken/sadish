@@ -10,7 +10,8 @@
 #      the walk quantizes it to 63; the miter's outer corner pixel reads 0.1 px^2 = 25;
 #   C. that dispatch honours the clip mask and MAX-combines with existing coverage;
 #   D. gradient paint through AREA coverage onto a WRAPPED surface equals sd_canvas_blit_at;
-#   E. sadish_version() == 700.
+#   E. a drawing verb before any MOVETO faults nothing, and paints nothing (0.7.1);
+#   F. sadish_version() == 701.
 # Exit code = failed checks; each failure prints its check number.
 
 include "src/lib.cyr"
@@ -166,8 +167,52 @@ fn main(): i64 {
     check(pad_bad, 0);                                                 # 31
     check(sd_surface_pixel_at(ws, 8, 5), sd_rgb(20, 140, 230));        # 32 — the band, at the stride
 
-    # ---- E. version probe -----------------------------------------------------------------------
-    check(sadish_version(), 700);                                      # 33
+    # ---- E. a drawing verb before any MOVETO faults nothing (0.7.1) -----------------------------
+    # ⛔ `cur` is an SdPoint POINTER, 0 until the first moveto, and every drawing verb dereferences
+    # it: through 0.7.0 a path whose first verb is a lineto/quadto/cubicto killed the process
+    # (MEASURED: SIGSEGV, rc 139, on 0.7.0 and 0.6.0 alike). 0.7.1 made it easy to BUILD such a path
+    # — a refused sd_path_moveto now returns SADISH_ERR_OOM with the path untouched, so a caller
+    # that logs and carries on has one. Every walk (fill, round stroke, styled stroke, dash,
+    # sd_path_flatten) now skips drawing verbs until a moveto arrives; their points are still
+    # consumed, so the verb and point streams stay in step.
+    # ⚠ THE WHOLE SUITE FAULTING IS THE FAILURE MODE HERE: if a guard is lost, these checks do not
+    # report a wrong number, the process dies and the exit code is 139.
+    var bad = sd_path_new();
+    sd_path_lineto(bad, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(bad, 20 * SD_ONE, 12 * SD_ONE);
+    sd_path_quadto(bad, 24 * SD_ONE, 4 * SD_ONE, 28 * SD_ONE, 12 * SD_ONE);
+    sd_path_cubicto(bad, 30 * SD_ONE, 2 * SD_ONE, 34 * SD_ONE, 2 * SD_ONE, 36 * SD_ONE, 12 * SD_ONE);
+    sd_path_close(bad);
+    var bcv = sd_canvas_new(24, 16);
+    check(sd_canvas_fill_path(bcv, bad, SD_FILL_NONZERO), SADISH_OK);  # 33 — no fault
+    check(it_right_sum(bcv, 0), 0);                                    # 34 — and nothing painted
+    var bcv2 = sd_canvas_new(24, 16);
+    sd_canvas_set_aa(bcv2, SD_AA_AREA);
+    check(sd_canvas_fill_path(bcv2, bad, SD_FILL_NONZERO), SADISH_OK);  # 35 — the area engine too
+    check(it_right_sum(bcv2, 0), 0);                                   # 36
+    check(sd_canvas_stroke_path(bcv, bad, 2 * SD_ONE), SADISH_OK);     # 37 — the round stroker
+    check(it_stroke(bcv, bad), SADISH_OK);                             # 38 — the styled walk
+    var dashpat = alloc(16);
+    store64(dashpat + 0, 4 * SD_ONE);
+    store64(dashpat + 8, 4 * SD_ONE);
+    check(sd_canvas_stroke_path_dash(bcv, bad, 2 * SD_ONE, SD_CAP_BUTT, SD_JOIN_MITER,
+        4 * SD_ONE, dashpat, 2, 0), SADISH_OK);   # 39 — the dash walk
+    check(it_right_sum(bcv, 0), 0);                                    # 40 — still nothing painted
+    var bpl = sd_path_flatten(bad, SD_ONE >> 2);
+    check(sd_polyline_count(bpl), 0);                                  # 41 — nothing to flatten:
+    #                                                                    every verb here needs a
+    #                                                                    `cur` no moveto ever set
+    # ⭐ A moveto LATER in the same path still draws: the skip is not a poisoned path.
+    sd_path_moveto(bad, 4 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(bad, 20 * SD_ONE, 4 * SD_ONE);
+    sd_path_lineto(bad, 20 * SD_ONE, 12 * SD_ONE);
+    sd_path_close(bad);
+    var bcv3 = sd_canvas_new(24, 16);
+    check(sd_canvas_fill_path(bcv3, bad, SD_FILL_NONZERO), SADISH_OK);  # 42
+    if (it_right_sum(bcv3, 0) <= 0) { g_fails = g_fails + 1; }         # 43 — the triangle is there
+
+    # ---- F. version probe -----------------------------------------------------------------------
+    check(sadish_version(), 701);                                      # 44
 
     if (g_fails == 0) {
         var ok = "integration_test: PASS (AREA styled strokes, clip/MAX, paint on wrapped, first-use alloc)\n";
