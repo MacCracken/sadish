@@ -24,7 +24,7 @@
 # caller NOTHING IT HAD: the PPM sink takes its two buffers before the O_TRUNC open, so a refusal
 # leaves the target file exactly as it was; the presenter closes the framebuffer fd on every one of
 # its four refusal paths and never returns a half-built record. Gated by programs/oom_test.cyr.
-# Closes half of docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md.
+# Closes half of docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md.
 
 # ---- PPM sink (platform-neutral) --------------------------------
 # Write the decimal ASCII of a non-negative n into buf at off; return new off.

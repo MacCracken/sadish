@@ -25,16 +25,48 @@
 #     that gets reset every frame, NOTHING sadish returned under it may be kept across the reset
 #     — not a path, not a canvas, not a surface. That is the consumer's lifetime call, exactly as
 #     it already is for `dh_falloc`.
-#   · A hook returning 0 is handled precisely as `alloc()` returning 0 already is: the callers
-#     that check (sd_surface_new, sd_canvas_new, sd_path_new, sd_path_grow) return 0 /
-#     SADISH_ERR_OOM; the callers that do not check never did. No new failure path.
+#   ⭐ A HOOK MAY REFUSE. Every `sd_alloc` result in `src/*.cyr` is tested and reported, and a
+#     refusal is a RETURN CODE at every public entry point that can reach one (0.7.1 for path,
+#     geom, raster, present and error; 0.7.2 for the three stroke entries, which were the last to
+#     fault). ⛔ THIS SENTENCE USED TO READ "No new failure path", and it was written before any
+#     of that work: through 0.7.0 a refusal inside path construction was a null-pointer STORE, and
+#     through 0.7.1 `sd_canvas_stroke_path` still died on one (MEASURED: SIGSEGV, rc 139). What is
+#     true now, entry point by entry point:
+#       · CONSTRUCTORS RETURN 0 — sd_surface_new, sd_canvas_new, sd_path_new / _cap,
+#         sd_point_new, sd_matrix_* (identity/translate/scale/rotate/skew/mul/invert/apply),
+#         the gradient constructors, sadish_err_new (whose 0 READS as SADISH_ERR_OOM, so a caller
+#         handling one failure is never handed a second), sd_path_flatten (0 with
+#         sd_flatten_truncated() set, which is how it is told from an empty path), and the
+#         presenter (_sd_present_probe / _sd_presenter_build, fd closed on every refusal path).
+#       · STATUS-RETURNING CALLS RETURN SADISH_ERR_OOM — sd_path_moveto / lineto / quadto /
+#         cubicto (verbs, points and contents exactly as they were), sd_path_grow,
+#         sd_canvas_clip_push_rect / _push_path / sd_clip_push_mask (nothing pushed, the previous
+#         region intact and poppable, the caller's mask untouched), sd_surface_write_ppm (both
+#         buffers taken BEFORE the O_TRUNC open, so an existing file is not truncated),
+#         sd_gradient_set_matrix / add_stop, sd_canvas_fill_path / _union, and
+#         sd_canvas_stroke_path / _ex / _dash.
+#       ⚠ WHAT A REFUSAL COSTS, WHICH IS NOT ALWAYS NOTHING. The path builders, the clip pushes
+#         and the PPM writer are all-or-nothing: a refusal costs the caller nothing it had (a path
+#         may have paid for one doubling — path.cyr says so). A FILL or a STROKE is not: coverage
+#         written before the refusal STAYS ON THE CANVAS, and the code says the picture is a
+#         prefix. Clear and retry, or draw into a scratch canvas.
+#       ⛔ WHAT STILL FAULTS: a CALLER that ignores a documented 0 and hands it back to sadish.
+#         MEASURED on this tree — `sd_path_moveto(0, x, y)` on a refused path, `sd_polyline_count(0)`
+#         on a refused flatten and `sd_canvas_coverage_at(0, …)` on a refused canvas are each
+#         SIGSEGV, rc 139. The builders and the accessors do not test their record pointer; the
+#         entry points that take a canvas or a path DO (`sd_canvas_stroke_path(0, 0, w)` is
+#         SADISH_ERR_BOUNDS, `sd_gradient_add_stop(0, …)` SADISH_ERR_BOUNDS). ⇒ Test a
+#         constructor's result before you build on it; that is the whole of the caller's duty.
 #   · `sd_alloc_set` returns the PREVIOUS hook so a nested scope unwinds in order; 0 restores the
 #     global allocator. `sd_alloc_get` reads it back.
 #   ⚠ The fill/stroke scratch in raster.cyr is deliberately NOT on this seam — it is allocated
 #     once for the life of the process from the global `alloc` (see `_sd_scratch_init`; the
-#     SD_AA_AREA accumulator in coverage.cyr and the styled-stroke batch in stroke.cyr likewise),
-#     and since 0.7.0 GROWN there too when a path outgrows it. A hook pointing at an arena that
-#     gets reset would otherwise leave the scratch dangling on the second frame.
+#     SD_AA_AREA accumulator in coverage.cyr, the styled-stroke batch and curve flags in
+#     stroke.cyr and the dash piece buffer in dash.cyr likewise), and since 0.7.0 GROWN there too
+#     when a path outgrows it. A hook pointing at an arena that gets reset would otherwise leave
+#     the scratch dangling on the second frame. ⇒ A hook CANNOT refuse any of them; the global
+#     allocator can, and a refusal there is reported by the same return codes as above (each set
+#     is published all-or-nothing, so the next call retries from scratch).
 #   ⚠ The hook is a process-wide global, like the scratch: sadish has never had a lock anywhere
 #     and is not thread-safe. Set it from the thread that draws.
 

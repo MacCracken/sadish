@@ -103,6 +103,40 @@
 # it. Out of memory, a stroke degrades to exactly 0.6.0's batches; it drops a piece only if an edge
 # arrives at a full array whose growth fails, which the reserve before every unit prevents.
 # ⚠ Single-threaded, like the fill: one edge batch and one run for the process.
+#
+# ⛔⛔ A REFUSED ALLOCATION IS A RETURN CODE, NOT A FAULT AND NOT A SILENT UNDER-DRAW (0.7.2).
+# All three public entries — sd_canvas_stroke_path, sd_canvas_stroke_path_ex,
+# sd_canvas_stroke_path_dash — return SADISH_ERR_OOM for a refusal at ANY allocation they reach:
+# the round stroker's per-piece SdPaths and the SdPoints inside them, and a curve's flatten
+# mid-points, all on the consumer's seam; the process-lifetime scratch and its growths (the fill /
+# stroke scratch, the batch, the run, the curve flags, the dash piece buffer, the flush's row
+# accumulator), all on the global alloc. Closes the STROKE half of
+# docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md.
+# ⭐ MEASURED, the same four calls on a materialised 0.7.1 tree and on this one — 32x32, warm
+# scratch, a hook granting K allocations and then refusing (K = 0..4):
+#   round stroker, a 2-point line     0.7.1 SIGSEGV rc 139   here SADISH_ERR_OOM, 0 of 27,964 ink
+#   round stroker, a closed 2-cubic   0.7.1 SIGSEGV rc 139   here SADISH_ERR_OOM, 0 of 59,303
+#   styled BUTT/MITER, that curve     0.7.1 SADISH_OK        here SADISH_ERR_OOM
+#   dashed BUTT/MITER, that curve     0.7.1 SADISH_OK        here SADISH_ERR_OOM
+# ⛔ AND THE INK IS THE SAME ON BOTH TREES WHEREVER 0.7.1 SURVIVED AT ALL: the styled stroke paints
+# 0 / 6,165 / 12,117 / 18,441 / 28,682 of its 59,850 units at K = 0..4 on both, the dashed one
+# 0 / 6,166 / 7,978 / 13,453 / 17,329 of 36,422. Only the REPORT changed — a starved stroke draws
+# what it always drew, and an unstarved one is byte-identical (agnos refagree, all 200 paths).
+# ⚠ WHAT A PARTIAL STROKE LEAVES ON THE CANVAS: whatever it had already drawn. THERE IS NO
+# ROLLBACK. The pieces before the refusal are MAX-combined into the coverage exactly as a whole
+# stroke's are, so the canvas holds a prefix of the stroke and the code says the picture is wrong;
+# a caller that wants all-or-nothing strokes into a scratch canvas, or clears and retries. The
+# ROUND stroker stops at the FIRST refusal (each piece is its own allocation + fill pass, and a
+# hook that refused one refuses the next); the styled path runs its walk out and reports at the
+# end, so its batch is still flushed and its ink is the prefix that fit.
+# ⛔ AND A REFUSAL LEAVES NO PROCESS-LIFETIME WRECKAGE. The batch is empty after the flush that
+# failed (it is emptied before anything in the flush can fail), its truncation flag is cleared, and
+# the run, the curve flags and the fill scratch keep the blocks and capacities they had — so the
+# NEXT stroke on a healthy allocator draws exactly what it would have drawn had the refusal never
+# happened. programs/stroke_oom_test.cyr asserts that byte for byte at every K of every sweep.
+# ⚠ sd_flatten_truncated() is unchanged and still STICKY (it belongs to the last flatten, not to the
+# last call — path.cyr says so): a stroke scopes it the way sd_fill_impl does and puts the caller's
+# standing verdict back. The RETURN CODE is the per-call witness a stroke did not have before.
 
 # ---- cap / join styles ------------------------------------------
 var SD_CAP_BUTT   = 0;
@@ -121,94 +155,90 @@ var SD_MITER_LIMIT_MAX = 67108864;
 # perpendicular (magnitude via sd_isqrt), fill-union it. Round caps + round
 # joins come from a disc at every vertex, so no bevel/miter math is needed.
 # Each piece is MAX-unioned so overlaps combine regardless of winding.
+# Returns SADISH_OK, or SADISH_ERR_OOM when the piece path, one of its four SdPoints or the fill
+# underneath is refused — this piece then draws NOTHING (the half-built path is abandoned to an
+# allocator with no free()), and every piece already drawn stays on the canvas. ⚠ 7 sd_alloc calls
+# a rect on the consumer's seam: sd_path_new's record + verbs + points, then one SdPoint a corner.
 fn sd_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
     var dx = bx - ax;
     var dy = by - ay;
     var len2 = dx * dx + dy * dy;
-    if (len2 == 0) { return 0; }     # zero-length -> the vertex disc covers it
+    if (len2 == 0) { return SADISH_OK; }     # zero-length -> the vertex disc covers it
     var l = sd_isqrt(len2);          # length in 16.16
-    if (l == 0) { return 0; }
+    if (l == 0) { return SADISH_OK; }
     var ox = ((0 - dy) * hw) / l;    # perpendicular offset, magnitude hw
     var oy = (dx * hw) / l;
     var rp = sd_path_new();
-    sd_path_moveto(rp, ax + ox, ay + oy);
-    sd_path_lineto(rp, bx + ox, by + oy);
-    sd_path_lineto(rp, bx - ox, by - oy);
-    sd_path_lineto(rp, ax - ox, ay - oy);
-    sd_path_close(rp);
-    sd_canvas_fill_union(cv, rp, SD_FILL_NONZERO);
-    return 0;
+    if (rp == 0) { return SADISH_ERR_OOM; }
+    if (sd_path_moveto(rp, ax + ox, ay + oy) != SADISH_OK) { return SADISH_ERR_OOM; }
+    if (sd_path_lineto(rp, bx + ox, by + oy) != SADISH_OK) { return SADISH_ERR_OOM; }
+    if (sd_path_lineto(rp, bx - ox, by - oy) != SADISH_OK) { return SADISH_ERR_OOM; }
+    if (sd_path_lineto(rp, ax - ox, ay - oy) != SADISH_OK) { return SADISH_ERR_OOM; }
+    if (sd_path_close(rp) != SADISH_OK) { return SADISH_ERR_OOM; }
+    return sd_canvas_fill_union(cv, rp, SD_FILL_NONZERO);
 }
 
 # A radius-hw disc (16-gon) at (cx, cy) — round cap / round join filler.
+# SADISH_OK, or SADISH_ERR_OOM on a refusal (nothing of this disc drawn), as sd_stroke_seg.
+# ⚠ 19 sd_alloc calls a disc: the path's three, then one SdPoint per vertex.
 fn sd_stroke_disc(cv, cx, cy, hw): i64 {
     var dp = sd_path_new();
+    if (dp == 0) { return SADISH_ERR_OOM; }
     var step = 411775 / 16;          # 2*pi / 16 in 16.16
     var k = 0;
+    var vrc = SADISH_OK;
     while (k < 16) {
-        var ang = k * step;
-        var px = cx + sd_fixed_mul(hw, sd_cos(ang));
-        var py = cy + sd_fixed_mul(hw, sd_sin(ang));
-        if (k == 0) { sd_path_moveto(dp, px, py); } else { sd_path_lineto(dp, px, py); }
+        if (vrc == SADISH_OK) {
+            var ang = k * step;
+            var px = cx + sd_fixed_mul(hw, sd_cos(ang));
+            var py = cy + sd_fixed_mul(hw, sd_sin(ang));
+            if (k == 0) { vrc = sd_path_moveto(dp, px, py); } else { vrc = sd_path_lineto(dp, px, py); }
+        }
         k = k + 1;
     }
-    sd_path_close(dp);
-    sd_canvas_fill_union(cv, dp, SD_FILL_NONZERO);
-    return 0;
+    if (vrc != SADISH_OK) { return SADISH_ERR_OOM; }
+    if (sd_path_close(dp) != SADISH_OK) { return SADISH_ERR_OOM; }
+    return sd_canvas_fill_union(cv, dp, SD_FILL_NONZERO);
 }
 
 # Stroke one flattened subpath run: a rect per segment + a disc per vertex.
+# Returns SADISH_OK, or the first SADISH_ERR_OOM a piece reported — and STOPS there: the remaining
+# pieces are not attempted, because each is another allocation on the hook that has just refused
+# one. What was drawn stays drawn (the header's no-rollback rule).
 fn sd_stroke_run(cv, run, n, closed, hw): i64 {
     var i = 0;
     while (i < n - 1) {
         var a = load64(run + i * 8);
         var b = load64(run + (i + 1) * 8);
-        sd_stroke_seg(cv, sd_point_x(a), sd_point_y(a), sd_point_x(b), sd_point_y(b), hw);
+        var src = sd_stroke_seg(cv, sd_point_x(a), sd_point_y(a), sd_point_x(b), sd_point_y(b), hw);
+        if (src != SADISH_OK) { return src; }
         i = i + 1;
     }
     if (closed != 0) {
         if (n > 1) {
             var a2 = load64(run + (n - 1) * 8);
             var b2 = load64(run + 0);
-            sd_stroke_seg(cv, sd_point_x(a2), sd_point_y(a2), sd_point_x(b2), sd_point_y(b2), hw);
+            var crc = sd_stroke_seg(cv, sd_point_x(a2), sd_point_y(a2), sd_point_x(b2),
+              sd_point_y(b2), hw);
+            if (crc != SADISH_OK) { return crc; }
         }
     }
     var k = 0;
     while (k < n) {
         var v = load64(run + k * 8);
-        sd_stroke_disc(cv, sd_point_x(v), sd_point_y(v), hw);
+        var drc = sd_stroke_disc(cv, sd_point_x(v), sd_point_y(v), hw);
+        if (drc != SADISH_OK) { return drc; }
         k = k + 1;
     }
-    return 0;
+    return SADISH_OK;
 }
 
-# ================================================================
-# sd_canvas_stroke_path — stroke `path` with the given `width` (16.16) onto
-# `cv`'s coverage, with round caps + round joins. Flattens curves, then per
-# subpath draws a rectangle per segment and a disc per vertex, MAX-combined
-# into the coverage buffer.
-#
-# Styled caps/joins are sd_canvas_stroke_path_ex below; this entry stays the
-# 0.4.0 piece-per-pass stroker, byte-identical.
-# TODO(v0.5): batch the round pieces — this still allocs a PATH (on the seam)
-# + runs a fill pass per segment/vertex (correctness-first); the fixed scratch
-# underneath is process-lifetime (0.5.5).
-# ================================================================
-# @public
-fn sd_canvas_stroke_path(cv, path, width): i64 {
-    if (cv == 0) { return SADISH_ERR_BOUNDS; }
-    if (path == 0) { return SADISH_ERR_EMPTY_PATH; }
+# The round stroker's verb walk — sd_canvas_stroke_path's body, split out (0.7.2) so the entry can
+# put the caller's standing flatten verdict back on the way out of an early return. Returns
+# SADISH_OK, or the first SADISH_ERR_OOM a piece reported, which STOPS the walk (sd_stroke_run).
+fn _sd_round_walk(cv, path, hw): i64 {
     var n_verbs = sd_path_verb_count(path);
-    if (n_verbs == 0) { return SADISH_ERR_EMPTY_PATH; }
-    var hw = sd_asr(width, 1);
-    if (hw <= 0) { return SADISH_OK; }
     var tol = SD_ONE >> 2;
-
-    # The stroker's OWN scratch set — the run stays live across the fill_union passes below, which
-    # use the fill set (see the scratch block in raster.cyr). ⚠ The run GROWS (0.7.0), so it is
-    # read as _sd_stroke_run at each use, never cached across a push.
-    _sd_scratch_init();
-    _sd_run_trunc = 0;
     var run_n = 0;
     var fbuf = _sd_stroke_fbuf;
     var fctx = _sd_stroke_fctx;
@@ -222,7 +252,10 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
     while (vi < n_verbs) {
         var verb = load64(verbs + vi * 8);
         if (verb == SD_VERB_MOVETO) {
-            if (run_n > 0) { sd_stroke_run(cv, _sd_stroke_run, run_n, closed, hw); }
+            if (run_n > 0) {
+                var mrc = sd_stroke_run(cv, _sd_stroke_run, run_n, closed, hw);
+                if (mrc != SADISH_OK) { return mrc; }
+            }
             run_n = 0;
             closed = 0;
             cur = load64(points + pi * 8);
@@ -269,8 +302,73 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
         }
         vi = vi + 1;
     }
-    if (run_n > 0) { sd_stroke_run(cv, _sd_stroke_run, run_n, closed, hw); }
+    if (run_n > 0) { return sd_stroke_run(cv, _sd_stroke_run, run_n, closed, hw); }
     return SADISH_OK;
+}
+
+# ================================================================
+# sd_canvas_stroke_path — stroke `path` with the given `width` (16.16) onto
+# `cv`'s coverage, with round caps + round joins. Flattens curves, then per
+# subpath draws a rectangle per segment and a disc per vertex, MAX-combined
+# into the coverage buffer.
+#
+# Returns SADISH_OK; SADISH_ERR_BOUNDS for cv == 0; SADISH_ERR_EMPTY_PATH for a 0 or verb-less
+# path; SADISH_ERR_OOM when any allocation the stroke reaches is refused — the piece paths and
+# their points on the seam, a curve's flatten mid-points, or the process-lifetime scratch. A
+# width <= 0 draws nothing and is SADISH_OK. ⚠ An OOM leaves the pieces already drawn ON the
+# canvas: see the no-rollback block in this file's header.
+#
+# Styled caps/joins are sd_canvas_stroke_path_ex below; this entry stays the
+# 0.4.0 piece-per-pass stroker, byte-identical.
+# TODO(v0.5): batch the round pieces — this still allocs a PATH (on the seam)
+# + runs a fill pass per segment/vertex (correctness-first); the fixed scratch
+# underneath is process-lifetime (0.5.5).
+# ================================================================
+# @public
+fn sd_canvas_stroke_path(cv, path, width): i64 {
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
+    if (path == 0) { return SADISH_ERR_EMPTY_PATH; }
+    var n_verbs = sd_path_verb_count(path);
+    if (n_verbs == 0) { return SADISH_ERR_EMPTY_PATH; }
+    var hw = sd_asr(width, 1);
+    if (hw <= 0) { return SADISH_OK; }
+
+    # The stroker's OWN scratch set — the run stays live across the fill_union passes below, which
+    # use the fill set (see the scratch block in raster.cyr). ⚠ The run GROWS (0.7.0), so it is
+    # read as _sd_stroke_run at each use, never cached across a push.
+    _sd_scratch_init();
+    # ⛔ THE GUARD IS ON THE BLOCK THE WALK STORES THROUGH, not on _sd_scratch_init's status —
+    # sd_fill_impl's reasoning (see it), applied to the stroker's own run: the publish is
+    # all-or-nothing, so a 0 here covers both a refused set and anything that ever published a 0
+    # behind a status of 1. Through 0.7.1 the status was discarded and this 0 was stored through.
+    if (_sd_stroke_run == 0) { return SADISH_ERR_OOM; }
+    _sd_run_trunc = 0;
+    # The flatten's truncation verdict, SCOPED TO THIS CALL exactly as sd_fill_impl scopes it: from
+    # here a 1 means THIS stroke lost mid-points. The caller's standing verdict is put back below,
+    # so sd_flatten_truncated() answers what it always answered (path.cyr: sticky until the next
+    # sd_path_flatten) and the return code is what answers for this call.
+    var flat_was = _sd_flat_trunc;
+    _sd_flat_trunc = 0;
+
+    var rc = _sd_round_walk(cv, path, hw);
+
+    if (_sd_flat_trunc != 0) {
+        if (rc == SADISH_OK) { rc = SADISH_ERR_OOM; }
+    }
+    # ⛔ AND THE CALLER'S STANDING VERDICT GOES BACK — the line _sd_round_walk was split out FOR.
+    # Without it a stroke would CLEAR a verdict its caller was holding from an earlier
+    # sd_path_flatten, which path.cyr documents as sticky until the next flatten. MEASURED as a
+    # mutation (this line deleted): a starved sd_path_flatten leaves sd_flatten_truncated() at 1, a
+    # healthy sd_canvas_stroke_path then reads it back 0. Gated by stroke_oom_test checks 115-117,
+    # the round twin of the _ex pair at 112-114.
+    if (flat_was != 0) { _sd_flat_trunc = 1; }
+    # A run point the growth could not take is ink the caller asked for and did not get, exactly as
+    # a lost mid-point is (_sd_run_grow / _sd_inner_grow set it; raster.cyr's _sd_grow_limit and a
+    # real out-of-memory are the two ways to reach it).
+    if (_sd_run_trunc != 0) {
+        if (rc == SADISH_OK) { rc = SADISH_ERR_OOM; }
+    }
+    return rc;
 }
 
 # ---- styled stroking: the edge batch -----------------------------
@@ -325,6 +423,13 @@ var _sd_sb_inner = 0;   # _sd_sb_inner_cap bytes, parallel to the run: 1 = insid
 var _sd_sb_inner_cap = 0;
 var _sd_sb_trunc = 0;   # 1 if the batch dropped an edge (a growth failed); cleared by the flush
 var _sd_run_trunc = 0;  # 1 if THIS stroke call dropped a run point (a growth failed)
+# ⛔ 1 if something INSIDE the styled machinery could not get memory during this call (0.7.2): the
+# flush's row accumulator or the area engine's, a batch that dropped an edge, a dash piece the
+# buffer could not take. It is what carries a refusal from a place that cannot return one — a
+# mid-walk _sd_sb_flush, a _sd_dash_put four frames down — out to the public entry point.
+# ⚠ Cleared at the top of _sd_styled_walk, which is the ONLY reader, and the only path on which any
+# of those sites runs. The round stroker reports through return codes instead and never sets it.
+var _sd_stroke_oom = 0;
 
 # The edge array's INITIAL capacity, from SD_STROKE_BATCH_CAP: 0 (no limit) takes the full
 # SD_FLATTEN_CAP, a positive limit is held to [SD_STROKE_BATCH_MIN, SD_FLATTEN_CAP]. ⛔ Never more
@@ -339,21 +444,62 @@ fn _sd_sb_cap_for(): i64 {
     return cap;
 }
 
+# Allocate the batch, the curve flags and the trig table once (idempotent). Returns 1 when they are
+# ready, 0 when a block was refused.
+# ⛔ ALL OR NOTHING, AND `_sd_sb_edges != 0` IS THE FLAG — _sd_scratch_init's rule, for the same
+# reason (0.7.2). Through 0.7.1 the three blocks went straight into the globals unchecked: a refused
+# trig table faulted in the table write two lines below it, and a refused `inner` or `edges` was
+# published WITH ITS CAPACITY, so the first curve flag or the first edge of that very stroke was
+# written through address 0. The blocks now land in locals and are published together, so a partial
+# set is abandoned (no free()) and the next call retries from scratch.
+# ⚠ These come from the GLOBAL `alloc`, never sd_alloc (raster.cyr's scratch rule), so no consumer
+# hook can refuse them: the only honest way to drive this path is the CAPACITY, which sizes two of
+# the three — programs/stroke_oom_test.cyr raises SD_FLATTEN_CAP past ALLOC_MAX / 8, the device
+# oom_test group J uses on the fill scratch.
+# ⛔ AND THESE THREE 0-TESTS ARE GATES, NOT A CONTRACT — `_sd_sb_edges` IS NOT ALWAYS THE LARGEST
+# BLOCK OF THE SET, unlike _sd_scratch_init's eight (where every capacity-sized block is CAP*8 or
+# more, so a size-based refusal takes them together). Here `inner` is SD_FLATTEN_CAP BYTES while
+# `edges` is _sd_sb_cap_for() * 32, and _sd_sb_cap_for reads SD_STROKE_BATCH_CAP — the PUBLIC knob
+# declared above. They move together only while that knob is 0 (then cap == SD_FLATTEN_CAP and
+# edges is 32x the larger); set it, and edges shrinks to it while inner does not. So whenever
+# SD_FLATTEN_CAP > 32 * cap, `inner` is the LARGEST block and lib/alloc.cyr refuses IT while
+# granting `edges` — the one arrangement a partial publish cannot survive, because `_sd_sb_edges`
+# is also the idempotence flag.
+# ⛔ MEASURED, SD_STROKE_BATCH_CAP = 1000 with SD_FLATTEN_CAP = 3,000,000,000: this function
+# reverted to 0.7.1's unchecked stores publishes edges = <32,000 B block>, inner = 0,
+# inner_cap = 3,000,000,000 and returns 1; the caller's `_sd_sb_edges == 0` guard passes, and the
+# next _sd_run_push writes its curve flag through address 0 — SIGSEGV, rc 139. And because
+# `_sd_sb_edges != 0` keeps this function from ever running again, so does EVERY styled stroke for
+# the rest of the process: the 0.7.0 poisoned-scratch shape, exactly.
+# ⇒ programs/stroke_oom_test.cyr group G4 drives those two values and gates all five publishes.
+# ⚠ Those two values are how a SUITE reaches it; a real machine reaches it without any knob at all,
+# because lib/alloc.cyr also refuses when the heap cannot be extended, and then any one of the three
+# can be the one that fails. The size argument is what makes the path testable, not what makes the
+# tests necessary.
 fn _sd_sb_init(): i64 {
-    if (_sd_sb_edges != 0) { return 0; }
-    _sd_sb_trig = alloc(16 * 16);
+    if (_sd_sb_edges != 0) { return 1; }
+    var trig = alloc(16 * 16);
+    var inner = alloc(SD_FLATTEN_CAP);
+    var cap = _sd_sb_cap_for();
+    var edges = alloc(cap * 32);
+    var ok = 1;
+    if (trig == 0) { ok = 0; }
+    if (inner == 0) { ok = 0; }
+    if (edges == 0) { ok = 0; }
+    if (ok == 0) { return 0; }
     var step = 411775 / 16;          # 2*pi / 16 in 16.16, as sd_stroke_disc
     var k = 0;
     while (k < 16) {
-        store64(_sd_sb_trig + k * 16, sd_cos(k * step));
-        store64(_sd_sb_trig + k * 16 + 8, sd_sin(k * step));
+        store64(trig + k * 16, sd_cos(k * step));
+        store64(trig + k * 16 + 8, sd_sin(k * step));
         k = k + 1;
     }
-    _sd_sb_inner = alloc(SD_FLATTEN_CAP);
+    _sd_sb_trig = trig;
+    _sd_sb_inner = inner;
     _sd_sb_inner_cap = SD_FLATTEN_CAP;
-    _sd_sb_cap = _sd_sb_cap_for();
-    _sd_sb_edges = alloc(_sd_sb_cap * 32);
-    return 0;
+    _sd_sb_cap = cap;
+    _sd_sb_edges = edges;
+    return 1;
 }
 
 # Grow the batch to hold at least `need` edges: crossings first, then the edges, doubling, the live
@@ -499,11 +645,26 @@ fn _sd_sb_edge(ax, ay, bx, by): i64 {
 # band's rim, where the round stroker reads 254 too).
 # Bridging a real 1-LSB gap adds 1/4 of a raw unit of coverage. Rows outside the batch's y range
 # are skipped: they would MAX a 0 into the coverage.
+# Returns SADISH_OK, or SADISH_ERR_OOM when the row accumulator (or the area engine's) is refused —
+# and sets _sd_stroke_oom either way, because the flushes _sd_sb_subpath makes mid-walk have no
+# caller that can return anything (0.7.2).
+# ⛔ THE COUNT IS TAKEN AND THE BATCH EMPTIED (`_sd_sb_n = 0`, two lines into the body) BEFORE
+# ANYTHING HERE CAN FAIL, AND THAT ORDER IS LOAD-BEARING — it is what makes a refused flush cost the
+# caller a picture and not the process. An accumulator refused with the batch still full would leave
+# the failed stroke's pieces sitting in it, and the NEXT styled stroke on a healthy allocator would
+# fill them together with its own: MEASURED as a mutation (the accrow guard below putting the count
+# back), a refused dashed stroke of the closed curve leaves 270 edges in the batch, and the next
+# healthy stroke — of the straight line, a different shape — comes back with 261 of its 1,024 pixels
+# carrying the curve's ink. This function must therefore keep every early return AFTER that line.
+# programs/stroke_oom_test.cyr checks 43-45 gate it.
 fn _sd_sb_flush(cv): i64 {
     var n = _sd_sb_n;
     var trunc = _sd_sb_trunc;
     _sd_sb_trunc = 0;
-    if (n == 0) { return 0; }
+    # An edge the batch could not take is ink the caller asked for and did not get: report it here,
+    # where the batch that lost it is consumed. _sd_sb_edge sets the flag only after a growth failed.
+    if (trunc != 0) { _sd_stroke_oom = 1; }
+    if (n == 0) { return SADISH_OK; }
     _sd_sb_n = 0;
     var edges = _sd_sb_edges;
     var cross = _sd_fill_cross;         # the CURRENT block: _sd_sb_grow keeps its capacity >= n
@@ -521,7 +682,11 @@ fn _sd_sb_flush(cv): i64 {
             var mask = 0;
             var clipn = load64(cv + SD_CANVAS_CLIP_OFFSET);
             if (clipn != 0) { mask = load64(clipn + 0); }
-            return _sd_area_fill(edges, n, w, h, cov, stride, mask, 1, 1);
+            # ⚠ SADISH_ERR_OOM out of here is the area engine's own (w + 1) * 8 accumulator being
+            # refused (src/coverage.cyr); it writes no coverage when that happens.
+            var arc = _sd_area_fill(edges, n, w, h, cov, stride, mask, 1, 1);
+            if (arc != SADISH_OK) { _sd_stroke_oom = 1; }
+            return arc;
         }
     }
     var ymin = load64(edges + 8);
@@ -543,6 +708,18 @@ fn _sd_sb_flush(cv): i64 {
     var ssy = SD_FILL_SS;
     var weight = SD_ONE / ssy;
     var accrow = _sd_fill_accrow_for(w);
+    # ⛔ A REFUSED ACCUMULATOR IS REPORTED, NOT STORED THROUGH (0.7.2). Through 0.7.1 this 0 went
+    # straight into the row loop below and killed the process — raster.cyr's _sd_fill_accrow_for
+    # named this caller as the one that did not test it. The block comes from the GLOBAL alloc and
+    # is only ever refused for a canvas wider than the allocator can serve a w*8 row for (MEASURED,
+    # a hand-built 536,870,912 px header: w*8 = 4 GiB, over lib/alloc.cyr's ALLOC_MAX).
+    # ⛔ THE BATCH IS ALREADY EMPTY HERE AND THIS RETURN MUST NOT PUT IT BACK — the header block on
+    # this function says why (the next stroke would paint this one's pieces). The lost pieces are
+    # the under-draw the code tells the caller about, and no coverage byte has been touched.
+    if (accrow == 0) {
+        _sd_stroke_oom = 1;
+        return SADISH_ERR_OOM;
+    }
     while (py < py_end) {
         var zi = 0;
         while (zi < w) {
@@ -642,7 +819,7 @@ fn _sd_sb_flush(cv): i64 {
         }
         py = py + 1;
     }
-    return 0;
+    return SADISH_OK;
 }
 
 # The rect A+o, B+o, B-o, A-o — sd_stroke_seg's corners. With o = perp(B - A) * hw / |B - A| its
@@ -1026,12 +1203,24 @@ fn _sd_sb_dispatch(cv, run_n, closed, hw, cap, join, ml, dashed): i64 {
 # and cleared _sd_run_trunc.
 # ⚠ The run and its curve flags GROW (0.7.0): read _sd_stroke_run at each use, never a copy taken
 # before a push.
+#
+# Returns SADISH_OK, or SADISH_ERR_OOM if anything this call reached was refused (0.7.2): a curve's
+# flatten mid-points, a run point or curve flag the growth could not take, an edge the batch could
+# not take, a dash piece the buffer could not take, the flush's accumulator. ⛔ THE WALK RUNS TO THE
+# END EITHER WAY and the batch is still flushed — the report is collected at the bottom, not thrown
+# at the first refusal, so a stroke that loses one curve's mid-points still draws every other piece
+# it can. What is on the canvas afterwards is that prefix (the header's no-rollback rule).
 fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
     var n_verbs = sd_path_verb_count(path);
     var tol = SD_ONE >> 2;
     var run_n = 0;
     var fbuf = _sd_stroke_fbuf;
     var fctx = _sd_stroke_fctx;
+    _sd_stroke_oom = 0;
+    # The flatten's truncation verdict, scoped to this call as sd_fill_impl scopes it; the caller's
+    # standing verdict is put back at the bottom. (sd_canvas_stroke_path does the same.)
+    var flat_was = _sd_flat_trunc;
+    _sd_flat_trunc = 0;
 
     var verbs = load64(path + SD_PATH_VERBS_OFFSET);
     var points = load64(path + SD_PATH_POINTS_OFFSET);
@@ -1096,8 +1285,16 @@ fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
         vi = vi + 1;
     }
     if (run_n > 0) { _sd_sb_dispatch(cv, run_n, 0, hw, cap, join, ml, dashed); }
+    # ⚠ The final flush's own code is not read here: it SETS _sd_stroke_oom, which is also the only
+    # way the mid-walk flushes (_sd_sb_subpath's, four frames down) can report anything at all.
     _sd_sb_flush(cv);
-    return SADISH_OK;
+
+    var rc = SADISH_OK;
+    if (_sd_flat_trunc != 0) { rc = SADISH_ERR_OOM; }
+    if (flat_was != 0) { _sd_flat_trunc = 1; }
+    if (_sd_run_trunc != 0) { rc = SADISH_ERR_OOM; }
+    if (_sd_stroke_oom != 0) { rc = SADISH_ERR_OOM; }
+    return rc;
 }
 
 # ================================================================
@@ -1107,7 +1304,9 @@ fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
 # default is 4.0 = 4 * SD_ONE; used only by SD_JOIN_MITER), MAX-combined into `cv`'s coverage.
 #
 # Returns SADISH_ERR_BOUNDS for cv == 0 or an unknown cap/join (nothing drawn),
-# SADISH_ERR_EMPTY_PATH for a 0 or verb-less path, SADISH_OK otherwise — width <= 0 draws nothing.
+# SADISH_ERR_EMPTY_PATH for a 0 or verb-less path, SADISH_ERR_OOM when an allocation this stroke
+# reached was refused (the header's refusal block — the canvas keeps the prefix that was drawn),
+# SADISH_OK otherwise — width <= 0 draws nothing.
 # ⚠ SD_CAP_ROUND + SD_JOIN_ROUND IS sd_canvas_stroke_path, exactly — and so, alone among the nine
 # pairs, keeps its 0.4.0 geometry: a drawing verb after CLOSE continues the closed run instead of
 # starting at the moveto point, and pieces meet by per-pass MAX (a pixel two of them split reads
@@ -1133,9 +1332,12 @@ fn sd_canvas_stroke_path_ex(cv, path, width, cap, join, miter_limit): i64 {
     if (ml > SD_MITER_LIMIT_MAX) { ml = SD_MITER_LIMIT_MAX; }
 
     # The stroker's run/fbuf/fctx (raster.cyr) stay live across the batch flushes; the batch is
-    # this file's own scratch.
+    # this file's own scratch. ⛔ Each guard is on the BLOCK the walk stores through, not on the
+    # initialiser's status — sd_fill_impl's reasoning; both publishes are all-or-nothing.
     _sd_scratch_init();
+    if (_sd_stroke_run == 0) { return SADISH_ERR_OOM; }
     _sd_sb_init();                      # the batch is empty: every call ends in _sd_sb_flush
+    if (_sd_sb_edges == 0) { return SADISH_ERR_OOM; }
     _sd_run_trunc = 0;
     return _sd_styled_walk(cv, path, hw, cap, join, ml, 0);
 }

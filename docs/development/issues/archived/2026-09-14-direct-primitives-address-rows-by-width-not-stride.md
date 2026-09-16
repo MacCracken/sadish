@@ -73,13 +73,15 @@ because a reader checking the plan bullet by bullet will not find either in the 
 
 - The plan's ONE shared store is `sd_put`, and `sd_put` was NOT made stride-aware — a raw pointer
   carries no stride. 0.6.0 added a private row-pointer store instead, `_sd_put_row(row, w, h, x, y,
-  color)` (`src/surface.cyr:127`), and every primitive hands it `px + y * stride`; `sd_put`
-  (`src/surface.cyr:144-146`) still computes `px + y * (w * 4)` and is now packed by contract. The
+  color)` (`src/surface.cyr:127` at 0.7.1, unmoved at 0.7.2), and every primitive hands it
+  `px + y * stride`; `sd_put` (`src/surface.cyr:144-146`, likewise) still computes
+  `px + y * (w * 4)` and is now packed by contract. The
   INVARIANT this bullet served is met by a different route, and the Status line says so — but no code
   satisfies the bullet as written.
 - The list is short by one site: it names `sd_put`, `sd_surface_pixel_at`, "the three row-based fast
   paths" and the presenter copy, and omits `sd_vline`, which this filing's OWN table lists at
-  `src/draw.cyr:89`. 0.6.0 covered it anyway (`src/draw.cyr:94`, `:102`) and `stride_test` group E
+  `src/draw.cyr:89`. 0.6.0 covered it anyway (`sd_vline`'s stride load and its use,
+  `src/draw.cyr:94`, `:102` at 0.7.1, unmoved at 0.7.2) and `stride_test` group E
   pins it — MEASURED, reverting that one site fails 10 checks. A gap in the plan text, not the
   outcome.
 

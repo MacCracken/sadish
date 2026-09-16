@@ -5,6 +5,123 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.2] - 2026-09-16 — the residue a 0.7.1 audit found under four "closed" filings
+
+0.7.1 archived nothing: an audit re-verified every closure claim in `docs/development/` against the
+tree and **four of five filings had unmet asks of their own**. This release is that residue. ⛔ Rendering
+does not move: agnos's `refagree` prints **BYTE-IDENTICAL on all 200 paths**, and rekha (23 suites) and
+dhancha (18) pass against this `dist/`.
+
+### Fixed — a refused allocation inside a STROKE is a return code, not a fault
+
+The last of `docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md`.
+0.7.1 made path construction, the fill, the clip stack, the presenter and the error record survive a
+hook that refuses; strokes still faulted, because `sd_stroke_seg` and `sd_stroke_disc` never tested the
+0 that 0.7.1 taught `sd_path_new` to return. `sd_canvas_stroke_path`, `_ex` and `_dash` now return
+`SADISH_ERR_OOM` for a refusal at ANY allocation they reach — the per-piece paths and their points, a
+curve's flatten mid-points, the scratch and every growth (run, curve flags, batch, dash buffer, the
+flush's row accumulator, the area engine's).
+⭐ MEASURED, the same calls on 0.7.1 and here (32x32, warm scratch, a hook granting K then refusing):
+the round stroker on a line and on a closed 2-cubic blob was **SIGSEGV, rc 139**; the styled and dashed
+strokes returned `SADISH_OK` over a fraction of the picture (0 / 6,165 / 12,117 / 18,441 / 28,682 of
+59,850 coverage units at K = 0..4) and now return `SADISH_ERR_OOM` **painting exactly the same ink** —
+only the report changed.
+⚠ **A partial stroke is not rolled back.** What was drawn before the refusal stays; the caller clears
+and strokes again, or strokes into a scratch canvas. ⛔ But a refusal leaves no process-lifetime
+wreckage: the next stroke on a healthy allocator is byte-identical to a clean one, which rests on
+`_sd_sb_flush` emptying the batch BEFORE anything in it can fail — MEASURED as a mutation, a refused
+flush that put its count back leaves 270 stale edges and paints 261 of the next stroke's 1,024 pixels
+wrong.
+⭐ **`src/alloc.cyr`'s seam contract is rewritten.** "A hook returning 0 is handled precisely as
+`alloc()` returning 0 already is … No new failure path" was the last sentence standing between the docs
+and "a hook may refuse". It now says which entry points return 0, which return `SADISH_ERR_OOM`, what a
+refusal costs (nothing for the builders and clip pushes, a partial picture for a fill or stroke), and
+what still faults: a caller that ignores a documented 0 — `sd_path_moveto(0, …)`, `sd_polyline_count(0)`,
+`sd_canvas_coverage_at(0, …)` are each SIGSEGV, MEASURED.
+
+### Fixed — a fill is ONE flatten operation, not one per curve verb
+
+0.7.1's budget bounded one CURVE inside a fill, so an untrusted outline's work stayed linear in its
+curve count — the filing's own severity case, left open. `sd_fill_impl` now opens one operation for the
+whole fill, LAZILY at the first curve it really flattens. MEASURED, one unwrapped `sd_canvas_fill_path`
+of the hostile 4,096-quad path on 64x64: **16,711,680 B / 1,044,480 allocations → 1,044,480 B / 65,280**
+— the same figure as at 1,024 quads — and `sd_flatten_degraded()` now answers for the unwrapped consumer
+that used to be told nothing.
+⚠ **The trade, taken on evidence and not on taste:** a path whose one fill emits more than
+`SD_FLATTEN_BUDGET_DEFAULT` = 65,536 points now degrades its remaining curves to CHORDS mid-fill and
+says so. The budget is unchanged because the measurement did not ask for more: the largest legitimate
+fill anywhere in this repo or its glyph corpus — all 95 ASCII-shaped glyphs as ONE path at a ~2,048 px
+em — emits 26,394 points, **40 % of the budget**; one glyph at that size 960; a 256 px circle of cubics
+64. Nothing in the suites, the 200 refagree paths, rekha's 23 suites or dhancha's 18 degrades.
+⚠ A fill of a path with NO curve verbs still opens no operation and leaves a consumer's standing verdict
+alone — documented since 0.7.1, checked only now.
+
+### Changed — `sd_path_new_cap` sizes the two arrays SEPARATELY
+
+Item 1 of `docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md`. 0.7.1 shipped
+the two-argument call over ONE capacity field, so `n_points` reached the allocator only through `max()`
+and a glyph bought ~2x more verb slots than it uses. `SdPath` now carries two capacities in the SAME
+48 B record: `SD_PATH_CAP_OFFSET` (+32) for verbs and the new `SD_PATH_PCAP_OFFSET` (+40) for points —
+the word that was `reserved`, written 0 by every constructor and read by nothing (grepped across `src/`,
+`programs/`, rekha, dhancha, agnos, and both repos that vendor `dist/sadish.cyr`).
+⭐ MEASURED, the proposal's own set (95 ASCII-shaped paths, 1,768 verbs, 2,498 points):
+
+| | bytes | vs `sd_path_new` |
+|---|---:|---:|
+| `sd_path_new` + pushes | 433,648 | — |
+| `sd_path_new_cap`, one capacity (0.7.1) | 84,496 | 5.13x |
+| `sd_path_new_cap`, two capacities | **78,656** | **5.51x** |
+
+⇒ the proposal's 78,656 B target to the byte. `sd_path_grow(path, which)` now doubles only the array
+that overflowed: a `(8 verbs, 64 points)` path pays **144 B in 2 allocations** for the lineto that
+overflows its verbs and keeps its 64 point slots.
+⛔ **`SD_PATH_RESERVED_OFFSET` is REMOVED, not aliased, and `sd_path_grow` gained an argument** (no repo
+in the ecosystem calls it). New: `sd_path_verb_cap`, `sd_path_point_cap`, `SD_PATH_PCAP_OFFSET`,
+`SD_PATH_GROW_VERBS` / `_POINTS`. A record a consumer HAND-BUILT to the 0.7.1 layout carries 0 at +40 and
+would read as a zero point capacity — nothing in the ecosystem builds one, and `sd_path_new` /
+`sd_path_new_cap` are unchanged in signature and in cost.
+⛔ **The verb array is the quiet half.** A growth copies its array's OWN live count; MEASURED with that
+one word wrong, **26 of the 28 suites still passed** — a lost verb tag reads back as a valid
+`SD_VERB_MOVETO` where a lost point slot is a null `SdPoint` that faults. `path_cap_test` groups E3, E4
+and G are the only paths in the suites whose verbs outnumber their points, and they now read every verb
+back after a growth.
+
+### Fixed — three coverage loads nothing could tell apart, and three shipped headers that lied
+
+`clip_pitch_test` group K pins the three public coverage loads the 0.7.1 audit found ungated —
+`sd_canvas_blit_gradient`'s own load and the `pm != 0` coverage argument in `_sd_paint_blit_run` and
+`_sd_paint_blit_point`. No source change: all three were already correct, and each mutation to the
+packed index now fails exactly one new check and nothing else, where previously all 27 suites stayed
+green.
+⚠ Three `@public` headers in `src/path.cyr` stated the opposite of the code and `cyrius distlib` copies
+them verbatim into every consumer's bundle: `sd_flatten_op_begin`'s published 16,711,680 B as the
+unwrapped cost of the hostile fill (16x wrong after the scope change) and told consumers to wrap a FILL
+for a bound they now get by default; it now sells the wrapper for STROKES, which are still per-curve.
+`sd_flatten_truncated`'s still called itself "the only witness a starved fill leaves" and said the fill
+returns `SADISH_OK` — false since 0.7.1.
+
+### Verified
+
+All **29** suites pass, plus the new `stroke_oom_test` (153 checks) and `path_cap_test`; `clip_pitch_test`
+106 → 122 and `flatten_bound_test` 304 → 372. `fmt --check` clean, `lint` 0 warnings, `vet` clean,
+`distlib` in sync with no duplicate top-level names. `sadish_version()` → **702**.
+⭐ **A review found a gate regression inside this release**: re-measuring three figures for the new fill
+scope removed the only check on `sd_flatten_quad`'s own per-curve operation, which the STROKER still
+depends on — deleting that operation left all 27 suites green while making identical unwrapped strokes
+paint different pictures. `flatten_bound_test` group P is the replacement gate, and it is a leak
+detector with absolute ink constants rather than a geometry check.
+
+### Still open
+
+- `docs/development/issues/2026-09-15-flatten-keeps-subdividing-…` — items 1 and 2 of its Still-open
+  section: a truncated contour is still FILLED OPEN rather than refused (there is no flag on
+  `SdPolyline`), and a stroke of a starved path reports through the return code but the filing asked for
+  the contour itself to be refused or clearly degraded.
+- `docs/development/proposals/2026-09-15-path-capacity-…` — items 2 and 3: no in-tree adopter
+  (`sd_path_new_cap`'s only callers are two test suites; sadish's own known-size path sites in
+  `src/stroke.cyr` still call `sd_path_new`), and inline `(x, y)` storage instead of `SdPoint` pointers,
+  which the proposal measures at a further 78,656 → 58,672 B and which is an `SdPath` ABI change.
+
 ## [0.7.1] - 2026-09-15 — the repairs rekha filed against 0.7.0
 
 Three filings from the **rekha** team, plus two faults found while closing them. ⛔ Rendering does not
@@ -66,7 +183,7 @@ verb and point blocks were **8 B apart** — the second push wrote off the end. 
 
 ### Fixed — a refused allocation is a return code, not a fault
 
-Closes `docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md`.
+Closes `docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md`.
 Every `sd_alloc` / `alloc` result in `path.cyr`, `geom.cyr`, `raster.cyr`, `present.cyr` and `error.cyr`
 is checked and propagated: constructors return 0, `sd_path_moveto/lineto/quadto/cubicto` return
 `SADISH_ERR_OOM` with the path's verbs, points and contents exactly as they were, and the clip pushes
@@ -271,7 +388,7 @@ fills of grey 200 at a = 10 give 98 against an analytic 110.14. A single layer s
 
 ### Fixed — a clip mask is PACKED `w*h`, on a canvas of any stride
 
-Closes `docs/development/issues/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md`.
+Closes `docs/development/issues/archived/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md`.
 The mask was written `y*w + x` by all three producers and read `py*stride + px` by all three consumers
 (`sd_fill_impl`, `_sd_area_fill`, `_sd_sb_flush`); they now read it packed. ⛔ Byte-identical — every
 canvas `sd_canvas_new` makes has `stride == width`, so no caller can tell.
@@ -290,7 +407,7 @@ Byte-identical on every canvas `sd_canvas_new` makes.
   tree with the same repro: 0.6.0 emitted 8,192 points for 50,200,616 B; 0.7.0 emits all 1,048,577 for
   **83,623,976 B** in **3,133,451** allocations. Truncation is gone; the waste is not. rekha's own note
   anticipated it — "whatever replaces the cap should still bound total flatten work".
-- `docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md`
+- `docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md`
   — `sd_path_new` / `sd_point_new` / `sd_path_flatten` store through unchecked `sd_alloc` results, so a
   hook that refuses faults inside sadish (SIGSEGV, rc 139).
 - `docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md` — `sd_path_new_cap`.
@@ -419,7 +536,7 @@ private row-pointer store; `sd_line` steps the row pointer rather than re-multip
 
 ### Filed
 
-`docs/development/issues/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md` — the
+`docs/development/issues/archived/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md` — the
 clip mask is written `y*w + x` and read `py*stride + px` by the fill, the area engine and the styled
 flush. Unobservable today (every canvas has `stride == w`).
 

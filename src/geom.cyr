@@ -66,7 +66,7 @@ var SD_POINT_SIZE     = 16;
 # ⚠ 0 IS A REAL RETURN VALUE (0.7.1). Through 0.7.0 this stored x/y through an unchecked sd_alloc,
 # so a hook that returns 0 — an arena that ran out is the natural hook the 0.5.5 seam invites —
 # faulted here (SIGSEGV) instead of failing; rekha filed it
-# (docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md).
+# (docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md).
 # Every caller in sadish now tests it: sd_path_moveto/lineto/quadto/cubicto return SADISH_ERR_OOM
 # WITHOUT touching the path, sd_matrix_apply returns 0, the flatten records a truncation.
 fn sd_point_new(x, y): i64 {

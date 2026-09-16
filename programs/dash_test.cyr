@@ -952,8 +952,13 @@ fn main(): i64 {
     sd_grow_limit_set(1);
     sd_alloc_set(&hook_alloc);                   # the cubic's mid-points go to the arena, as ever
     g0 = alloc_used();
+    # ⚠ SADISH_ERR_OOM, AND IT WAS SADISH_OK THROUGH 0.7.1. The dash below keeps a prefix and drops
+    # the rest (152-156 measure exactly that), which is the silent under-draw
+    # docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md
+    # asks the stroke entries to report: a refusal at ANY allocation a stroke reaches is now a
+    # return code. _sd_dash_trunc keeps its own meaning and its own checks, unchanged.
     check(sd_canvas_stroke_path_dash(rc, rv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0),
-      SADISH_OK);                                                 # 150
+      SADISH_ERR_OOM);                                            # 150
     check(alloc_used() - g0, 0);                                  # 151 — nothing allocated
     check(_sd_dash_trunc, 1);                                     # 152 — and recorded
     check(_sd_dash_cap, 16384);                                   # 153 — the block is kept

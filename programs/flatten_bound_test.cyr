@@ -9,7 +9,7 @@
 #      sd_path_flatten cost 83,623,976 B in 3,133,451 allocations for 1,048,577 points.
 #   2. sd_path_new_cap (proposals/2026-09-15-path-capacity-for-known-size-paths.md)
 #   3. CHECKED ALLOCATIONS in path.cyr + geom.cyr
-#      (issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md)
+#      (issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md)
 #
 # ⛔⛔ THE GATE THAT MATTERS MOST IS GROUP B: every path UNDER the budget must flatten to the SAME
 # POINTS IN THE SAME ORDER as 0.7.0. This suite carries 0.7.0's recursion verbatim (ref_quad /
@@ -30,6 +30,13 @@
 # ⭐ GROUP N IS THE SECOND ONE — the same fullness leak measured where M did not look (fill -> fill
 # inside one operation, which blanked every later fill), and the boundary M1's constant was never
 # actually held to. Same rule: every check in it failed before the repair it guards.
+# ⭐ GROUP O IS 0.7.2's CHANGE — sd_fill_impl opens ONE flatten operation for the whole fill instead
+# of one per curve verb, which is the filing's severity case (an untrusted outline's work stayed
+# linear in its curve count). It moves group H's 102/103/104, the only assertions in these suites
+# that this deliberately re-measures.
+# ⭐ GROUP P IS WHAT THAT RE-MEASURE WOULD OTHERWISE HAVE COST: 102/103/104 were the only gate on
+# sd_flatten_quad / sd_flatten_cubic's OWN per-curve operation, which the STROKER still depends on.
+# ⛔ Never re-measure a figure without asking what it was pinning.
 # Exit code = failed checks; each failure prints its check number.
 
 include "src/lib.cyr"
@@ -285,6 +292,20 @@ fn circle_cubic(cx, cy, r): i64 {
     return p;
 }
 
+# The same circle drawn with QUAD verbs, so a group can drive sd_flatten_quad's branch of a caller
+# and sd_flatten_cubic's branch separately. The control points are the corners of the bounding box,
+# so it is a rounded diamond rather than a true circle — it only has to be CURVED.
+fn quad_ring(cx, cy, r): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, cx + r, cy);
+    sd_path_quadto(p, cx + r, cy + r, cx, cy + r);
+    sd_path_quadto(p, cx - r, cy + r, cx - r, cy);
+    sd_path_quadto(p, cx - r, cy - r, cx, cy - r);
+    sd_path_quadto(p, cx + r, cy - r, cx + r, cy);
+    sd_path_close(p);
+    return p;
+}
+
 # grow_edges_test.cyr's cubic_ring: a closed ring of n cubic arcs bulging 3 px out of a 24 px
 # radius — the curve path whose flattening runs furthest in the suites.
 fn cubic_ring(n): i64 {
@@ -340,6 +361,20 @@ fn lines_then_cubic(nlines, bulge): i64 {
     }
     var x0 = nlines * SD_ONE;
     sd_path_cubicto(p, x0 + SD_ONE, bulge, x0 + 2 * SD_ONE, bulge, x0 + 3 * SD_ONE, 0);
+    return p;
+}
+
+# A path full in BOTH arrays at SD_PATH_CAP_MIN: 8 verbs, 8 points, no room for either.
+# ⚠ Group J3 rebuilds one per grant budget. Since 0.7.2 the two arrays grow INDEPENDENTLY, so a
+# verb growth granted under one budget still stands under the next and the following lineto would
+# need fewer allocations than the site the budget is aiming at. Each grant must meet the same path.
+fn full_minpath(): i64 {
+    var p = sd_path_new_cap(0, 0);
+    var i = 0;
+    while (i < SD_PATH_CAP_MIN) {
+        sd_path_lineto(p, i * SD_ONE, 0);
+        i = i + 1;
+    }
     return p;
 }
 
@@ -443,6 +478,41 @@ fn cov_sum(cv): i64 {
         i = i + 1;
     }
     return s;
+}
+
+# Stroke `path` onto `n` fresh 64x64 canvases IN A ROW, each stroke unwrapped, and return how many
+# of those strokes painted something other than `want` or reported sd_flatten_degraded(). 0 is the
+# only acceptable answer at ANY budget the individual curves fit in: the stroker flattens one curve
+# verb at a time and each of those is its own operation, so repeating a stroke cannot change it.
+# ⛔ It is a drift counter, not a spot check, because the failure it exists for is CUMULATIVE — see
+# group P. `n` strokes of a 4-cubic circle spend 16n points if nothing resets the count.
+fn stroke_drift(path, want, n): i64 {
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        var cv = sd_canvas_new(64, 64);
+        sd_canvas_stroke_path(cv, path, 4 * SD_ONE);
+        if (cov_sum(cv) != want) { bad = bad + 1; }
+        if (sd_flatten_degraded() != 0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# The same for the STYLED stroker: _sd_styled_walk (src/stroke.cyr) has its own sd_flatten_quad /
+# sd_flatten_cubic call sites, in a second function, reached only through sd_canvas_stroke_path_ex
+# with a cap/join pair that is not ROUND/ROUND (that one delegates to sd_canvas_stroke_path).
+fn stroke_ex_drift(path, want, n): i64 {
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        var cv = sd_canvas_new(64, 64);
+        sd_canvas_stroke_path_ex(cv, path, 4 * SD_ONE, SD_CAP_BUTT, SD_JOIN_MITER, 4 * SD_ONE);
+        if (cov_sum(cv) != want) { bad = bad + 1; }
+        if (sd_flatten_degraded() != 0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
 }
 
 fn main(): i64 {
@@ -736,9 +806,13 @@ fn main(): i64 {
     check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 8000);    # 96
 
     # ── H) A CONSUMER-SCOPED OPERATION BOUNDS A WHOLE FILL ──────────────
-    # raster.cyr flattens ONE CURVE VERB at a time into a fixed buffer, so each of those calls is
-    # its own operation and a 4,096-curve fill spends the budget 4,096 times over. A consumer that
-    # wants the whole fill bounded says so with sd_flatten_op_begin/end.
+    # raster.cyr flattens ONE CURVE VERB at a time into a fixed buffer. Through 0.7.1 each of those
+    # calls was its own operation, so a 4,096-curve fill spent the budget 4,096 times over and a
+    # consumer that wanted the whole fill bounded had to say so with sd_flatten_op_begin/end.
+    # ⭐ SINCE 0.7.2 THE FILL OPENS THAT OPERATION ITSELF (sd_fill_impl, group O), so the two halves
+    # below now cost the SAME — checks 102/103 hold the unwrapped fill to 105/106's figures, and 104
+    # reads the verdict the unwrapped consumer used to be denied. The wrapped half is still driven
+    # here: wrapping must stay a no-op, not a second budget.
     check(sd_flatten_op_begin(), 1);                                  # 97 — nesting depth
     check(sd_flatten_op_begin(), 2);                                  # 98
     check(sd_flatten_op_end(), 1);                                    # 99
@@ -754,9 +828,12 @@ fn main(): i64 {
     prev = sd_alloc_set(&hook_count);
     sd_canvas_fill_path(hcv2, hpath, SD_FILL_NONZERO);
     sd_alloc_set(prev);
-    check(g_bytes, 16711680);                                         # 102 — 0.7.0: 50,135,040 B
-    check(g_calls, 1044480);                                          # 103 — 0.7.0: 3,133,440
-    check(sd_flatten_degraded(), 0);                                  # 104 — per-curve: never over
+    check(g_bytes, 1044480);                                          # 102 — 0.7.1: 16,711,680 B;
+    #                                                                   0.7.0: 50,135,040
+    check(g_calls, 65280);                                            # 103 — 0.7.1: 1,044,480;
+    #                                                                   0.7.0: 3,133,440
+    check(sd_flatten_degraded(), 1);                                  # 104 — ⭐ AND THE UNWRAPPED
+    #                                                                   CONSUMER IS TOLD (0.7.1: 0)
     var hcv3 = sd_canvas_new(64, 64);
     g_calls = 0;
     g_bytes = 0;
@@ -782,17 +859,17 @@ fn main(): i64 {
     check(cov_sum(hcv4) > 0, 1);                                      # 110
 
     # ── I) sd_path_new_cap ─────────────────────────
-    # ⚠ ONE capacity field governs BOTH arrays, so n_verbs and n_points collapse to their max and
-    # both arrays are opened at it. The 95-glyph figure below is therefore 84,496 B and not the
-    # 78,656 B the proposal computed for separate capacities — 5,840 B (7.4 %) more, against
-    # 5.13x less than sd_path_new. Splitting the capacities is an ABI change to SdPath; the
-    # two-argument signature here is the one that would survive it.
+    # ⭐ 0.7.2: n_verbs sizes the VERB array and n_points the POINT array, each clamped on its own.
+    # Through 0.7.1 one capacity field governed both arrays, so the two arguments collapsed to their
+    # max and the 95-glyph figure below was 84,496 B; it is now the 78,656 B the proposal computed.
+    # The word at +40 was `reserved` (always 0) and is the point capacity — see
+    # programs/path_cap_test.cyr for the split-capacity contract in full.
     var ip = sd_path_new_cap(61, 90);
     check(ip != 0, 1);                                                # 111
-    check(load64(ip + SD_PATH_CAP_OFFSET), 90);                       # 112 — max(61, 90)
+    check(load64(ip + SD_PATH_CAP_OFFSET), 61);                       # 112 — the VERB capacity
     check(sd_path_verb_count(ip), 0);                                 # 113
     check(sd_path_point_count(ip), 0);                                # 114
-    check(load64(ip + SD_PATH_RESERVED_OFFSET), 0);                   # 115 — layout unchanged
+    check(load64(ip + SD_PATH_PCAP_OFFSET), 90);                      # 115 — and the POINT capacity
     check(load64(sd_path_new_cap(0, 0) + SD_PATH_CAP_OFFSET), SD_PATH_CAP_MIN);        # 116
     check(load64(sd_path_new_cap(0 - 9, 0 - 9) + SD_PATH_CAP_OFFSET), SD_PATH_CAP_MIN);  # 117
     check(load64(sd_path_new_cap(3, 2) + SD_PATH_CAP_OFFSET), SD_PATH_CAP_MIN);       # 118 — floor
@@ -827,10 +904,10 @@ fn main(): i64 {
     # reads back identical, verb for verb and point for point.
     var iunder = glyph_into(sd_path_new_cap(1, 1), 0);
     check(glyph_matches(iunder, 0), 1);                               # 127
-    check(load64(iunder + SD_PATH_CAP_OFFSET) >= glyph_npoints(0), 1);  # 128 — it grew to fit
+    check(load64(iunder + SD_PATH_PCAP_OFFSET) >= glyph_npoints(0), 1);  # 128 — it grew to fit
     var iexact = glyph_into(sd_path_new_cap(glyph_nverbs(0), glyph_npoints(0)), 0);
     check(glyph_matches(iexact, 0), 1);                               # 129
-    check(load64(iexact + SD_PATH_CAP_OFFSET), glyph_npoints(0));     # 130 — and never grew
+    check(load64(iexact + SD_PATH_PCAP_OFFSET), glyph_npoints(0));    # 130 — and never grew
     # THE PROPOSAL'S MEASUREMENT: 95 ASCII-shaped paths, 1,768 verbs and 2,498 points in total.
     var itv = 0;
     var itp = 0;
@@ -861,14 +938,17 @@ fn main(): i64 {
     while (ii < 95) {
         var gp = sd_path_new_cap(glyph_nverbs(ii), glyph_npoints(ii));
         glyph_into(gp, ii);
-        if (load64(gp + SD_PATH_CAP_OFFSET) != glyph_npoints(ii)) { igrew = igrew + 1; }
+        if (load64(gp + SD_PATH_CAP_OFFSET) != glyph_nverbs(ii)) { igrew = igrew + 1; }
+        if (load64(gp + SD_PATH_PCAP_OFFSET) != glyph_npoints(ii)) { igrew = igrew + 1; }
         ii = ii + 1;
     }
     sd_alloc_set(prev);
-    check(g_bytes, 84496);                                            # 135 — 5.13x less
-    check(igrew, 0);                                                  # 136 — not one doubling
-    check(95 * 48 + 8 * itv + 8 * itp + 16 * itp, 78656);             # 137 — two-capacity target
-    check(95 * 48 + 16 * itp + 16 * itp, 84496);                      # 138 — what one capacity costs
+    check(g_bytes, 78656);                                            # 135 — 5.51x less (0.7.1:
+    #                                                                   84,496 with one capacity)
+    check(igrew, 0);                                                  # 136 — not one doubling, in
+    #                                                                   either array
+    check(95 * 48 + 8 * itv + 8 * itp + 16 * itp, 78656);             # 137 — and it IS the formula
+    check(95 * 48 + 16 * itp + 16 * itp, 84496);                      # 138 — what one capacity cost
 
     # ── J) A REFUSED ALLOCATION FAILS; IT DOES NOT FAULT ───────────────
     # ⛔ THE POINT OF THIS GROUP IS THAT IT RUNS AT ALL. On 0.7.0 the very first sweep below
@@ -960,18 +1040,15 @@ fn main(): i64 {
     var jcv = sd_canvas_new(8, 8);
     check(sd_canvas_fill_path(jcv, jpath, SD_FILL_NONZERO), SADISH_OK);   # 155
     check(cov_sum(jcv) > 0, 1);                                       # 156
-    # J3. A refusal at the GROWTH: a path exactly at capacity needs 2 array blocks before its
-    # points, so grants 0 and 1 fail in sd_path_grow and 2 in sd_point_new.
-    var jfull = sd_path_new_cap(0, 0);
-    jk = 0;
-    while (jk < SD_PATH_CAP_MIN) {
-        sd_path_lineto(jfull, jk * SD_ONE, 0);
-        jk = jk + 1;
-    }
+    # J3. A refusal at the GROWTH: a path full in BOTH arrays needs 2 array blocks before its points
+    # (one per array since 0.7.2 — one sd_path_grow call each, where 0.7.1 made both in one call),
+    # so grants 0 and 1 fail in sd_path_grow and 2 in sd_point_new.
+    var jfull = full_minpath();
     check(sd_path_point_count(jfull), SD_PATH_CAP_MIN);               # 157 — exactly full
     jk = 0;
     jbad = 0;
     while (jk < 3) {
+        jfull = full_minpath();       # a FRESH full path per grant — see full_minpath's header
         g_grant = jk;
         prev = sd_alloc_set(&hook_grant);
         jr = sd_path_lineto(jfull, 99 * SD_ONE, 0);
@@ -1166,7 +1243,7 @@ fn main(): i64 {
     check(sd_path_quadto(lq, SD_ONE, SD_ONE, 2 * SD_ONE, 2 * SD_ONE), SADISH_OK);   # 214 — usable
     check(sd_path_verb_count(lq), 8);                                 # 215
     check(sd_path_point_count(lq), 9);                                # 216
-    check(load64(lq + SD_PATH_CAP_OFFSET), 16);                       # 217 — it grew for the points
+    check(load64(lq + SD_PATH_PCAP_OFFSET), 16);                      # 217 — it grew for the points
     # L5. A capacity of 0 cannot double its way to anything, so a hand-built record at 0 is REFUSED
     # rather than spun on. (⚠ No public call can produce one — sd_path_new_cap floors at
     # SD_PATH_CAP_MIN — so this pins the guard against a record a consumer built itself.)
@@ -1586,6 +1663,211 @@ fn main(): i64 {
     check(nfc5, 255);                                                 # 302 — and the other is not
     check(nfc6, 0);                                                   # 303 — ⛔ STILL full afterwards
     check(load64(nfctx + 8), 2);                                      # 304 — nothing new got in
+
+    # ── O) THE FILL IS ITSELF ONE FLATTEN OPERATION (0.7.2) ─────────────
+    # ⛔⛔ THE FILING'S SEVERITY CASE, WHICH 0.7.1 LEFT OPEN. The budget bounds an OPERATION, and
+    # through 0.7.1 a fill opened one PER CURVE VERB — so an untrusted outline got a fresh 65,536
+    # points for every curve in it and the fill's work stayed linear in the curve count (group H's
+    # 102/103 were 16,711,680 B in 1,044,480 calls). The consumer had to KNOW to wrap the call.
+    # sd_fill_impl now opens ONE operation for the whole fill, LAZILY, at the first curve it really
+    # flattens — see its header for the measured distribution the default rests on (the largest
+    # legitimate fill in this repo or its glyph corpus spends 40 % of the budget).
+    # Every check below fails on the 0.7.1 scope.
+    var ocv = sd_canvas_new(64, 64);
+    var ocirc = circle_cubic(32 * SD_ONE, 32 * SD_ONE, 20 * SD_ONE);
+    # O1. THE BUDGET NOW SPANS A FILL'S CURVES — the change itself, stated as an observable.
+    # hostile_quads(2) is two maximally non-flat quads, 256 emitted points and 255 allocated
+    # mid-points each (the 256th point is the path's own SdPoint). At a budget of 300 a PER-CURVE
+    # operation can never bite — the count resets at every verb and 256 < 300 — so 0.7.1 allocates
+    # 255 + 255 = 510 and reports nothing. One operation for the fill puts the SECOND curve over the
+    # budget partway through, and the allocation count is where it stopped: MEASURED 302 (and 303 for
+    # the cubic pair below, against 0.7.1's 231 + 231 = 462).
+    check(sd_flatten_op_end(), 0);                                    # 305 — nothing open here
+    check(sd_flatten_budget_set(300), SD_FLATTEN_BUDGET_DEFAULT);     # 306
+    var oq2 = hostile_quads(2);
+    var oqcv = sd_canvas_new(64, 64);
+    sd_canvas_fill_path(oqcv, oq2, SD_FILL_NONZERO);                  # warm the edge list
+    g_calls = 0;
+    g_bytes = 0;
+    prev = sd_alloc_set(&hook_count);
+    sd_canvas_fill_path(oqcv, oq2, SD_FILL_NONZERO);
+    sd_alloc_set(prev);
+    check(g_calls, 302);                                              # 307 — 0.7.1: 510
+    check(sd_flatten_degraded(), 1);                                  # 308 — 0.7.1: 0
+    # ⛔ AND THE CUBIC BRANCH IS A SECOND, INDEPENDENT OPEN. Group H drives quads only; a fill whose
+    # curves are all cubics would walk straight past a guard that exists in the quad branch alone.
+    var ok2 = hostile_cubics(2);
+    var okcv = sd_canvas_new(64, 64);
+    sd_canvas_fill_path(okcv, ok2, SD_FILL_NONZERO);
+    g_calls = 0;
+    prev = sd_alloc_set(&hook_count);
+    sd_canvas_fill_path(okcv, ok2, SD_FILL_NONZERO);
+    sd_alloc_set(prev);
+    check(g_calls, 303);                                              # 309 — 0.7.1: 462
+    check(sd_flatten_degraded(), 1);                                  # 310 — 0.7.1: 0
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 300);     # 311
+    # O2. THE NESTING IS BALANCED. A fill that opens an operation and does not close it leaves the
+    # depth above 0 for ever: every later fill is then nested, nothing resets the point count, and
+    # the budget starts biting fills that never spent it. The depth is observable, so pin it — after
+    # a degraded fill (the path the returns are on) and after a whole one.
+    check(sd_flatten_op_begin(), 1);                                  # 312 — depth 0 before it
+    check(sd_flatten_op_end(), 0);                                    # 313
+    check(sd_canvas_fill_path(ocv, ocirc, SD_FILL_NONZERO), SADISH_OK);   # 314
+    check(sd_flatten_op_begin(), 1);                                  # 315 — and 0 after it too
+    check(sd_flatten_op_end(), 0);                                    # 316
+    # ⛔ AND INSIDE A CONSUMER'S SCOPE THE DEPTH MUST COME BACK TO WHERE IT WAS — one level more
+    # during the fill, exactly the same after it. A close that is not paired with this fill's own
+    # open (dropping the `fop != 0` guard) would end a level the CONSUMER opened, and every check
+    # above still passes: at depth 0 sd_flatten_op_end is a documented no-op.
+    check(sd_flatten_op_begin(), 1);                                  # 317
+    check(sd_flatten_op_begin(), 2);                                  # 318
+    check(sd_canvas_fill_path(ocv, ocirc, SD_FILL_NONZERO), SADISH_OK);   # 319 — a CURVED fill
+    check(sd_flatten_op_end(), 1);                                    # 320 — still 2 deep
+    check(sd_flatten_op_end(), 0);                                    # 321
+    # O3. A LEGITIMATE FILL IS UNTOUCHED — the same ink as with no budget at all, and no verdict.
+    # cubic_ring(3000) is the largest curve path in these suites: 8,600 points in one fill, 13 % of
+    # the default budget.
+    var oring = cubic_ring(3000);
+    var oref1 = sd_canvas_new(64, 64);
+    var oref2 = sd_canvas_new(64, 64);
+    check(sd_flatten_budget_set(0), SD_FLATTEN_BUDGET_DEFAULT);       # 322 — 0.7.1's unbounded
+    sd_canvas_fill_path(oref1, ocirc, SD_FILL_NONZERO);
+    sd_canvas_fill_path(oref2, oring, SD_FILL_NONZERO);
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 0);       # 323
+    var obud1 = sd_canvas_new(64, 64);
+    var obud2 = sd_canvas_new(64, 64);
+    sd_canvas_fill_path(obud1, ocirc, SD_FILL_NONZERO);
+    check(sd_flatten_degraded(), 0);                                  # 324
+    sd_canvas_fill_path(obud2, oring, SD_FILL_NONZERO);
+    check(sd_flatten_degraded(), 0);                                  # 325 — 8,600 of 65,536
+    check(cov_sum(obud1), cov_sum(oref1));                            # 326 — identical ink
+    check(cov_sum(obud2), cov_sum(oref2));                            # 327
+    check(cov_sum(obud1), 312280);                                    # 328 — M6's true picture
+    check(cov_sum(obud2) > 0, 1);                                     # 329
+    # O4. ⚠ A FILL OF A PATH WITH NO CURVE VERBS OPENS NO OPERATION AT ALL, so it leaves whichever
+    # verdict was already standing. That is sd_flatten_degraded()'s documented contract
+    # (src/path.cyr) and the reason the open above is LAZY rather than unconditional — a consumer
+    # that reads the verdict after a draw must not have it wiped by every rectangle in the frame.
+    # ⛔ Re-verified by hand at the 0.7.1 audit and NOT pinned by anything until now: an
+    # unconditional sd_flatten_op_begin at the top of sd_fill_impl passes every other check here.
+    sd_flatten_budget_set(64);
+    sd_path_flatten(hostile_quads(32), TOL);
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 64);      # 330
+    check(sd_flatten_degraded(), 1);                                  # 331 — the standing verdict
+    var olines = sd_path_new();
+    sd_path_moveto(olines, 8 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(olines, 40 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(olines, 40 * SD_ONE, 40 * SD_ONE);
+    sd_path_lineto(olines, 8 * SD_ONE, 40 * SD_ONE);
+    sd_path_close(olines);
+    var olcv = sd_canvas_new(64, 64);
+    check(sd_canvas_fill_path(olcv, olines, SD_FILL_NONZERO), SADISH_OK);   # 332
+    check(cov_sum(olcv), 32 * 32 * 255);                              # 333 — it really filled
+    check(sd_flatten_degraded(), 1);                                  # 334 — ⛔ AND IT SURVIVED
+    # ...and it opens and closes nothing inside a consumer's scope either.
+    check(sd_flatten_op_begin(), 1);                                  # 335
+    check(sd_flatten_op_begin(), 2);                                  # 336
+    check(sd_canvas_fill_path(olcv, olines, SD_FILL_NONZERO), SADISH_OK);   # 337
+    check(sd_flatten_op_end(), 1);                                    # 338 — the consumer's levels
+    check(sd_flatten_op_end(), 0);                                    # 339
+    # ⚠ That depth-0 begin CLEARED the verdict, by sd_flatten_op_begin's own contract — so the next
+    # case needs a fresh one. (Which is the distinction this group is about: an operation clears it,
+    # and a curve-less fill is not an operation.)
+    sd_flatten_budget_set(64);
+    sd_path_flatten(hostile_quads(32), TOL);
+    sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT);
+    # A path whose only curve verbs come BEFORE any moveto is the same case: those verbs are skipped
+    # (they flatten nothing), so the fill still opens nothing.
+    var oskip = sd_path_new();
+    sd_path_quadto(oskip, 4 * SD_ONE, 0, 8 * SD_ONE, 8 * SD_ONE);
+    sd_path_cubicto(oskip, SD_ONE, SD_ONE, 2 * SD_ONE, 2 * SD_ONE, 3 * SD_ONE, 3 * SD_ONE);
+    sd_path_moveto(oskip, 8 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(oskip, 40 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(oskip, 40 * SD_ONE, 40 * SD_ONE);
+    sd_path_lineto(oskip, 8 * SD_ONE, 40 * SD_ONE);
+    sd_path_close(oskip);
+    var oscv = sd_canvas_new(64, 64);
+    check(sd_canvas_fill_path(oscv, oskip, SD_FILL_NONZERO), SADISH_OK);    # 340
+    check(cov_sum(oscv), 32 * 32 * 255);                              # 341 — the square, nothing else
+    check(sd_flatten_degraded(), 1);                                  # 342 — still standing
+    # The other half of the contract: a fill that DOES flatten a curve answers for itself, so it
+    # clears the verdict it inherited.
+    check(sd_canvas_fill_path(ocv, ocirc, SD_FILL_NONZERO), SADISH_OK);    # 343
+    check(sd_flatten_degraded(), 0);                                  # 344
+    # O5. A CONSUMER'S SCOPE STILL WINS — the fill's operation is NESTED inside it, so two fills in
+    # one scope share ONE budget (that is what a consumer opens a scope for). The circle emits 16
+    # points a fill, so at a budget of 20 the first is whole and the second runs out.
+    check(sd_flatten_budget_set(20), SD_FLATTEN_BUDGET_DEFAULT);      # 345
+    var onest1 = sd_canvas_new(64, 64);
+    var onest2 = sd_canvas_new(64, 64);
+    check(sd_flatten_op_begin(), 1);                                  # 346
+    sd_canvas_fill_path(onest1, ocirc, SD_FILL_NONZERO);
+    check(sd_flatten_degraded(), 0);                                  # 347 — 16 of 20
+    sd_canvas_fill_path(onest2, ocirc, SD_FILL_NONZERO);
+    check(sd_flatten_degraded(), 1);                                  # 348 — ⛔ ONE budget for both
+    check(sd_flatten_op_end(), 0);                                    # 349 — and the depth is right
+    check(cov_sum(onest1), 312280);                                   # 350 — the whole one is whole
+    check(cov_sum(onest2) != cov_sum(onest1), 1);                     # 351 — the cut one is cut
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 20);      # 352
+    # O6. AND THE DEGRADED FILL STILL RETURNS SADISH_OK — degrading is not losing. A fill that lost
+    # POINTS is SADISH_ERR_OOM (group M6, unchanged by this scope); a fill that was cut to chords
+    # rendered a picture it can describe, and says so through sd_flatten_degraded() alone.
+    sd_flatten_budget_set(8);
+    var odeg = sd_canvas_new(64, 64);
+    check(sd_canvas_fill_path(odeg, ocirc, SD_FILL_NONZERO), SADISH_OK);   # 353
+    check(sd_flatten_degraded(), 1);                                  # 354
+    check(cov_sum(odeg) != 312280, 1);                                # 355 — a different picture
+    check(cov_sum(odeg) > 0, 1);                                      # 356 — and not a blank one
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 8);       # 357
+    check(sd_flatten_truncated(), 0);                                 # 358 — nothing was LOST
+
+    # ── P) THE STROKER'S PER-CURVE OPERATION SURVIVES GROUP O ───────────
+    # ⛔⛔ WHAT GROUP O MUST NOT TAKE WITH IT. sd_flatten_quad and sd_flatten_cubic each open an
+    # operation of their OWN around one curve (src/path.cyr). sd_path_flatten always opened one
+    # first, and since 0.7.2 sd_fill_impl does too — so those two begins now nest inside somebody
+    # else's everywhere except ONE caller: stroke.cyr, which walks a path one curve verb at a time
+    # and never opens a scope. Nothing else resets _sd_flat_used for an unwrapped stroke.
+    # ⚠ AND CHECKS 102/103/104 WERE THAT PAIR'S ONLY GATE UNTIL NOW. Re-measuring them for the fill
+    # scope took it away: MEASURED on this tree, deleting the begin/end from sd_flatten_quad ALONE
+    # left all 27 suites green, and so did deleting both pairs. This group is what replaces them, and
+    # it drives the quad branch and the cubic branch separately because each carries its own pair —
+    # and each stroker separately, because _sd_styled_walk has its own pair of call sites.
+    # ⛔ THE LEAK IS NOT THEORETICAL: _sd_flat_used would accumulate for the life of the PROCESS, so
+    # identical strokes would paint different pictures. MEASURED at a budget of 64 points, ten
+    # unwrapped strokes of the same 4-cubic circle — 126,930 coverage units every time with the pair;
+    # 126,930 four times and then 114,300 with degraded() = 1 for ever without it.
+    var spcirc = circle_cubic(32 * SD_ONE, 32 * SD_ONE, 20 * SD_ONE);
+    var spquad = quad_ring(32 * SD_ONE, 32 * SD_ONE, 20 * SD_ONE);
+    check(sd_flatten_budget_set(64), SD_FLATTEN_BUDGET_DEFAULT);      # 359 — 4 strokes' worth
+    check(stroke_drift(spcirc, 126930, 10), 0);                       # 360 — cubic, plain stroker
+    check(stroke_drift(spquad, 131040, 10), 0);                       # 361 — quad, plain stroker
+    check(stroke_ex_drift(spcirc, 127232, 10), 0);                    # 362 — cubic, styled walk
+    check(stroke_ex_drift(spquad, 132120, 10), 0);                    # 363 — quad, styled walk
+    # ⛔ AND THE BUDGET REALLY IS SPENDABLE AT 64 — without this the four checks above would pass on
+    # a stroker that could not degrade at all. A consumer's scope still wins over the per-curve one:
+    # the same stroke repeated inside ONE operation shares one budget, 16 points at a time, so the
+    # fifth is cut. That is the contract sd_flatten_op_begin's header sells, measured.
+    check(sd_flatten_op_begin(), 1);                                  # 364
+    var spw1 = sd_canvas_new(64, 64);
+    sd_canvas_stroke_path(spw1, spcirc, 4 * SD_ONE);
+    check(cov_sum(spw1), 126930);                                     # 365 — the whole picture
+    check(sd_flatten_degraded(), 0);                                  # 366 — 16 points of 64
+    var spn = 0;
+    while (spn < 3) {                                                 # strokes 2-4 spend the rest
+        var spcv = sd_canvas_new(64, 64);
+        sd_canvas_stroke_path(spcv, spcirc, 4 * SD_ONE);
+        spn = spn + 1;
+    }
+    var spw5 = sd_canvas_new(64, 64);
+    sd_canvas_stroke_path(spw5, spcirc, 4 * SD_ONE);
+    check(cov_sum(spw5), 114300);                                     # 367 — ⛔ the 5th is CHORDS
+    check(sd_flatten_degraded(), 1);                                  # 368
+    check(sd_flatten_op_end(), 0);                                    # 369 — and the depth is right
+    check(sd_flatten_budget_set(SD_FLATTEN_BUDGET_DEFAULT), 64);      # 370
+    var spfull = sd_canvas_new(64, 64);
+    sd_canvas_stroke_path(spfull, spcirc, 4 * SD_ONE);
+    check(cov_sum(spfull), 126930);                                   # 371 — and unbudgeted it is
+    check(sd_flatten_degraded(), 0);                                  # 372   the same whole picture
 
     if (g_fails == 0) {
         var ok = "flatten_bound_test: PASS (mid-points, the bound, sd_path_new_cap, checked allocs)\n";

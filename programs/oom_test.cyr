@@ -4,7 +4,7 @@
 # natural one to install is a per-frame arena — which can RUN OUT. Through 0.7.0 a refusal inside
 # the clip pushes, the PPM sink, the presenter and the error record was a null-pointer STORE:
 # rekha's filing measured `sd_path_moveto` on a one-block budget dying with SIGSEGV, rc 139
-# (docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md).
+# (docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md).
 # This suite drives a FAILING hook in two modes — grant the first K and refuse the rest, or refuse
 # only the K-th — and sweeps K so that each site in this half of the filing is the failing one in turn.
 #

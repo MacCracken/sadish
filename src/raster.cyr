@@ -39,7 +39,7 @@ var SD_AA_AREA        = 1;
 # the three consumers read it packed too (sd_fill_impl, _sd_area_fill, _sd_sb_flush). Byte-identical
 # on every canvas sd_canvas_new makes, where stride == width — the gate is programs/clip_pitch_test.cyr,
 # which hand-builds the header sd_canvas_new cannot. Closed
-# docs/development/issues/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md.
+# docs/development/issues/archived/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md.
 # ⚠ The canvas was 40 bytes through 0.5.5. Nothing in dhancha, rekha or agnos builds one by hand
 # (checked by grep) — sd_canvas_new is the only constructor. But every canvas — and the temp mask
 # canvas behind each sd_canvas_clip_push_path — now costs 8 B more on sd_alloc, which moves exact
@@ -298,7 +298,9 @@ fn _sd_grow_alloc(n): i64 {
 # success publishes ALL ELEVEN globals (checks 128-138). And the shape a missing test would
 # produce — a 0 published behind a status of 1 — cannot reach a store, because sd_fill_impl guards
 # on _sd_fill_ectx itself rather than on this status.
-# ⚠ The callers in stroke.cyr / dash.cyr discard this status, as they did when it was always 0; on
+# ⚠ The callers in stroke.cyr / dash.cyr discard this status too, and guard on the block they store
+# through (_sd_stroke_run) exactly as sd_fill_impl guards on _sd_fill_ectx: since 0.7.2 all three
+# stroke entry points return SADISH_ERR_OOM for a refused scratch instead of storing into it. On
 # this allocator a failure here means the process could not get 262,144 B and is over before it.
 fn _sd_scratch_init(): i64 {
     if (_sd_fill_ectx != 0) { return 1; }
@@ -397,9 +399,9 @@ fn _sd_fill_edges_grow(ectx): i64 {
 # the fill of it SIGSEGVs, rc 139, and with the store moved past it the following 8x8 fill does.
 # Now the refusal is reported, sd_fill_impl returns SADISH_ERR_OOM having touched no coverage, and
 # every later fill still has the accumulator it had (programs/oom_test.cyr group H).
-# ⚠ THE CALLER IN stroke.cyr (the styled span walk) STILL DOES NOT TEST THIS 0 — it faults on a
-# refusal exactly as it did through 0.7.0, and that file is out of this change's scope. What it no
-# longer does is fault on the NEXT, perfectly ordinary fill.
+# ⚠ THE OTHER CALLER — stroke.cyr's styled span walk (_sd_sb_flush) — tests this 0 since 0.7.2 and
+# returns SADISH_ERR_OOM out of all three stroke entry points; it faulted on a refusal through
+# 0.7.1, which is what this note used to record (programs/stroke_oom_test.cyr group F).
 fn _sd_fill_accrow_for(w): i64 {
     if (w <= _sd_fill_accrow_cap) { return _sd_fill_accrow; }
     var blk = alloc(w * 8);
@@ -594,8 +596,10 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     # ⚠ The flag is RESTORED for the caller afterwards (sd_flatten_truncated() is documented as sticky
     # until the next sd_path_flatten), so scoping it here cannot swallow a verdict the caller was
     # already holding.
-    # ⚠ Strokes are NOT covered by this return: the styled path has its own flush and the round stroker
-    # discards sd_canvas_fill_union's result, so sd_flatten_truncated() remains their only witness.
+    # ⚠ Strokes were NOT covered by this return through 0.7.1 — the styled path has its own flush and
+    # the round stroker discarded sd_canvas_fill_union's result, so a starved stroke returned
+    # SADISH_OK over a partial picture. Since 0.7.2 each stroke entry scopes the verdict the same way
+    # and returns SADISH_ERR_OOM itself (src/stroke.cyr's refusal block).
     # ⛔ A DRAWING VERB BEFORE ANY MOVETO IS SKIPPED, not drawn from (0, 0). `cur` is an SdPoint
     # POINTER, 0 until the first moveto, and every drawing verb dereferences it — so a path whose first
     # verb is a lineto/quadto/cubicto used to fault the process (MEASURED on 0.7.0 and 0.6.0 alike:
@@ -603,8 +607,42 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     # verbs (their points are still consumed, so the verb/point streams stay in step) until a moveto
     # arrives. ⚠ 0.7.1 made this easy to reach: a refused sd_path_moveto now returns SADISH_ERR_OOM
     # with the path untouched, so a caller that logs and carries on builds exactly this path.
+    # ⛔⛔ ONE FLATTEN OPERATION FOR THE WHOLE FILL (0.7.2) — the budget bounds this CALL, not one
+    # curve of it. 0.7.1 gave sd_path_flatten a per-operation budget in points
+    # (SD_FLATTEN_BUDGET_DEFAULT = 65,536, src/path.cyr) and left the fill flattening ONE CURVE VERB
+    # at a time into fbuf, each call its own operation — so an untrusted outline got one budget PER
+    # CURVE and the fill's work stayed linear in the curve count, which is the severity case of
+    # docs/development/issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md
+    # (rekha → dhancha → crab fill glyph outlines from font files, every frame). MEASURED on the
+    # filing's own repro, 4,096 maximally non-flat quads filled on 64x64: 16,711,680 B in 1,044,480
+    # sd_alloc calls per curve-scoped fill, 1,044,480 B in 65,280 with the fill scoped — 16x, and it
+    # no longer grows with the curve count (1,024 quads costs the same as 4,096). A consumer had to
+    # KNOW to wrap the call in sd_flatten_op_begin/_end to get that; now it is the default, and
+    # sd_flatten_degraded() answers for the fill itself.
+    # ⚠ THE TRADE, AND THE MEASUREMENTS IT RESTS ON: a path whose ONE fill emits more than the budget
+    # now degrades its remaining curves to CHORDS mid-fill (and says so) where it used to tessellate
+    # them whole. Points emitted by one fill, MEASURED on this tree at the fill's own tolerance
+    # (SD_ONE >> 2) — sd_alloc calls under a counting hook plus one path-owned endpoint per curve:
+    #   a circle of 4 cubics, radius 8 px to 4,096 px               16 →    256
+    #   a rounded rect, 200x100 r=16 to 1920x1080 r=240             16 →     64
+    #   a 64-cubic blob at radius 1,024 px                                1,536
+    #   the curve paths of these suites (area, stroke_style, mixed)  14 →     26
+    #   grow_edges_test's cubic_ring(3000), the largest suite path        8,600
+    #   one synthetic ASCII glyph, ~13 px em to ~2,048 px em         60 →    960
+    #   all 95 of them as ONE path (a whole label, one fill)      2,396 → 26,394
+    # ⇒ The largest legitimate fill anywhere in this repo or its glyph corpus spends 40 % of the
+    # budget, the largest single glyph 1.5 %, a UI shape under 3 %. The default degrades a
+    # ONE-PATH label at about 1,889 glyphs at a 32 px em, 649 at 208 px, 236 at 2,048 px — per PATH,
+    # not per draw, and a consumer that really fills such a path raises sd_flatten_budget_set (0 =
+    # unbounded, 0.7.1's behaviour) and reads sd_flatten_degraded() to know it mattered.
+    # ⛔ THE OPERATION OPENS LAZILY, AT THE FIRST CURVE THIS FILL ACTUALLY FLATTENS, and that is not
+    # tidiness: sd_flatten_degraded()'s contract (src/path.cyr) is that a fill of a path with NO
+    # curve verbs opens no operation and leaves whichever verdict was already standing. Opening
+    # unconditionally here would clear a consumer's verdict on every rectangle it draws. Gated by
+    # programs/flatten_bound_test.cyr group O.
     var flat_was = _sd_flat_trunc;      # the caller's standing verdict, restored below
     _sd_flat_trunc = 0;                 # scoped: from here it means "THIS fill lost points"
+    var fop = 0;                        # 1 once this fill has opened its flatten operation
     var verbs = load64(path + SD_PATH_VERBS_OFFSET);
     var points = load64(path + SD_PATH_POINTS_OFFSET);
     var cur = 0;
@@ -640,6 +678,10 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
             if (qe != 0) {
+                if (fop == 0) {
+                    sd_flatten_op_begin();
+                    fop = 1;
+                }
                 sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
                 cur = sd_fill_edges_from(ectx, fctx, cur);
                 sub_open = 1;
@@ -655,6 +697,10 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
             if (ke != 0) {
+                if (fop == 0) {
+                    sd_flatten_op_begin();
+                    fop = 1;
+                }
                 sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
                 cur = sd_fill_edges_from(ectx, fctx, cur);
                 sub_open = 1;
@@ -670,6 +716,10 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
         }
         vi = vi + 1;
     }
+    # The walk is over, so the last flatten has happened: close the operation the first curve opened.
+    # ⚠ Nothing between the open and here returns, so the nesting depth cannot leak (the returns that
+    # DO exist — an empty edge list, a refused accumulator, the AREA dispatch — are all below).
+    if (fop != 0) { sd_flatten_op_end(); }
     if (sub_open != 0) {
         sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
     }
@@ -1114,9 +1164,9 @@ fn sd_canvas_clip_pop(cv): i64 {
 
 # ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
-# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700; 0.7.1 -> 701.
+# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700; 0.7.1 -> 701; 0.7.2 -> 702.
 # ================================================================
 # @public
 fn sadish_version(): i64 {
-    return 701;
+    return 702;
 }

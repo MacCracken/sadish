@@ -36,7 +36,7 @@ enum SadishErrCode {
 # second one to handle: it may pass this result straight to the accessors without a null check.
 # Through 0.7.0 the store was unchecked — a hook that can refuse (the 0.5.5 seam's natural arena)
 # made this a null-pointer store, which is what rekha filed
-# (docs/development/issues/2026-09-15-path-construction-stores-through-a-refused-allocation.md).
+# (docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md).
 fn sadish_err_new(code, detail): i64 {
     var e = sd_alloc(16);
     if (e == 0) { return 0; }

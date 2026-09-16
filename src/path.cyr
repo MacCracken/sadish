@@ -6,13 +6,14 @@
 # builds; the rasterizer (raster.cyr) consumes the FLATTENED polyline the
 # curve verbs expand into.
 #
-# Storage model: two bump-allocated arrays sized at construction. Verbs
-# are one i64 each; points are SdPoint pointers (one i64 each). A quadto
-# consumes 2 points (control, end); a cubicto 3 (c1, c2, end); moveto and
-# lineto 1 (the target); close 0. Storage is unbounded as of v0.4.0 —
-# sd_path_grow doubles both arrays on overflow; SD_PATH_CAP is only the
-# initial allocation, and sd_path_new_cap (0.7.1) opens the two arrays at a
-# size the caller already knows.
+# Storage model: two bump-allocated arrays sized at construction, EACH
+# WITH ITS OWN CAPACITY (0.7.2). Verbs are one i64 each; points are SdPoint
+# pointers (one i64 each). A quadto consumes 2 points (control, end); a
+# cubicto 3 (c1, c2, end); moveto and lineto 1 (the target); close 0.
+# Storage is unbounded as of v0.4.0 — sd_path_grow doubles ONE array, the
+# one that overflowed (0.7.2; through 0.7.1 it doubled both); SD_PATH_CAP is
+# only sd_path_new's initial allocation, and sd_path_new_cap (0.7.1) opens
+# each array at the size the caller already knows.
 
 # ---- verb tags --------------------------------------------------
 var SD_VERB_MOVETO = 0;
@@ -21,8 +22,8 @@ var SD_VERB_QUADTO = 2;
 var SD_VERB_CUBICTO = 3;
 var SD_VERB_CLOSE  = 4;
 
-# Initial capacity for both the verb and point arrays; sd_path_grow doubles
-# them on overflow (v0.4.0), so this is just the first allocation size.
+# sd_path_new's initial capacity for the verb AND the point array; each doubles on its own overflow
+# (v0.4.0), so this is just the first allocation size.
 var SD_PATH_CAP = 256;
 
 # The floor sd_path_new_cap clamps to, so a path asked for at 0 (or a negative estimate) still
@@ -44,44 +45,68 @@ var SD_PATH_CAP_MIN = 8;
 var SD_PATH_CAP_MAX = 268435456;
 
 # ================================================================
-# SdPath (48 bytes):
-#   +0:  verbs      (ptr — array of SD_PATH_CAP i64 verb tags)
+# SdPath (48 bytes — the same 48 B since 0.4.0):
+#   +0:  verbs      (ptr — array of `vcap` i64 verb tags)
 #   +8:  n_verbs    (i64 — verb count)
-#   +16: points     (ptr — array of SD_PATH_CAP i64 SdPoint ptrs)
+#   +16: points     (ptr — array of `pcap` i64 SdPoint ptrs)
 #   +24: n_points   (i64 — point count)
-#   +32: cap        (i64 — capacity, in verbs and points)
-#   +40: reserved   (i64 — 0; future flags: subpath-open, bounds-cached)
+#   +32: vcap       (i64 — the VERB array's capacity)
+#   +40: pcap       (i64 — the POINT array's capacity)
 # ================================================================
-var SD_PATH_VERBS_OFFSET    = 0;
-var SD_PATH_NVERBS_OFFSET   = 8;
-var SD_PATH_POINTS_OFFSET   = 16;
-var SD_PATH_NPOINTS_OFFSET  = 24;
-var SD_PATH_CAP_OFFSET      = 32;
-var SD_PATH_RESERVED_OFFSET = 40;
-var SD_PATH_SIZE            = 48;
+# ⛔⛔ +40 WAS `reserved` THROUGH 0.7.1, AND IS THE POINT ARRAY'S CAPACITY FROM 0.7.2. That word was
+# written 0 by every constructor and read by NOTHING — so no record any consumer holds changed
+# meaning and the record is still 48 B. The name SD_PATH_RESERVED_OFFSET is GONE rather than
+# aliased: a constant that says "reserved" pointing at a live capacity is the trap, not the fix.
+# ⚠ THE SWEEP THAT SAYS SO, AND THE COMPLETE SET OF PLACES A STALE COPY LIVES (re-run 2026-09-16):
+# src/, programs/, rekha, dhancha, agnos, and the TWO repos that vendor dist/sadish.cyr wholesale —
+# crab AND puka (puka/lib/sadish.cyr:925 still carries 0.7.1's SD_PATH_RESERVED_OFFSET; puka's own
+# src/, programs/ and tests/ name no SD_PATH_* constant and call no sd_path_* function, and its
+# cyrius.cyml declares no sadish dep, so the copy is inert). Outside this repo the only SD_PATH_*
+# READS anywhere are SD_PATH_VERBS_OFFSET / SD_PATH_POINTS_OFFSET in five rekha test programs, and
+# no repo calls sd_path_grow — whose arity changed here — at all.
+# ⚠ ONE SHAPE DOES CHANGE: a record a consumer HAND-BUILT to the 0.7.1 layout carries 0 at +40, and
+# a 0 point capacity is refused (SADISH_ERR_OOM from _sd_path_reserve / sd_path_push_point) rather
+# than written through — the safe direction, and the reason both capacities are 0-checked. Nothing
+# in this repo or in any of those five repos hand-builds one; sd_path_new / sd_path_new_cap are the
+# only constructors.
+var SD_PATH_VERBS_OFFSET   = 0;
+var SD_PATH_NVERBS_OFFSET  = 8;
+var SD_PATH_POINTS_OFFSET  = 16;
+var SD_PATH_NPOINTS_OFFSET = 24;
+var SD_PATH_CAP_OFFSET     = 32;
+var SD_PATH_PCAP_OFFSET    = 40;
+var SD_PATH_SIZE           = 48;
 
-# An empty SdPath whose verb and point arrays hold `cap` entries each. 0 if ANY of the three
+# Which array sd_path_grow doubles.
+var SD_PATH_GROW_VERBS  = 0;
+var SD_PATH_GROW_POINTS = 1;
+
+# An empty SdPath whose verb array holds `vcap` entries and whose point array holds `pcap` — the
+# two are INDEPENDENT (0.7.2; through 0.7.1 one `cap` sized both). 0 if ANY of the three
 # allocations is refused — record, verbs and points, in that order (0.7.1; through 0.7.0 only the
 # record was checked and a refused verb array was stored as 0, which the first sd_path_moveto then
 # wrote through: SIGSEGV, rekha's filing). An earlier block of a failed path is abandoned; the
 # allocator sadish draws from has no free().
-# ⛔ The capacity is bounded BEFORE the multiply — see SD_PATH_CAP_MAX. `cap * 8` on an
+# ⛔ BOTH capacities are bounded BEFORE either multiply — see SD_PATH_CAP_MAX. `cap * 8` on an
 # unrepresentable capacity wraps to a small block the first pushes then run off the end of, and no
-# 0-check can see that: both allocations SUCCEED.
-fn _sd_path_alloc(cap): i64 {
-    if (cap > SD_PATH_CAP_MAX) { return 0; }
+# 0-check can see that: both allocations SUCCEED. ⚠ The two ceiling tests run before the FIRST
+# sd_alloc, so an over-ceiling point capacity costs zero allocations even though the verb array is
+# allocated first (programs/path_cap_test.cyr counts them).
+fn _sd_path_alloc(vcap, pcap): i64 {
+    if (vcap > SD_PATH_CAP_MAX) { return 0; }
+    if (pcap > SD_PATH_CAP_MAX) { return 0; }
     var p = sd_alloc(SD_PATH_SIZE);
     if (p == 0) { return 0; }
-    var verbs = sd_alloc(cap * 8);
+    var verbs = sd_alloc(vcap * 8);
     if (verbs == 0) { return 0; }
-    var points = sd_alloc(cap * 8);
+    var points = sd_alloc(pcap * 8);
     if (points == 0) { return 0; }
     store64(p + SD_PATH_VERBS_OFFSET, verbs);
     store64(p + SD_PATH_NVERBS_OFFSET, 0);
     store64(p + SD_PATH_POINTS_OFFSET, points);
     store64(p + SD_PATH_NPOINTS_OFFSET, 0);
-    store64(p + SD_PATH_CAP_OFFSET, cap);
-    store64(p + SD_PATH_RESERVED_OFFSET, 0);
+    store64(p + SD_PATH_CAP_OFFSET, vcap);
+    store64(p + SD_PATH_PCAP_OFFSET, pcap);
     return p;
 }
 
@@ -90,39 +115,42 @@ fn _sd_path_alloc(cap): i64 {
 # alloc_test pins a small path at 4,192 B — this plus three SdPoints). A caller that knows the
 # path's size should use sd_path_new_cap instead.
 fn sd_path_new(): i64 {
-    return _sd_path_alloc(SD_PATH_CAP);
+    return _sd_path_alloc(SD_PATH_CAP, SD_PATH_CAP);
 }
 
 # @public — allocate an empty path sized for `n_verbs` verbs and `n_points` points, so a caller
 # that knows the shape ahead of the first moveto never pays a doubling. Returns 0 if any
 # allocation is refused.
 #
-# ⚠ ONE CAPACITY, TWO ARRAYS — n_verbs AND n_points COLLAPSE TO THEIR MAX. SdPath has a single
-# SD_PATH_CAP_OFFSET field governing both arrays (see the record above), so the capacity opened is
-# max(n_verbs, n_points, SD_PATH_CAP_MIN) and BOTH arrays are allocated at it. A TrueType contour
-# of n points emits at most n + 1 verbs and 2n + 1 points, so a glyph pays about 2x more verb slots
-# than it uses. The two-argument SIGNATURE is the shape rekha asked for and the shape a future
-# split-capacity record would keep, so no call site changes if sadish ever separates them.
+# ⭐⭐ TWO CAPACITIES, TWO ARRAYS (0.7.2) — n_verbs sizes the verb array and n_points the point
+# array, each clamped on its own into [SD_PATH_CAP_MIN, SD_PATH_CAP_MAX]. ⚠ Through 0.7.1 the two
+# arguments COLLAPSED TO THEIR MAX because one field sized both arrays; a glyph therefore bought
+# about 2x more verb slots than it uses, since a TrueType contour of n points emits at most n + 1
+# verbs and 2n + 1 points. The signature did not change — a 0.7.1 call site is already correct.
 # MEASURED (95 ASCII-shaped paths — 1,768 verbs, 2,498 points, largest glyph 61 verbs — built
-# through sd_path_moveto/lineto/quadto/close on the seam, programs/flatten_bound_test.cyr):
-#   sd_path_new()                        433,648 B   (95 x 4,144 of arrays + 2,498 x 16 of points)
-#   sd_path_new_cap(v, p), one capacity   84,496 B   = 5.13x less
-#   the same at SEPARATE capacities        78,656 B   = 5.51x less — 5,840 B (7.4 %) below the one-
-#                                                      capacity figure, and an ABI change away
-# ⭐ NOT a cap: an underestimate is still correct. sd_path_grow doubles both arrays exactly as it
-# does for sd_path_new, so a path asked for at 4 that takes 300 points ends up where it would have
-# ended up anyway — it just pays for the doublings.
-# ⚠ 0 or negative for either argument contributes nothing, and a capacity below SD_PATH_CAP_MIN = 8
-# is raised to it: sd_path_new_cap(0, 0) is a valid 8-entry path, not an error and not a 256-entry
-# one.
-# ⛔ AND THE OTHER END IS REFUSED, NOT CLAMPED: a capacity above SD_PATH_CAP_MAX = 2^28 returns 0.
-# That is the ceiling `cap * 8` stays representable and servable under (see SD_PATH_CAP_MAX) — a
+# through sd_path_moveto/lineto/quadto/close on the allocation seam, programs/path_cap_test.cyr):
+#   sd_path_new()                         433,648 B   (95 x 4,144 of arrays + 2,498 x 16 of points)
+#   sd_path_new_cap, ONE capacity (0.7.1)  84,496 B   = 5.13x less
+#   sd_path_new_cap, two capacities (here) 78,656 B   = 5.51x less — 5,840 B (6.9 %) below 0.7.1,
+#                                                       and the figure the proposal asked for
+# = 95 x 48 (records) + 8 x 1,768 (verbs) + 8 x 2,498 (point slots) + 16 x 2,498 (the SdPoints).
+# ⚠ 39,968 of those 78,656 B are the SdPoints themselves: SdPath stores POINTERS to 16 B SdPoints.
+# Inline (x, y) storage would take the same set to 58,672 B — 19,984 B less again — and is an ABI
+# change to SdPath that 0.7.2 does not make.
+# ⭐ NOT a cap: an underestimate is still correct. Each array doubles on its own overflow exactly as
+# it does for sd_path_new, so a path asked for at 4 that takes 300 points ends up where it would
+# have ended up anyway — it just pays for the doublings, and only in the array that overflowed.
+# ⚠ 0 or negative for either argument is raised to SD_PATH_CAP_MIN = 8 — INDEPENDENTLY, so
+# sd_path_new_cap(61, 0) is a 61-verb, 8-point path, not an error and not a 256-entry one.
+# ⛔ AND THE OTHER END IS REFUSED, NOT CLAMPED: EITHER capacity above SD_PATH_CAP_MAX = 2^28 returns
+# 0. That is the ceiling `cap * 8` stays representable and servable under (see SD_PATH_CAP_MAX) — a
 # count read out of a file is exactly the shape of argument that reaches 2^61 and wraps.
 fn sd_path_new_cap(n_verbs, n_points): i64 {
-    var cap = n_verbs;
-    if (n_points > cap) { cap = n_points; }
-    if (cap < SD_PATH_CAP_MIN) { cap = SD_PATH_CAP_MIN; }
-    return _sd_path_alloc(cap);
+    var vcap = n_verbs;
+    if (vcap < SD_PATH_CAP_MIN) { vcap = SD_PATH_CAP_MIN; }
+    var pcap = n_points;
+    if (pcap < SD_PATH_CAP_MIN) { pcap = SD_PATH_CAP_MIN; }
+    return _sd_path_alloc(vcap, pcap);
 }
 
 # ---- accessors --------------------------------------------------
@@ -130,37 +158,58 @@ fn sd_path_new_cap(n_verbs, n_points): i64 {
 fn sd_path_verb_count(path): i64  { return load64(path + SD_PATH_NVERBS_OFFSET); }
 # @public
 fn sd_path_point_count(path): i64 { return load64(path + SD_PATH_NPOINTS_OFFSET); }
+# @public — how many verbs the verb array can hold before it doubles (0.7.2). sd_path_new() reports
+# SD_PATH_CAP; sd_path_new_cap(v, p) reports v clamped into [SD_PATH_CAP_MIN, SD_PATH_CAP_MAX].
+fn sd_path_verb_cap(path): i64  { return load64(path + SD_PATH_CAP_OFFSET); }
+# @public — how many points the point array can hold before it doubles (0.7.2). This is the word at
+# +40 that was `reserved` through 0.7.1 — see the record layout above.
+fn sd_path_point_cap(path): i64 { return load64(path + SD_PATH_PCAP_OFFSET); }
 
-# Double both the verb and point arrays (copying live entries). Returns
-# SADISH_OK, or SADISH_ERR_OOM if the larger allocation fails.
+# Double ONE of the two arrays — `which` is SD_PATH_GROW_VERBS or SD_PATH_GROW_POINTS — copying its
+# live entries. Returns SADISH_OK, or SADISH_ERR_OOM if the allocation fails.
+# ⭐ ONE ARRAY, ONE ALLOCATION (0.7.2). Through 0.7.1 this doubled BOTH arrays whichever one
+# overflowed, so a path whose points outran its verbs bought verb slots it had no verbs for. The
+# overflowing array now doubles alone and the other one does not move — which is what makes
+# sd_path_new_cap's two capacities survive the first growth.
+# ⛔ THE COPY LENGTH COMES FROM THE SAME ARRAY'S OWN LIVE COUNT (`n_off` below), AND THE VERB HALF IS
+# THE QUIET ONE. n_verbs and n_points differ on every path whose verbs outnumber its points — a
+# default path holding 256 closes and no points at all is the extreme — and a verb copy taken from
+# n_points instead moves the wrong number of bytes into a FRESH block, where each missing verb reads
+# back as 0 = SD_VERB_MOVETO rather than faulting the way a missing SdPoint pointer does. MEASURED
+# with exactly that one-word mutation: 26 of the 28 suites still passed — only
+# programs/area_test.cyr (#131: 6,205 of 7,800 coverage units) and programs/grow_edges_test.cyr
+# (SIGSEGV) caught it. programs/path_cap_test.cyr groups E3, E4 and G read the verb array back after
+# a growth for this reason; they are the only paths in the suites whose verbs outnumber their points.
 # ⛔ A capacity past SD_PATH_CAP_MAX / 2 cannot double — `newcap * 8` would be unrepresentable (see
 # SD_PATH_CAP_MAX) — so the doubling is REFUSED rather than wrapped into a small block. Unreachable
-# from sadish's own constructors, which bound the capacity at SD_PATH_CAP_MAX; this holds for a
+# from sadish's own constructors, which bound both capacities at SD_PATH_CAP_MAX; this holds for a
 # record a consumer wrote a capacity into itself.
-fn sd_path_grow(path): i64 {
-    var cap = load64(path + SD_PATH_CAP_OFFSET);
+fn sd_path_grow(path, which): i64 {
+    var cap_off = SD_PATH_CAP_OFFSET;
+    var arr_off = SD_PATH_VERBS_OFFSET;
+    var n_off = SD_PATH_NVERBS_OFFSET;
+    if (which == SD_PATH_GROW_POINTS) {
+        cap_off = SD_PATH_PCAP_OFFSET;
+        arr_off = SD_PATH_POINTS_OFFSET;
+        n_off = SD_PATH_NPOINTS_OFFSET;
+    }
+    var cap = load64(path + cap_off);
     if (cap > SD_PATH_CAP_MAX / 2) { return SADISH_ERR_OOM; }
     var newcap = cap * 2;
-    var nv = sd_alloc(newcap * 8);
-    if (nv == 0) { return SADISH_ERR_OOM; }
-    var np = sd_alloc(newcap * 8);
-    if (np == 0) { return SADISH_ERR_OOM; }
-    var nverbs = load64(path + SD_PATH_NVERBS_OFFSET);
-    var npoints = load64(path + SD_PATH_NPOINTS_OFFSET);
-    memcpy(nv, load64(path + SD_PATH_VERBS_OFFSET), nverbs * 8);
-    memcpy(np, load64(path + SD_PATH_POINTS_OFFSET), npoints * 8);
-    store64(path + SD_PATH_VERBS_OFFSET, nv);
-    store64(path + SD_PATH_POINTS_OFFSET, np);
-    store64(path + SD_PATH_CAP_OFFSET, newcap);
+    var blk = sd_alloc(newcap * 8);
+    if (blk == 0) { return SADISH_ERR_OOM; }
+    memcpy(blk, load64(path + arr_off), load64(path + n_off) * 8);
+    store64(path + arr_off, blk);
+    store64(path + cap_off, newcap);
     return SADISH_OK;
 }
 
-# Append one verb tag, growing the backing store if full. Returns SADISH_OK
-# (or SADISH_ERR_OOM only if a grow allocation fails).
+# Append one verb tag, growing the VERB array if it is full. Returns SADISH_OK
+# (or SADISH_ERR_OOM only if that grow allocation fails).
 fn sd_path_push_verb(path, verb): i64 {
     var n = load64(path + SD_PATH_NVERBS_OFFSET);
     if (n >= load64(path + SD_PATH_CAP_OFFSET)) {
-        var g = sd_path_grow(path);
+        var g = sd_path_grow(path, SD_PATH_GROW_VERBS);
         if (g != SADISH_OK) { return g; }
     }
     store64(load64(path + SD_PATH_VERBS_OFFSET) + n * 8, verb);
@@ -168,11 +217,11 @@ fn sd_path_push_verb(path, verb): i64 {
     return SADISH_OK;
 }
 
-# Append one SdPoint ptr, growing the backing store if full.
+# Append one SdPoint ptr, growing the POINT array if it is full.
 fn sd_path_push_point(path, pt): i64 {
     var n = load64(path + SD_PATH_NPOINTS_OFFSET);
-    if (n >= load64(path + SD_PATH_CAP_OFFSET)) {
-        var g = sd_path_grow(path);
+    if (n >= load64(path + SD_PATH_PCAP_OFFSET)) {
+        var g = sd_path_grow(path, SD_PATH_GROW_POINTS);
         if (g != SADISH_OK) { return g; }
     }
     store64(load64(path + SD_PATH_POINTS_OFFSET) + n * 8, pt);
@@ -189,28 +238,39 @@ fn sd_path_push_point(path, pt): i64 {
 # POINTS AND CONTENTS exactly as they were, and the path is still usable: the next call may
 # succeed.
 # ⚠ EXACTLY WHAT "UNCHANGED" COVERS, AND WHAT IT DOES NOT. (1) runs BEFORE (2), so a refusal at the
-# SdPoint can leave the path ALREADY GROWN — a bigger capacity and two new array blocks, the old
-# ones abandoned to an allocator with no free(). MEASURED: a path at SD_PATH_CAP_MIN holding 8
-# verbs and 8 points, under a hook granting exactly the two sd_path_grow allocations and then
-# refusing — sd_path_lineto returns SADISH_ERR_OOM, cap 8 -> 16, both array pointers moved, and
-# verb count, point count and every stored point are untouched; the next lineto returns SADISH_OK.
-# ⇒ The cost of a refusal is bounded by ONE doubling, and nothing a caller can read through the
-# public accessors moved. Reserving AFTER the points would trade that for a worse bargain: the
-# SdPoints would then be the allocations thrown away, and the push could still fail.
+# SdPoint can leave the path ALREADY GROWN — a bigger capacity and a new array block per array that
+# had to double, the old ones abandoned to an allocator with no free(). MEASURED: a path at
+# SD_PATH_CAP_MIN holding 8 verbs and 8 points, under a hook granting exactly the two sd_path_grow
+# allocations (one per array, 0.7.2) and then refusing — sd_path_lineto returns SADISH_ERR_OOM,
+# both capacities 8 -> 16, both array pointers moved, and verb count, point count and every stored
+# point are untouched; the next lineto returns SADISH_OK.
+# ⇒ The cost of a refusal is bounded by ONE doubling PER ARRAY, and nothing a caller can read
+# through the public accessors moved except the capacities. Reserving AFTER the points would trade
+# that for a worse bargain: the SdPoints would then be the allocations thrown away, and the push
+# could still fail.
 #
-# Make room for `nv` more verbs AND `np` more points, doubling (both arrays, as sd_path_grow
-# always has) until one capacity covers both. SADISH_OK, or SADISH_ERR_OOM with the path
-# unchanged. ⚠ The doubling count is the same as pushing one at a time reaches — the capacity a
-# verb's last push would have forced is the capacity its first push reserves.
+# Make room for `nv` more verbs AND `np` more points, doubling EACH array to its OWN need (0.7.2;
+# through 0.7.1 one capacity had to cover both, so either need doubled both arrays). SADISH_OK, or
+# SADISH_ERR_OOM with the path unchanged. ⚠ The doubling count per array is the same as pushing one
+# at a time reaches — the capacity a verb's last push would have forced is the capacity its first
+# push reserves.
+# ⚠ VERBS ARE GROWN FIRST, so a refusal of the POINT growth can leave the verb array already
+# doubled (one abandoned block, the capacity raised) — the same bounded cost the builders' header
+# describes, and nothing readable through the public accessors moves.
 fn _sd_path_reserve(path, nv, np): i64 {
-    var need = load64(path + SD_PATH_NVERBS_OFFSET) + nv;
+    var needv = load64(path + SD_PATH_NVERBS_OFFSET) + nv;
     var needp = load64(path + SD_PATH_NPOINTS_OFFSET) + np;
-    if (needp > need) { need = needp; }
-    # A capacity of 0 cannot double its way anywhere: refuse rather than spin.
+    # A capacity of 0 cannot double its way anywhere: refuse rather than spin. Both are checked —
+    # a record hand-built to the 0.7.1 layout carries 0 at +40 (see SD_PATH_PCAP_OFFSET).
     if (load64(path + SD_PATH_CAP_OFFSET) <= 0) { return SADISH_ERR_OOM; }
-    while (load64(path + SD_PATH_CAP_OFFSET) < need) {
-        var g = sd_path_grow(path);
-        if (g != SADISH_OK) { return g; }
+    if (load64(path + SD_PATH_PCAP_OFFSET) <= 0) { return SADISH_ERR_OOM; }
+    while (load64(path + SD_PATH_CAP_OFFSET) < needv) {
+        var gv = sd_path_grow(path, SD_PATH_GROW_VERBS);
+        if (gv != SADISH_OK) { return gv; }
+    }
+    while (load64(path + SD_PATH_PCAP_OFFSET) < needp) {
+        var gp = sd_path_grow(path, SD_PATH_GROW_POINTS);
+        if (gp != SADISH_OK) { return gp; }
     }
     return SADISH_OK;
 }
@@ -391,10 +451,13 @@ fn sd_flatten_budget_get(): i64 {
 # budget ran out. Read it after sd_path_flatten, or after sd_flatten_op_end when a consumer scopes
 # a whole draw.
 # ⚠ IT BELONGS TO THE LAST OPERATION, NOT THE LAST CALL, and it is cleared when the next one opens
-# at nesting depth 0. Every sd_path_flatten is an operation (an empty path included, 0.7.1), and so
-# is every single curve verb a fill or stroke flattens — but a fill of a path with NO CURVE VERBS
-# opens none at all, so this still reads whatever the last flatten left: MEASURED, a degraded
-# flatten followed by a fill of a 3-lineto path still reports 1. Read it inside a scope you opened
+# at nesting depth 0. Every sd_path_flatten is an operation (an empty path included, 0.7.1); since
+# 0.7.2 so is every FILL, as a whole (sd_fill_impl opens one, lazily, at the first curve it really
+# flattens); and so is every single curve verb the STROKER flattens — stroke.cyr is the one caller
+# left that goes one verb at a time, so a stroke's verdict is its LAST CURVE's unless the consumer
+# scopes it. ⛔ A fill of a path with NO CURVE VERBS opens none at all, so this still reads whatever
+# the last flatten left: MEASURED, a degraded flatten followed by a fill of a 3-lineto path still
+# reports 1 (programs/flatten_bound_test.cyr group O). Read it inside a scope you opened
 # (sd_flatten_op_begin / _end) if you want it to answer for a particular draw.
 fn sd_flatten_degraded(): i64 {
     return _sd_flat_degraded;
@@ -402,15 +465,18 @@ fn sd_flatten_degraded(): i64 {
 
 # @public — 1 if points that a flatten wanted to emit were LOST (a growth was refused, or an
 # SdPoint was): the result is a PREFIX of the true flattening, not the whole of it.
-# ⚠ IT IS SET BY EVERY FLATTEN, INCLUDING THE PER-CURVE ONES INSIDE A FILL OR A STROKE, and it is
-# cleared by sd_path_flatten ALONE — raster.cyr and stroke.cyr do not clear it, so after a fill it
-# reads "something was lost since the last sd_path_flatten".
-# ⛔ THAT MAKES IT THE ONLY WITNESS A STARVED FILL LEAVES. sd_canvas_fill_path cannot see a refused
-# mid-point (it calls sd_flatten_quad / _cubic, which return 0 either way), so it returns SADISH_OK
-# and draws a wrong picture: MEASURED, a 20 px-radius circle of 4 cubics on 64x64 under a hook that
-# grants 5 allocations and then refuses — SADISH_OK, 81,029 of 312,280 coverage units, truncated()
-# = 1 (0.7.0 did not get that far: SIGSEGV in sd_pt_mid).
-# A consumer that fills under a hook that can refuse polls this after the fill.
+# ⚠ IT IS SET BY EVERY FLATTEN, INCLUDING THE PER-CURVE ONES INSIDE A FILL OR A STROKE. It is STICKY:
+# sd_path_flatten clears it, and the fill and the stroke walks scope it per call (they save the
+# caller's standing verdict and put it back), so after a draw it still reads "something was lost
+# since the last sd_path_flatten".
+# ⛔ IT IS NO LONGER THE ONLY WITNESS, and the header said it was through 0.7.1. Since 0.7.1
+# sd_canvas_fill_path RETURNS SADISH_ERR_OOM for a fill whose own flatten lost points, and since
+# 0.7.2 so do sd_canvas_stroke_path / _ex / _dash: MEASURED, a 20 px-radius circle of 4 cubics on
+# 64x64 under a hook granting 5 allocations — SADISH_ERR_OOM, 81,029 of 312,280 coverage units,
+# truncated() = 1 (0.7.0 did not get that far: SIGSEGV in sd_pt_mid).
+# ⇒ Poll this when you want to know whether an EARLIER draw lost something; read the return code to
+# know whether THIS one did. The canvas keeps whatever the partial draw painted — nothing is rolled
+# back.
 fn sd_flatten_truncated(): i64 {
     return _sd_flat_trunc;
 }
@@ -418,16 +484,24 @@ fn sd_flatten_truncated(): i64 {
 # @public — open a flatten OPERATION: the scope the budget and the degraded flag are measured over.
 # Returns the new nesting depth.
 #
-# ⭐ WHY A CONSUMER WOULD CALL THIS. sd_path_flatten opens one around its whole verb walk, so a
-# lone flatten needs nothing. But raster.cyr's fill and stroke.cyr's stroker flatten ONE CURVE VERB
-# AT A TIME into a fixed per-curve buffer, each call its own operation — so the budget bounds one
-# curve there (at most 2^SD_FLATTEN_MAX_DEPTH = 256 points, which never reaches it) and not the
-# fill. A consumer that wants ONE fill of an untrusted path bounded wraps it:
-#     sd_flatten_op_begin();  sd_canvas_fill_path(cv, path, rule);  sd_flatten_op_end();
+# ⭐ WHY A CONSUMER WOULD CALL THIS — AND WHAT 0.7.2 TOOK OFF ITS PLATE. sd_path_flatten opens one
+# around its whole verb walk, and since 0.7.2 sd_canvas_fill_path does too (sd_fill_impl, lazily at
+# its first flattened curve), so neither a lone flatten NOR a lone fill needs anything from you:
+# MEASURED (programs/flatten_bound_test.cyr groups H and O), the hostile 4,096-quad path filled on
+# 64x64 — unwrapped 1,044,480 B in 65,280 allocations on the seam, wrapped the SAME 1,044,480 B in
+# 65,280, with sd_flatten_degraded() reading 1 either way. (0.7.1 unwrapped: 16,711,680 B in
+# 1,044,480 — one budget per curve verb. 0.7.0: 50,135,040 B in 3,133,440 — no budget at all.)
+# ⛔ THE STROKER IS STILL PER-CURVE, and that is what this is for now. stroke.cyr flattens ONE CURVE
+# VERB AT A TIME into a fixed buffer, each call its own operation, so the budget bounds one curve
+# there (at most 2^SD_FLATTEN_MAX_DEPTH = 256 points, which never reaches the default) and not the
+# stroke. A consumer that wants ONE stroke of an untrusted path bounded wraps it:
+#     sd_flatten_op_begin();  sd_canvas_stroke_path(cv, path, w);  sd_flatten_op_end();
 #     if (sd_flatten_degraded() != 0) { ...the outline was cut to chords... }
-# MEASURED (programs/flatten_bound_test.cyr), the hostile 4,096-quad path filled on 64x64:
-# unwrapped 16,711,680 B in 1,044,480 allocations on the seam, wrapped 1,044,480 B in 65,280 — the
-# budget stops the subdivision at 65,536 points (0.7.0: 50,135,040 B in 3,133,440).
+# MEASURED (group P), a 4-cubic circle stroked at a budget of 64 points: TEN unwrapped strokes each
+# paint 126,930 coverage units and none degrades — every curve gets its own 64, and spends 4 — while
+# inside ONE operation the first four paint 126,930 and the FIFTH paints 114,300 with degraded() = 1,
+# because 16 points a stroke spend it. Wrap to bound a stroke, or to make several draws share one
+# budget.
 # ⚠ Balance it. An op left open keeps accumulating, and a later flatten degrades for a budget it
 # did not spend; sd_flatten_op_end is the only thing that closes one.
 # ⚠ THE RESET IS AT DEPTH 0 ONLY — a nested begin joins the operation already open, which is the
@@ -516,8 +590,9 @@ fn _sd_flat_put(ctx, x, y, pt): i64 {
 #   grant=1  starved 1,314  then 0        grant=3  starved 16,697  then 0
 # The second fill ran with the allocator fully restored, returned SADISH_OK, and painted a BLANK
 # canvas — for the whole life of the consumer's operation, since only a depth-0 begin cleared the
-# flag. (Outside an operation the leak is invisible: sd_flatten_quad's own begin is then the depth-0
-# one and clears it. That is exactly why it took an operation to find.)
+# flag. (Outside an operation the leak is invisible: the depth-0 begin is then the draw's own —
+# sd_flatten_quad's for a stroke, and since 0.7.2 sd_fill_impl's for a fill — and it clears the
+# flag. That is exactly why it took an operation to find.)
 # ⇒ Fullness is re-derived from the ctx itself: the verdict survives only while the ctx REALLY has
 # no room (count >= cap, the growth-refused case), which is what group F's cross-curve stop rests
 # on. A verdict set by a refused SdPoint (count < cap — the allocator said no, the array did not)
@@ -609,9 +684,15 @@ fn _sd_flat_quad_r(ctx, x0, y0, x1, y1, x2, y2, pt2, tol, depth): i64 {
 
 # Recursively flatten a quad (p0,p1,p2). Emits every point AFTER p0 up to and
 # including p2 — p0 is already in the output from the previous segment.
-# Opens a flatten operation, so a direct caller (raster.cyr's fill, stroke.cyr's stroker — one
-# curve verb at a time into a fixed buffer) gets a fresh budget and a fresh full/degraded flag per
-# curve, while sd_path_flatten's walk shares ONE operation across the whole path.
+# ⛔⛔ THE OPERATION OPENED HERE IS LOAD-BEARING FOR THE STROKER, AND FOR NOTHING ELSE NOW (0.7.2).
+# stroke.cyr calls this one curve verb at a time into a fixed buffer, and nothing else resets
+# _sd_flat_used for an UNWRAPPED stroke — so a fresh budget and a fresh full/degraded flag per curve
+# is what this begin/end pair is. Delete it and _sd_flat_used accumulates for the life of the
+# PROCESS: MEASURED (programs/flatten_bound_test.cyr group P), ten identical unwrapped strokes of a
+# 4-cubic circle at a budget of 64 paint 126,930 coverage units each with it, and 126,930 four times
+# then 114,300 with degraded() = 1 for ever after without it — the same input, a different picture.
+# Since 0.7.2 sd_path_flatten's walk and sd_fill_impl's fill BOTH open an operation of their own
+# first, so these begins nest inside theirs and reset nothing there.
 fn sd_flatten_quad(ctx, p0, p1, p2, tol, depth): i64 {
     _sd_flat_enter(ctx);
     sd_flatten_op_begin();
@@ -676,7 +757,9 @@ fn _sd_flat_cubic_r(ctx, x0, y0, x1, y1, x2, y2, x3, y3, pt3, tol, depth): i64 {
 }
 
 # Recursively flatten a cubic (p0,p1,p2,p3). Emits every point after p0.
-# Opens a flatten operation, exactly as sd_flatten_quad does.
+# Opens a flatten operation, exactly as sd_flatten_quad does — and for the same reason: the stroker
+# is the caller that depends on it. Group P drives BOTH, because a stroke of an all-cubic path walks
+# straight past a per-curve operation that survives in the quad branch alone.
 fn sd_flatten_cubic(ctx, p0, p1, p2, p3, tol, depth): i64 {
     _sd_flat_enter(ctx);
     sd_flatten_op_begin();

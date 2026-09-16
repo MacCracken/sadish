@@ -136,13 +136,46 @@ var _sd_dash_trunc = 0;     # 1 if THIS stroke dropped a piece point (a growth f
 # A piece's interior points are the run's own SdPoints, passed by pointer.
 var _sd_dash_rec = 0;
 
+# Allocate the piece buffer, its curve flags and the four cut-point records once (idempotent).
+# Returns 1 when they are ready, 0 when a block was refused.
+# ⛔ ALL OR NOTHING, AND `_sd_dash_run != 0` IS THE FLAG — _sd_scratch_init's and _sd_sb_init's rule
+# (0.7.2). Through 0.7.1 the three blocks went straight into the globals unchecked, so a refusal of
+# the flags or of the 64 B records left _sd_dash_run published and every later dashed stroke wrote
+# its flags, or its cut points, through address 0 — for the life of the process, since this
+# function never runs a second time. ⚠ GLOBAL alloc, never sd_alloc (raster.cyr's scratch rule): no
+# consumer hook can refuse these, and the capacity is the only honest way to drive the path
+# (programs/stroke_oom_test.cyr raises SD_FLATTEN_CAP past ALLOC_MAX / 8).
+# ⚠ THE THREE 0-TESTS HERE ARE A CONTRACT, NOT THREE GATES — and the arithmetic is this function's
+# own, NOT the one stroke.cyr's _sd_sb_init makes (that one is a gate, because its `inner` and its
+# `edges` are sized by two DIFFERENT knobs and either can be the larger; read the ⛔ block there).
+# All three blocks below come from the one `cap`: run = cap * 8, flags = cap, rec = 64. lib/alloc.cyr
+# refuses BY SIZE, so for any cap >= 8 `run` — the block sd_canvas_stroke_path_dash guards on — is
+# the largest, and no capacity refuses `flags` or `rec` while granting it. MEASURED at the tightest
+# cap that separates them, 268,435,457: alloc(cap * 8) = 2,147,483,656 B is refused (over
+# ALLOC_MAX = 2 GiB) while alloc(cap) and alloc(64) are both granted — so 0.7.1's unchecked stores
+# still leave `_sd_dash_run` at 0, the entry point still answers SADISH_ERR_OOM, and the next call
+# still re-initialises. Group G3 of programs/stroke_oom_test.cyr drives the same shape at
+# SD_FLATTEN_CAP = 3,000,000,000, where all three sizes but `rec` are refused together.
+# ⇒ The three tests are kept, and they are load-bearing for a reason no TEST can reach: a bump
+# allocator also refuses when the heap cannot be extended, and `run` granted with `flags` refused
+# then publishes a 0 that _sd_dash_put's store8 writes through. "Contract, not a gate" here means
+# only that no honest suite can drive it on THIS allocator — not that the tests are decoration.
 fn _sd_dash_init(): i64 {
-    if (_sd_dash_run != 0) { return 0; }
-    _sd_dash_cap = SD_FLATTEN_CAP;
-    _sd_dash_run = alloc(_sd_dash_cap * 8);
-    _sd_dash_flags = alloc(_sd_dash_cap);
-    _sd_dash_rec = alloc(4 * SD_POINT_SIZE);
-    return 0;
+    if (_sd_dash_run != 0) { return 1; }
+    var cap = SD_FLATTEN_CAP;
+    var run = alloc(cap * 8);
+    var flags = alloc(cap);
+    var rec = alloc(4 * SD_POINT_SIZE);
+    var ok = 1;
+    if (run == 0) { ok = 0; }
+    if (flags == 0) { ok = 0; }
+    if (rec == 0) { ok = 0; }
+    if (ok == 0) { return 0; }
+    _sd_dash_cap = cap;
+    _sd_dash_run = run;
+    _sd_dash_flags = flags;
+    _sd_dash_rec = rec;
+    return 1;
 }
 
 # Grow both blocks to hold at least `need` slots, doubling, the OLD CAPACITY copied (not the live
@@ -167,10 +200,14 @@ fn _sd_dash_grow(need): i64 {
 }
 
 # Append SdPoint `pt` with curve flag `flag` to the piece being built.
+# ⚠ A point the growth cannot take is DROPPED, as it always was — and since 0.7.2 it also raises
+# the styled walk's refusal flag, so sd_canvas_stroke_path_dash returns SADISH_ERR_OOM instead of
+# SADISH_OK over a dash that stops early. _sd_dash_trunc keeps its own meaning and its own gates.
 fn _sd_dash_put(pt, flag): i64 {
     if (_sd_dash_dn >= _sd_dash_cap) {
         if (_sd_dash_grow(_sd_dash_dn + 1) == 0) {
             _sd_dash_trunc = 1;
+            _sd_stroke_oom = 1;
             return 0;
         }
     }
@@ -428,7 +465,10 @@ fn _sd_dash_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
 #
 # Returns SADISH_ERR_BOUNDS for cv == 0, an unknown cap/join, a NEGATIVE pattern entry or a period
 # that overflows i64 — nothing drawn in any of those; SADISH_ERR_EMPTY_PATH for a 0 or verb-less
-# path; SADISH_OK otherwise. width <= 0 draws nothing.
+# path; SADISH_ERR_OOM when an allocation this stroke reached was refused — the piece buffer's
+# growth, a curve's flatten mid-points, the run, the batch or the flush's accumulator (stroke.cyr's
+# refusal block; the canvas keeps the dashes that were drawn before it); SADISH_OK otherwise.
+# width <= 0 draws nothing.
 #   · pattern == 0, n <= 0, or every entry 0: sd_canvas_stroke_path_ex's bytes, exactly (it IS the
 #     call that runs).
 #   · An odd n is the array twice; the pattern restarts at every subpath; a closed subpath dashes
@@ -489,9 +529,14 @@ fn sd_canvas_stroke_path_dash(cv, path, width, cap, join, miter_limit, pattern, 
     _sd_dash_period = period;
     _sd_dash_off = offset;
 
+    # ⛔ Three process-lifetime sets, each guarded on the BLOCK the walk stores through rather than
+    # on its initialiser's status (sd_fill_impl's reasoning); every publish is all-or-nothing.
     _sd_scratch_init();
+    if (_sd_stroke_run == 0) { return SADISH_ERR_OOM; }
     _sd_sb_init();                      # the batch is empty: every call ends in _sd_sb_flush
+    if (_sd_sb_edges == 0) { return SADISH_ERR_OOM; }
     _sd_dash_init();
+    if (_sd_dash_run == 0) { return SADISH_ERR_OOM; }
     _sd_run_trunc = 0;
     _sd_dash_trunc = 0;
     return _sd_styled_walk(cv, path, hw, cap, join, ml, 1);

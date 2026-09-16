@@ -1,0 +1,803 @@
+# programs/stroke_oom_test.cyr — RUN test for REFUSED ALLOCATIONS inside the three STROKE entries.
+#
+# ⭐⭐ WHAT THIS EXISTS TO PROVE. The 0.5.5 seam lets a consumer install any allocator, and the
+# natural one to install is a per-frame arena — which can RUN OUT. 0.7.1 made path construction, the
+# fill, the clip stack, the presenter and the error record survive a hook that refuses; STROKES did
+# not get there, and the 0.7.1 audit measured both halves of the gap on HEAD f722e8c:
+#   · sd_canvas_stroke_path / _ex(ROUND, ROUND) **SIGSEGV, rc 139** — sd_stroke_seg and
+#     sd_stroke_disc never tested the 0 that 0.7.1 taught sd_path_new to return, and the next line
+#     was an sd_path_moveto through it;
+#   · the styled span walk stored through a refused _sd_fill_accrow_for (raster.cyr admitted it in
+#     the tree: "⚠ THE CALLER IN stroke.cyr … STILL DOES NOT TEST THIS 0");
+#   · and a starved FLATTEN inside a stroke was invisible — 0 / 3,118 / 6,418 / 7,612 coverage units
+#     of a much larger true stroke, returned as SADISH_OK, at 0, 1, 2 and 3 granted allocations.
+# The filing is docs/development/issues/archived/
+# 2026-09-15-path-construction-stores-through-a-refused-allocation.md (closed by this item).
+# ⭐ RE-MEASURED for 0.7.2 on a materialised 0.7.1 tree against this one, with this suite's own
+# shapes (32x32, warm scratch, budget K = 0..4): the round stroker on the line and on the closed
+# curve is SIGSEGV rc 139 there and SADISH_ERR_OOM here; the styled and dashed strokes return
+# SADISH_OK there and SADISH_ERR_OOM here, painting the SAME ink on both trees — 0 / 6,165 / 12,117
+# / 18,441 / 28,682 of 59,850 styled, 0 / 6,166 / 7,978 / 13,453 / 17,329 of 36,422 dashed. The fix
+# changed what a stroke SAYS, not what it draws.
+#
+# ⛔ THE FOUR THINGS ASSERTED AT EVERY K OF EVERY SWEEP, because a return code alone is not the fix:
+#   (a) the process does not fault — the suite runs to completion and prints;
+#   (b) the documented code comes back: SADISH_ERR_OOM for every K below the call's own allocation
+#       count, SADISH_OK at and above it (the count is MEASURED per case, by running the same call
+#       under a hook that grants everything and counting);
+#   (c) the NEXT stroke, on a healthy allocator, returns SADISH_OK and is BYTE-IDENTICAL to a clean
+#       one — the refusal left no wreckage in the batch, the run, the curve flags or the scratch;
+#   (d) a clip the canvas was carrying is still there and still pops.
+# ⚠ WHAT IS DELIBERATELY NOT ASSERTED: that the starved canvas holds nothing. It holds the pieces
+# that were drawn before the refusal — a stroke is NOT rolled back (src/stroke.cyr's header), and
+# group H measures exactly what one leaves.
+#
+# The sweeps cover: the round stroker on a line, on a closed curved path and on a TWO-SUBPATH path
+# (the one shape whose first subpath is stroked mid-walk); sd_canvas_stroke_path_ex under all nine
+# cap/join pairs; sd_canvas_stroke_path_dash with a pattern (three cap/join pairs); each of them on
+# SD_AA_SUBSCANLINE and SD_AA_AREA, and one of each entry point again with a clip pushed.
+# ⚠ THE HOOK ONLY SEES sd_alloc. The process-lifetime scratch comes from the GLOBAL alloc
+# (raster.cyr's rule), so groups F, G and K drive those refusals the way oom_test group J,
+# grow_edges_test's ceiling and dash_test group R do — with a request the real allocator really
+# refuses, with the exact state a refusal leaves behind, or through the public growth ceiling.
+#
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "stroke_oom_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, "  got ", 6);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- the failing hook, in two modes ----------------------------------------------------------
+# BUDGET (so_budget k): grant the first k allocations, refuse every one after — an arena that has
+#   run out, which is the shape of failure the 0.5.5 seam makes reachable.
+# FAIL-ONLY (so_fail_only k): refuse the k-th allocation and grant everything else.
+# ⛔ NOT THE SAME TEST, and oom_test's reason applies twice over here: under a BUDGET every
+# allocation after the first refusal is refused too, so a piece that swallowed its own failure is
+# covered by the next piece failing. MEASURED as mutations of this item's code: sd_stroke_seg with
+# an unchecked sd_path_moveto, sd_stroke_run dropping a segment's code, the round walk dropping a
+# mid-path subpath's, and sd_canvas_stroke_path ignoring the flatten verdict ALL survive the budget
+# sweeps and are killed by the fail-only ones.
+# g_seen counts ATTEMPTS, granted or not, so a clean call under a huge budget reports exactly what
+# the call costs the hook.
+var g_arena = 0;
+var g_mode = 0;
+var g_k = 0;
+var g_seen = 0;
+var g_grants = 0;
+var g_refusals = 0;
+
+fn so_hook(n): i64 {
+    g_seen = g_seen + 1;
+    var refuse = 0;
+    if (g_mode == 0) {
+        if (g_seen > g_k) { refuse = 1; }
+    } else {
+        if (g_seen == g_k) { refuse = 1; }
+    }
+    if (refuse != 0) {
+        g_refusals = g_refusals + 1;
+        return 0;
+    }
+    g_grants = g_grants + 1;
+    return arena_alloc(g_arena, n);
+}
+
+fn so_arm(mode, k): i64 {
+    g_mode = mode;
+    g_k = k;
+    g_seen = 0;
+    g_grants = 0;
+    g_refusals = 0;
+    sd_alloc_set(&so_hook);
+    return 0;
+}
+
+fn so_budget(k): i64 {
+    return so_arm(0, k);
+}
+
+fn so_fail_only(k): i64 {
+    return so_arm(1, k);
+}
+
+# Restore the global allocator AND rewind the arena: a stroke keeps nothing it allocated on the
+# seam (the piece paths and the flatten mid-points are dead the moment it returns), so every sweep
+# step starts from an empty arena and the suite's peak is one call's worth.
+fn so_restore(): i64 {
+    sd_alloc_set(0);
+    arena_reset(g_arena);
+    return 0;
+}
+
+# ---- canvases ------------------------------------------------------------------------------
+var SO_W = 32;
+var SO_H = 32;
+
+fn so_canvas(mode): i64 {
+    var cv = sd_canvas_new(SO_W, SO_H);
+    sd_canvas_set_aa(cv, mode);
+    return cv;
+}
+
+# A canvas of the right engine, with the group's clip pushed when `clipped` — pushed with NO hook
+# armed, so the mask and node come off the global heap and the sweep's refusals are the stroke's.
+fn so_prep(mode, clipped): i64 {
+    var cv = so_canvas(mode);
+    if (clipped != 0) { sd_canvas_clip_push_rect(cv, 6, 6, 26, 26); }
+    return cv;
+}
+
+fn cov_diff(a, b): i64 {
+    var n = sd_canvas_width(a) * sd_canvas_height(a);
+    var pa = sd_canvas_coverage(a);
+    var pb = sd_canvas_coverage(b);
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(pa + i) != load8(pb + i)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn cov_sum(cv): i64 {
+    var n = sd_canvas_width(cv) * sd_canvas_height(cv);
+    var p = sd_canvas_coverage(cv);
+    var s = 0;
+    var i = 0;
+    while (i < n) {
+        s = s + load8(p + i);
+        i = i + 1;
+    }
+    return s;
+}
+
+# ---- the shapes ----------------------------------------------------------------------------
+# Built with no hook armed: their own construction is path.cyr's business (oom_test's rule), and
+# 0.7.1's suites already sweep it.
+var SO_WIDTH = 0;        # stroke width, 16.16
+var SO_ML = 0;           # miter limit
+var g_line = 0;          # M 6,7 L 26,21 — two points, no curve: the styled walk allocates nothing
+var g_curve = 0;         # a closed blob of two cubics: mid-points on the seam, every K reachable
+var g_two = 0;           # TWO subpaths — the only shape that runs the walks' mid-path dispatch
+var g_dot = 0;           # a LONE MOVETO — the round stroker draws one disc and no segment rect
+var g_tri = 0;           # a CLOSED triangle — its closing segment has length, so it allocates
+var g_pat = 0;           # a dash pattern, on 3.5 px / off 2.5 px
+
+fn so_shapes(): i64 {
+    SO_WIDTH = 4 * SD_ONE;
+    SO_ML = 4 * SD_ONE;
+    g_line = sd_path_new();
+    sd_path_moveto(g_line, 6 * SD_ONE, 7 * SD_ONE);
+    sd_path_lineto(g_line, 26 * SD_ONE, 21 * SD_ONE);
+    g_curve = sd_path_new();
+    sd_path_moveto(g_curve, 8 * SD_ONE, 8 * SD_ONE);
+    sd_path_cubicto(g_curve, 26 * SD_ONE, 4 * SD_ONE, 28 * SD_ONE, 18 * SD_ONE,
+      22 * SD_ONE, 24 * SD_ONE);
+    sd_path_cubicto(g_curve, 16 * SD_ONE, 30 * SD_ONE, 4 * SD_ONE, 22 * SD_ONE,
+      8 * SD_ONE, 8 * SD_ONE);
+    sd_path_close(g_curve);
+    g_two = sd_path_new();
+    sd_path_moveto(g_two, 6 * SD_ONE, 7 * SD_ONE);
+    sd_path_lineto(g_two, 26 * SD_ONE, 21 * SD_ONE);
+    sd_path_moveto(g_two, 4 * SD_ONE, 27 * SD_ONE);
+    sd_path_lineto(g_two, 28 * SD_ONE, 27 * SD_ONE);
+    g_dot = sd_path_new();
+    sd_path_moveto(g_dot, 16 * SD_ONE, 16 * SD_ONE);
+    # ⚠ NOT g_curve for the closing segment: g_curve's last point IS its moveto point, so its
+    # closing segment is zero-length and sd_stroke_seg returns before it allocates anything. A
+    # triangle that does not walk back to its start is what puts that piece on the hook — MEASURED
+    # as a mutation: sd_stroke_run dropping the closing segment's code survives without this shape.
+    g_tri = sd_path_new();
+    sd_path_moveto(g_tri, 8 * SD_ONE, 8 * SD_ONE);
+    sd_path_lineto(g_tri, 24 * SD_ONE, 10 * SD_ONE);
+    sd_path_lineto(g_tri, 16 * SD_ONE, 24 * SD_ONE);
+    sd_path_close(g_tri);
+    g_pat = alloc(2 * 8);
+    store64(g_pat + 0, 3 * SD_ONE + (SD_ONE >> 1));
+    store64(g_pat + 8, 2 * SD_ONE + (SD_ONE >> 1));
+    return 0;
+}
+
+# ---- the cases -----------------------------------------------------------------------------
+# 0  round stroker, the line          1  round stroker, the closed curve
+# 2..10  _ex on the curve, cap = (c-2)/3, join = (c-2)%3 — all nine pairs, ROUND/ROUND (c == 6)
+#        included, which _ex sends back to the round stroker
+# 11 _ex on the line (BUTT/MITER): the case whose seam cost is ZERO
+# 12 _dash on the curve, BUTT/MITER   13 _dash on the curve, ROUND/ROUND (the styled geometry)
+# 14 _dash on the line, SQUARE/BEVEL, phase-shifted
+# 15 round stroker on TWO subpaths — the first is stroked mid-walk, at the second's moveto, which
+#    is the one place a piece's refusal has to travel out of the verb loop rather than off its end
+# 16 round stroker on a LONE MOVETO — one disc, no segment rect: the only case whose whole picture
+#    comes from sd_stroke_disc, so a refusal there cannot be reported by some later piece
+# 17 round stroker on a CLOSED TRIANGLE — the only case whose closing segment has length
+var SO_CASES = 18;
+
+fn draw_case(c, cv): i64 {
+    if (c == 0) { return sd_canvas_stroke_path(cv, g_line, SO_WIDTH); }
+    if (c == 1) { return sd_canvas_stroke_path(cv, g_curve, SO_WIDTH); }
+    if (c == 15) { return sd_canvas_stroke_path(cv, g_two, SO_WIDTH); }
+    if (c == 16) { return sd_canvas_stroke_path(cv, g_dot, SO_WIDTH); }
+    if (c == 17) { return sd_canvas_stroke_path(cv, g_tri, SO_WIDTH); }
+    if (c == 11) {
+        return sd_canvas_stroke_path_ex(cv, g_line, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML);
+    }
+    if (c == 12) {
+        return sd_canvas_stroke_path_dash(cv, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER,
+          SO_ML, g_pat, 2, 0);
+    }
+    if (c == 13) {
+        return sd_canvas_stroke_path_dash(cv, g_curve, SO_WIDTH, SD_CAP_ROUND, SD_JOIN_ROUND,
+          SO_ML, g_pat, 2, 0);
+    }
+    if (c == 14) {
+        return sd_canvas_stroke_path_dash(cv, g_line, SO_WIDTH, SD_CAP_SQUARE, SD_JOIN_BEVEL,
+          SO_ML, g_pat, 2, SD_ONE);
+    }
+    var cap = (c - 2) / 3;
+    var join = c - 2 - cap * 3;
+    return sd_canvas_stroke_path_ex(cv, g_curve, SO_WIDTH, cap, join, SO_ML);
+}
+
+# The clean picture of every case on every engine, taken before a single refusal — group J holds
+# every stroke the suite draws afterwards to these.
+var g_refs = 0;
+
+fn so_ref(c, mode): i64 {
+    return load64(g_refs + (c * 2 + mode) * 8);
+}
+
+# What case `c` costs the hook when nothing is refused. The canvas is thrown away; only g_seen is
+# wanted. ⚠ Read AFTER the call and before so_restore, which re-arms nothing.
+fn so_count(c, mode): i64 {
+    var cv = so_canvas(mode);
+    so_budget(1000000000);
+    draw_case(c, cv);
+    var n = g_seen;
+    so_restore();
+    return n;
+}
+
+# THE SWEEP. K from 0 to the call's own allocation count + 1, and at every K: the documented code,
+# a healthy redraw that is byte-identical to the clean reference, and (when clipped) the clip still
+# in place. Returns the number of failures; the caller turns that into one numbered check.
+fn sweep_case(c, mode, clipped): i64 {
+    var bad = 0;
+    var ref = so_prep(mode, clipped);
+    if (draw_case(c, ref) != SADISH_OK) { bad = bad + 1; }
+    if (clipped == 0) {
+        if (cov_diff(ref, so_ref(c, mode)) != 0) { bad = bad + 1; }
+    }
+    var need = so_count(c, mode);
+    var k = 0;
+    while (k <= need + 1) {
+        var star = so_prep(mode, clipped);
+        so_budget(k);
+        var rc = draw_case(c, star);
+        so_restore();
+        var want = SADISH_ERR_OOM;
+        if (k >= need) { want = SADISH_OK; }
+        if (rc != want) { bad = bad + 1; }
+        # ⭐ (c): the next stroke on a healthy allocator draws the clean picture, byte for byte.
+        var again = so_prep(mode, clipped);
+        if (draw_case(c, again) != SADISH_OK) { bad = bad + 1; }
+        if (cov_diff(again, ref) != 0) { bad = bad + 1; }
+        # ⭐ (d): the starved canvas's clip stack is exactly as it was — the node is still on the
+        # canvas and still pops back to unclipped. (That a clip really clips is checks 28-30.)
+        if (clipped != 0) {
+            if (load64(star + SD_CANVAS_CLIP_OFFSET) == 0) { bad = bad + 1; }
+            if (sd_canvas_clip_pop(star) != SADISH_OK) { bad = bad + 1; }
+            if (load64(star + SD_CANVAS_CLIP_OFFSET) != 0) { bad = bad + 1; }
+        }
+        k = k + 1;
+    }
+    return bad;
+}
+
+# ONE REFUSAL AT A TIME. Every allocation of the call, made the ONLY failing one in turn: each must
+# come back as SADISH_ERR_OOM by itself, with everything else granted — there is no later failure to
+# report it. ⛔ This is the sweep that holds each individual site's check; the budget sweep holds the
+# contract of the entry point. Returns the number of failures.
+fn sweep_fail_only(c, mode): i64 {
+    var bad = 0;
+    var ref = so_ref(c, mode);
+    var need = so_count(c, mode);
+    var k = 1;
+    while (k <= need) {
+        var star = so_canvas(mode);
+        so_fail_only(k);
+        var rc = draw_case(c, star);
+        so_restore();
+        if (rc != SADISH_ERR_OOM) { bad = bad + 1; }
+        var again = so_canvas(mode);
+        if (draw_case(c, again) != SADISH_OK) { bad = bad + 1; }
+        if (cov_diff(again, ref) != 0) { bad = bad + 1; }
+        k = k + 1;
+    }
+    return bad;
+}
+
+fn main(): i64 {
+    alloc_init();
+    so_shapes();
+
+    # ── A) WARM EVERY PROCESS-LIFETIME BLOCK, AND BASELINE EVERY PICTURE ──────────────
+    # ⚠ NOT OPTIONAL, and for oom_test's reason: the fill/stroke scratch, the styled batch, the
+    # curve flags, the dash piece buffer and the row accumulator all come from the GLOBAL alloc, so
+    # a budget hook cannot starve them — but a FIRST call would grow them on the global heap while
+    # the hook was armed, and the sweep's figures would be measuring that instead of the stroke.
+    check(sd_alloc_get(), 0);                                          # 1 — no hook yet
+    g_refs = alloc(SO_CASES * 2 * 8);
+    var c = 0;
+    while (c < SO_CASES) {
+        var mode = SD_AA_SUBSCANLINE;
+        while (mode <= SD_AA_AREA) {
+            var warm = so_canvas(mode);
+            draw_case(c, warm);                        # warms; the picture is thrown away
+            var ref = so_canvas(mode);
+            draw_case(c, ref);
+            store64(g_refs + (c * 2 + mode) * 8, ref);
+            mode = mode + 1;
+        }
+        c = c + 1;
+    }
+    check(_sd_fill_accrow_cap, SO_W);                                  # 2 — the accumulator, warm
+    check(_sd_area_acc_cap, SO_W + 1);                                 # 3 — the area engine's, warm
+    check(_sd_sb_edges != 0, 1);                                       # 4 — the batch
+    check(_sd_dash_run != 0, 1);                                       # 5 — the dash piece buffer
+    check(_sd_stroke_run != 0, 1);                                     # 6 — the stroker's run
+    check(cov_sum(so_ref(0, SD_AA_SUBSCANLINE)) > 0, 1);               # 7 — and they all drew
+    check(cov_sum(so_ref(13, SD_AA_AREA)) > 0, 1);                     # 8
+    g_arena = arena_new_growable(4194304);
+    check(g_arena != 0, 1);                                            # 9
+    # A warm STYLED stroke of a straight path costs the global heap nothing but the canvas — every
+    # later figure is a seam figure. ⚠ Not the ROUND stroker and not a CURVE: the piece paths and
+    # the flatten mid-points are sd_alloc calls, and with no hook armed sd_alloc IS the global heap
+    # (MEASURED here: 126,176 B for the round stroker on this closed curve, 192 B of mid-points for
+    # a dashed one).
+    var gh = alloc_used();
+    var a1 = so_canvas(SD_AA_SUBSCANLINE);
+    check(draw_case(11, a1), SADISH_OK);                               # 10
+    check(alloc_used() - gh, 48 + SO_W * SO_H);                        # 11 — the canvas, nothing else
+    # ⭐ THE STYLED WALK'S SEAM COST ON A STRAIGHT PATH IS ZERO, so case 11 is drawn whole under a
+    # budget of 0 — the "0 B once warm" promise, read through the hook.
+    check(so_count(11, SD_AA_SUBSCANLINE), 0);                         # 12
+    check(so_count(14, SD_AA_SUBSCANLINE), 0);                         # 13 — a dashed line likewise
+    # The round stroker pays 7 sd_allocs a segment rect and 19 a disc: the 2-point line is one rect
+    # and two discs.
+    check(so_count(0, SD_AA_SUBSCANLINE), 7 + 19 + 19);                # 14
+    check(so_count(2, SD_AA_SUBSCANLINE) > 0, 1);                      # 15 — the curve's mid-points
+
+    # ── B) THE ROUND STROKER: EVERY K, BOTH ENGINES ────────────────────
+    # ⛔ K = 0 is the audit's SIGSEGV: sd_path_new refused, sd_path_moveto through the 0 it returns.
+    check(sweep_case(0, SD_AA_SUBSCANLINE, 0), 0);                     # 16
+    check(sweep_case(0, SD_AA_AREA, 0), 0);                            # 17
+    check(sweep_case(1, SD_AA_SUBSCANLINE, 0), 0);                     # 18 — closed, curved
+    check(sweep_case(1, SD_AA_AREA, 0), 0);                            # 19
+    check(sweep_case(15, SD_AA_SUBSCANLINE, 0), 0);                    # 20 — two subpaths
+    check(sweep_case(15, SD_AA_AREA, 0), 0);                           # 21
+    check(sweep_case(16, SD_AA_SUBSCANLINE, 0), 0);                    # 22 — a lone moveto: one disc
+    check(sweep_case(16, SD_AA_AREA, 0), 0);                           # 23
+    check(sweep_case(17, SD_AA_SUBSCANLINE, 0), 0);                    # 24 — a closed triangle
+
+    # ── C) sd_canvas_stroke_path_ex: ALL NINE CAP/JOIN PAIRS, BOTH ENGINES ────────────
+    var bad = 0;
+    c = 2;
+    while (c <= 11) {
+        bad = bad + sweep_case(c, SD_AA_SUBSCANLINE, 0);
+        bad = bad + sweep_case(c, SD_AA_AREA, 0);
+        c = c + 1;
+    }
+    check(bad, 0);                                                     # 25
+
+    # ── D) sd_canvas_stroke_path_dash: A PATTERN, BOTH ENGINES ────────────────
+    bad = 0;
+    c = 12;
+    while (c <= 14) {
+        bad = bad + sweep_case(c, SD_AA_SUBSCANLINE, 0);
+        bad = bad + sweep_case(c, SD_AA_AREA, 0);
+        c = c + 1;
+    }
+    check(bad, 0);                                                     # 26
+
+    # ── E) THE SAME SWEEPS WITH A CLIP PUSHED ──────────────────────
+    # One case per entry point, both engines: the refusal must leave the clip stack exactly as it
+    # found it (sweep_case pops it at every K, and a failed pop is a failure).
+    bad = 0;
+    bad = bad + sweep_case(1, SD_AA_SUBSCANLINE, 1);
+    bad = bad + sweep_case(1, SD_AA_AREA, 1);
+    bad = bad + sweep_case(4, SD_AA_SUBSCANLINE, 1);
+    bad = bad + sweep_case(4, SD_AA_AREA, 1);
+    bad = bad + sweep_case(12, SD_AA_SUBSCANLINE, 1);
+    bad = bad + sweep_case(12, SD_AA_AREA, 1);
+    check(bad, 0);                                                     # 27
+    # And the clipped picture really is clipped — otherwise the group above would be comparing two
+    # unclipped strokes and proving nothing about the mask.
+    var ecl = so_prep(SD_AA_SUBSCANLINE, 1);
+    check(draw_case(1, ecl), SADISH_OK);                               # 28
+    check(cov_sum(ecl) < cov_sum(so_ref(1, SD_AA_SUBSCANLINE)), 1);    # 29
+    check(sd_canvas_clip_pop(ecl), SADISH_OK);                         # 30
+
+    # ── E2) ONE REFUSAL AT A TIME: EVERY SITE, ALONE ───────────────
+    # ⛔ THE SWEEP THAT HOLDS THE INDIVIDUAL CHECKS. With everything else granted there is no second
+    # failure to report a swallowed first one, so each site must answer for itself: the piece path's
+    # record, its verb and point arrays, each corner's SdPoint, each disc vertex's, and every flatten
+    # mid-point of a curve. MEASURED as mutations: four of this item's checks survive the budget
+    # sweeps above and die here.
+    bad = 0;
+    bad = bad + sweep_fail_only(0, SD_AA_SUBSCANLINE);     # the line: rect, then two discs
+    bad = bad + sweep_fail_only(1, SD_AA_SUBSCANLINE);     # closed + curved: mid-points, closing seg
+    bad = bad + sweep_fail_only(15, SD_AA_SUBSCANLINE);    # two subpaths: the mid-walk stroke
+    bad = bad + sweep_fail_only(16, SD_AA_SUBSCANLINE);    # the lone disc
+    bad = bad + sweep_fail_only(17, SD_AA_SUBSCANLINE);    # the closing segment of a closed run
+    bad = bad + sweep_fail_only(2, SD_AA_SUBSCANLINE);     # styled, curved
+    bad = bad + sweep_fail_only(12, SD_AA_SUBSCANLINE);    # dashed, curved
+    check(bad, 0);                                                     # 31
+    bad = 0;
+    bad = bad + sweep_fail_only(1, SD_AA_AREA);
+    bad = bad + sweep_fail_only(2, SD_AA_AREA);
+    bad = bad + sweep_fail_only(13, SD_AA_AREA);
+    check(bad, 0);                                                     # 32
+
+    # ── F) THE FLUSH'S ROW ACCUMULATOR, AND THE AREA ENGINE'S ────────────────
+    # ⛔ THE SITE raster.cyr NAMED IN THE TREE: "THE CALLER IN stroke.cyr (the styled span walk)
+    # STILL DOES NOT TEST THIS 0". Both blocks come from the GLOBAL alloc, so they are driven the
+    # two honest ways: the STATE a refusal leaves (oom_test group I's device — the pointer 0 with
+    # the capacity intact, which is what 0.7.0 left behind), and a REAL refusal (oom_test group H's
+    # — a hand-built 536,870,912 px header whose w*8 row is 4 GiB, over lib/alloc.cyr's ALLOC_MAX).
+    var save_acc = _sd_fill_accrow;
+    check(save_acc != 0, 1);                                           # 33
+    var f1 = so_canvas(SD_AA_SUBSCANLINE);
+    _sd_fill_accrow = 0;
+    check(sd_canvas_stroke_path_ex(f1, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 34 ⭐ the styled span walk
+    check(cov_sum(f1), 0);                                             # 35 — not one coverage byte
+    check(sd_canvas_stroke_path(f1, g_curve, SO_WIDTH), SADISH_ERR_OOM);   # 36 — through the fill
+    # ⭐ The LONE DISC, whose whole picture is one sd_stroke_disc: no later piece can report for it.
+    check(sd_canvas_stroke_path(f1, g_dot, SO_WIDTH), SADISH_ERR_OOM);     # 37
+    # ⛔ AND THE TWO PIECES, CALLED DIRECTLY — the one way to hold sd_stroke_seg to its own contract.
+    # sd_stroke_run always draws a disc AFTER the segments, so through a public entry a segment that
+    # swallowed the fill's code is re-reported one piece later and the entry still answers OOM
+    # (MEASURED as a mutation: discarding sd_canvas_fill_union's result in sd_stroke_seg survives
+    # every sweep in this suite and dies on the line below).
+    check(sd_stroke_seg(f1, 4 * SD_ONE, 4 * SD_ONE, 20 * SD_ONE, 12 * SD_ONE, 2 * SD_ONE),
+      SADISH_ERR_OOM);                                                     # 38
+    check(sd_stroke_disc(f1, 10 * SD_ONE, 10 * SD_ONE, 2 * SD_ONE), SADISH_ERR_OOM);   # 39
+    check(sd_canvas_stroke_path_dash(f1, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML,
+        g_pat, 2, 0), SADISH_ERR_OOM);                                   # 40
+    check(cov_sum(f1), 0);                                             # 41
+    _sd_fill_accrow = save_acc;
+    check(_sd_fill_accrow_cap, SO_W);                                  # 42 — the capacity never moved
+    # ⛔ AND THE BATCH THE REFUSED FLUSH HELD IS EMPTY. _sd_sb_flush empties it BEFORE anything in
+    # it can fail, which is what keeps a refusal from costing the NEXT stroke as well: pieces left
+    # in the batch would be filled together with that stroke's own. The redraw below is therefore a
+    # DIFFERENT SHAPE from every stroke starved above — the straight line, not g_curve — so stale
+    # curve edges show up as ink the line's picture does not have. MEASURED as a mutation (the
+    # accrow guard restoring the count it took): #43 reads 270 (the dashed curve's edges, still in the
+    # batch) and #45 reads 261 differing pixels of 1,024. ⚠ With case 2 here instead the mutation is
+    # INVISIBLE: it is the same call as #34, so the stale edges and the fresh ones union to the same
+    # region and cov_diff reads 0. Hence the different shape here and case 2 on its own canvas below.
+    check(_sd_sb_n, 0);                                                # 43
+    check(draw_case(11, f1), SADISH_OK);                               # 44 — a different shape...
+    check(cov_diff(f1, so_ref(11, SD_AA_SUBSCANLINE)), 0);             # 45 ⭐ ...with none of g_curve in it
+    var f1b = so_canvas(SD_AA_SUBSCANLINE);
+    check(draw_case(2, f1b), SADISH_OK);                               # 46 — and the same stroke again...
+    check(cov_diff(f1b, so_ref(2, SD_AA_SUBSCANLINE)), 0);             # 47 ⭐ ...is the clean picture
+    # The area engine's accumulator, the same way.
+    var save_area = _sd_area_acc;
+    var f2 = so_canvas(SD_AA_AREA);
+    _sd_area_acc = 0;
+    check(sd_canvas_stroke_path_ex(f2, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 48
+    check(cov_sum(f2), 0);                                             # 49
+    _sd_area_acc = save_area;
+    check(_sd_area_acc_cap, SO_W + 1);                                 # 50
+    check(draw_case(2, f2), SADISH_OK);                                # 51
+    check(cov_diff(f2, so_ref(2, SD_AA_AREA)), 0);                     # 52
+    # A REAL refusal: the hand-built header. Nothing may be written through its coverage pointer.
+    var probe = alloc(8);
+    store8(probe, 65);
+    var big = alloc(SD_CANVAS_SIZE);
+    store64(big + SD_CANVAS_WIDTH_OFFSET, 536870912);
+    store64(big + SD_CANVAS_HEIGHT_OFFSET, 1);
+    store64(big + SD_CANVAS_COVERAGE_OFFSET, probe);
+    store64(big + SD_CANVAS_STRIDE_OFFSET, 536870912);
+    store64(big + SD_CANVAS_CLIP_OFFSET, 0);
+    store64(big + SD_CANVAS_AA_OFFSET, SD_AA_SUBSCANLINE);
+    gh = alloc_used();
+    check(sd_canvas_stroke_path_ex(big, g_line, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 53 ⭐ a real 4 GiB refusal
+    check(alloc_used() - gh, 0);                                       # 54 — and it cost the heap 0
+    check(load8(probe), 65);                                           # 55 — the coverage was not written
+    check(_sd_fill_accrow_cap, SO_W);                                  # 56 — the capacity was not raised
+    store64(big + SD_CANVAS_AA_OFFSET, SD_AA_AREA);
+    check(sd_canvas_stroke_path_ex(big, g_line, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 57 — the area engine's own
+    check(load8(probe), 65);                                           # 58
+    check(_sd_area_acc_cap, SO_W + 1);                                 # 59
+    # ⭐ AND THE NEXT ORDINARY STROKE STILL WORKS — the 0.7.0 shape of this bug was a poisoned
+    # scratch that killed every later call, not the call that was refused.
+    var f3 = so_canvas(SD_AA_SUBSCANLINE);
+    check(draw_case(1, f3), SADISH_OK);                                # 60
+    check(cov_diff(f3, so_ref(1, SD_AA_SUBSCANLINE)), 0);              # 61
+
+    # ── G) THE PROCESS-LIFETIME SETS THEMSELVES, REFUSED ──────────────
+    # ⛔ HOW A TEST REACHES A PATH THE HOOK CANNOT (oom_test group J's device, with a capacity big
+    # enough that nothing large is actually mapped): the scratch, the batch and the dash buffer are
+    # sized by SD_FLATTEN_CAP, so a capacity of 3,000,000,000 puts every one of their blocks over
+    # ALLOC_MAX = 2 GiB and the real allocator refuses them all. The "already initialised" flag is
+    # zeroed with them, which is the state a process whose FIRST stroke is refused really has.
+    # ⚠ Only the straight-line path is stroked here: while SD_FLATTEN_CAP is a lie, a curve's
+    # flatten would be handed that lie as its buffer capacity.
+    var save_cap = SD_FLATTEN_CAP;
+    var g1 = so_canvas(SD_AA_SUBSCANLINE);
+    _sd_fill_ectx = 0;
+    _sd_stroke_run = 0;
+    SD_FLATTEN_CAP = 3000000000;
+    check(sd_canvas_stroke_path(g1, g_line, SO_WIDTH), SADISH_ERR_OOM);            # 62
+    check(_sd_fill_ectx, 0);                                           # 63 — nothing published
+    check(_sd_stroke_run, 0);                                          # 64
+    check(sd_canvas_stroke_path_ex(g1, g_line, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 65
+    check(sd_canvas_stroke_path_dash(g1, g_line, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML,
+        g_pat, 2, 0), SADISH_ERR_OOM);                                   # 66
+    check(cov_sum(g1), 0);                                             # 67 — nothing drawn
+    SD_FLATTEN_CAP = save_cap;
+    check(draw_case(0, g1), SADISH_OK);                                # 68 ⭐ the retry rebuilds it
+    check(cov_diff(g1, so_ref(0, SD_AA_SUBSCANLINE)), 0);              # 69 — and draws the clean picture
+    check(_sd_stroke_run != 0, 1);                                     # 70
+    # G2. The styled batch (its edges, its curve flags and its trig table).
+    var g2 = so_canvas(SD_AA_SUBSCANLINE);
+    _sd_sb_edges = 0;
+    SD_FLATTEN_CAP = 3000000000;
+    check(sd_canvas_stroke_path_ex(g2, g_line, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 71
+    check(_sd_sb_edges, 0);                                            # 72 — nothing published
+    check(sd_canvas_stroke_path_dash(g2, g_line, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML,
+        g_pat, 2, 0), SADISH_ERR_OOM);                                   # 73
+    check(cov_sum(g2), 0);                                             # 74
+    SD_FLATTEN_CAP = save_cap;
+    check(draw_case(11, g2), SADISH_OK);                               # 75
+    check(cov_diff(g2, so_ref(11, SD_AA_SUBSCANLINE)), 0);             # 76
+    # G3. The dash piece buffer — and only the DASH entry may notice.
+    var g3 = so_canvas(SD_AA_SUBSCANLINE);
+    _sd_dash_run = 0;
+    SD_FLATTEN_CAP = 3000000000;
+    check(sd_canvas_stroke_path_dash(g3, g_line, SO_WIDTH, SD_CAP_SQUARE, SD_JOIN_BEVEL, SO_ML,
+        g_pat, 2, SD_ONE), SADISH_ERR_OOM);                              # 77
+    check(_sd_dash_run, 0);                                            # 78
+    check(cov_sum(g3), 0);                                             # 79
+    SD_FLATTEN_CAP = save_cap;
+    check(draw_case(14, g3), SADISH_OK);                               # 80
+    check(cov_diff(g3, so_ref(14, SD_AA_SUBSCANLINE)), 0);             # 81
+    # G4. ⛔ THE BATCH'S PUBLISH IS ALL-OR-NOTHING, AND `_sd_sb_edges` IS NOT ALWAYS THE BLOCK THAT
+    # IS REFUSED FIRST. G2 above raises SD_FLATTEN_CAP alone, which refuses every block of the set
+    # together — so it does NOT hold _sd_sb_init to its publish. The set is sized by TWO knobs:
+    # `inner` is SD_FLATTEN_CAP bytes, `edges` is _sd_sb_cap_for() * 32, and _sd_sb_cap_for reads
+    # the public SD_STROKE_BATCH_CAP. Hold the batch cap at 1,000 and raise the flatten cap past
+    # ALLOC_MAX and the order INVERTS: `inner` is 3 GB and refused, `edges` is 32,000 B and granted.
+    # ⛔ That is the one arrangement a partial publish cannot survive — `_sd_sb_edges` is also the
+    # idempotence flag, so a non-zero `edges` beside a 0 `inner` is published FOREVER and every
+    # styled stroke of the process writes a curve flag through address 0. MEASURED as a mutation
+    # (this function reverted to 0.7.1's unchecked stores): _sd_sb_init returns 1 with edges set,
+    # inner 0 and inner_cap 3,000,000,000, and the stroke at #88 is SIGSEGV, rc 139 — while every
+    # other suite in the tree, this one included, stays green without the group below.
+    var save_bc = SD_STROKE_BATCH_CAP;
+    var g4 = so_canvas(SD_AA_SUBSCANLINE);
+    _sd_sb_edges = 0;
+    _sd_sb_inner = 0;
+    _sd_sb_trig = 0;
+    _sd_sb_cap = 0;
+    _sd_sb_inner_cap = 0;
+    SD_FLATTEN_CAP = 3000000000;
+    SD_STROKE_BATCH_CAP = 1000;
+    check(_sd_sb_init(), 0);                                           # 82 — refused, and...
+    check(_sd_sb_edges, 0);                                            # 83 — ...not one of the five
+    check(_sd_sb_inner, 0);                                            # 84      globals published,
+    check(_sd_sb_inner_cap, 0);                                        # 85      the flag least of all
+    check(_sd_sb_trig, 0);                                             # 86
+    check(_sd_sb_cap, 0);                                              # 87
+    check(sd_canvas_stroke_path_ex(g4, g_line, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 88 ⭐ a code, not a fault
+    check(sd_canvas_stroke_path_dash(g4, g_line, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML,
+        g_pat, 2, 0), SADISH_ERR_OOM);                                   # 89 — the dash entry too
+    check(cov_sum(g4), 0);                                             # 90 — nothing drawn
+    SD_FLATTEN_CAP = save_cap;
+    SD_STROKE_BATCH_CAP = save_bc;
+    check(draw_case(11, g4), SADISH_OK);                               # 91 ⭐ the retry rebuilds it...
+    check(cov_diff(g4, so_ref(11, SD_AA_SUBSCANLINE)), 0);             # 92 — ...and draws the clean picture
+    check(_sd_sb_inner != 0, 1);                                       # 93 — with a whole set behind it
+    check(_sd_sb_inner_cap, save_cap);                                 # 94
+    check(_sd_sb_trig != 0, 1);                                        # 95
+
+    # ── H) WHAT A PARTIAL STROKE LEAVES ON THE CANVAS ─────────────────
+    # ⛔ IT IS NOT ROLLED BACK, and this group is the measurement behind that sentence in
+    # src/stroke.cyr's header. The round stroker on the closed curve, at 0, 1 and a middle budget,
+    # against the whole stroke: the ink grows piece by piece and never arrives.
+    # ⚠ THE LINE, not the curve: a curved path's mid-points are allocated BEFORE its first piece
+    # path, so a small budget there buys a coarser polyline rather than a prefix of the pieces
+    # (h3 below is that case). On the 2-point line the budget buys pieces, one at a time: 7 for the
+    # segment rect, then 19 a disc.
+    var full = cov_sum(so_ref(0, SD_AA_SUBSCANLINE));
+    var h0 = so_canvas(SD_AA_SUBSCANLINE);
+    so_budget(0);
+    check(sd_canvas_stroke_path(h0, g_line, SO_WIDTH), SADISH_ERR_OOM);    # 96
+    so_restore();
+    check(cov_sum(h0), 0);                                             # 97 — the first path refused
+    var h1 = so_canvas(SD_AA_SUBSCANLINE);
+    so_budget(7);
+    check(sd_canvas_stroke_path(h1, g_line, SO_WIDTH), SADISH_ERR_OOM);    # 98
+    so_restore();
+    check(cov_sum(h1) > 0, 1);                                         # 99 ⭐ one rect's worth of ink
+    check(cov_sum(h1) < full, 1);                                      # 100 — and no more
+    var h2 = so_canvas(SD_AA_SUBSCANLINE);
+    so_budget(7 + 19);
+    check(sd_canvas_stroke_path(h2, g_line, SO_WIDTH), SADISH_ERR_OOM);    # 101
+    so_restore();
+    check(cov_sum(h2) > cov_sum(h1), 1);                               # 102 — the rect and one cap
+    check(cov_sum(h2) < full, 1);                                      # 103
+    # ⭐ AND THE CANVAS IS NOT SPOILED: the caller's remedy is to clear and stroke again.
+    sd_canvas_clear(h2);
+    check(sd_canvas_stroke_path(h2, g_line, SO_WIDTH), SADISH_OK);      # 104
+    check(cov_diff(h2, so_ref(0, SD_AA_SUBSCANLINE)), 0);              # 105
+    # The styled path's partial picture is the same story through a different mechanism: a starved
+    # flatten leaves a COARSER polyline, so its ink is not a subset — only its code is honest.
+    var h3 = so_canvas(SD_AA_SUBSCANLINE);
+    so_budget(1);
+    check(sd_canvas_stroke_path_ex(h3, g_curve, SO_WIDTH, SD_CAP_ROUND, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 106
+    so_restore();
+    check(cov_sum(h3) > 0, 1);                                         # 107 — a chord-ish stroke, drawn
+    check(cov_diff(h3, so_ref(4, SD_AA_SUBSCANLINE)) > 0, 1);          # 108 — and not the true one
+
+    # ── I) THE WITNESS: THE CODE IS PER CALL, sd_flatten_truncated() IS STILL STICKY ───
+    # ⚠ The filing's "the witness is sticky: nothing in a stroke clears _sd_flat_trunc, so it reads
+    # 3 on later healthy strokes too — it cannot be trusted per call". Both halves are held here:
+    # the flag keeps the behaviour path.cyr documents (it belongs to the last flatten, and only
+    # sd_path_flatten clears it), and the RETURN CODE answers for the call.
+    sd_path_flatten(g_line, SD_ONE >> 2);
+    check(sd_flatten_truncated(), 0);                                  # 109
+    var i1 = so_canvas(SD_AA_SUBSCANLINE);
+    so_budget(2);
+    check(sd_canvas_stroke_path_ex(i1, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 110
+    so_restore();
+    check(sd_flatten_truncated(), 1);                                  # 111 — mid-points were lost
+    var i2 = so_canvas(SD_AA_SUBSCANLINE);
+    check(sd_canvas_stroke_path_ex(i2, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_OK);                                                      # 112 ⭐ no leak into the next call
+    check(cov_diff(i2, so_ref(2, SD_AA_SUBSCANLINE)), 0);              # 113
+    check(sd_flatten_truncated(), 1);                                  # 114 ⚠ and still sticky, as ever
+    # ⭐ THE ROUND STROKER SCOPES AND RESTORES THE SAME WAY, and this is the pair that gates it —
+    # the reason _sd_round_walk exists as a function separate from sd_canvas_stroke_path. A HEALTHY
+    # round stroke run while a verdict is standing must hand it back: it clears _sd_flat_trunc for
+    # its own walk (so its return code answers for THIS call) and restores the caller's on the way
+    # out. MEASURED as a mutation (the one restore line in sd_canvas_stroke_path deleted): #117
+    # reads 0 — a verdict the caller was holding, silently swallowed by a stroke that drew fine —
+    # while this suite and every other stayed green without these three checks. ⚠ #118 below cannot
+    # reach it: it STARVES the round stroker, and #119 clears the flag with sd_path_flatten anyway.
+    var i2b = so_canvas(SD_AA_SUBSCANLINE);
+    check(sd_canvas_stroke_path(i2b, g_curve, SO_WIDTH), SADISH_OK);   # 115 — healthy, and...
+    check(cov_diff(i2b, so_ref(1, SD_AA_SUBSCANLINE)), 0);             # 116 — ...the clean picture
+    check(sd_flatten_truncated(), 1);                                  # 117 ⭐ the verdict still stands
+    var i3 = so_canvas(SD_AA_SUBSCANLINE);
+    so_budget(2);
+    check(sd_canvas_stroke_path(i3, g_curve, SO_WIDTH), SADISH_ERR_OOM);   # 118 — the round stroker too
+    so_restore();
+    sd_path_flatten(g_line, SD_ONE >> 2);
+    check(sd_flatten_truncated(), 0);                                  # 119 — only this clears it
+
+    # ── K) A REFUSED SCRATCH GROWTH IS A REFUSAL TOO ──────────────────
+    # ⛔ The run, the curve flags and the batch GROW from the global alloc (0.7.0), and a growth
+    # that fails DROPS what does not fit — 0.6.0's degradation, recorded in _sd_run_trunc /
+    # _sd_sb_trunc. That is a silent under-draw of exactly the kind this item is about, so it is a
+    # return code now. Driven through the PUBLIC ceiling (sd_grow_limit_set, grow_edges_test's and
+    # dash_test's device) with the capacities lowered white-box: the blocks under them are the real
+    # ones, so nothing can be written past anything — only the growth path is entered early.
+    var save_run_cap = _sd_stroke_run_cap;
+    var save_inner_cap = _sd_sb_inner_cap;
+    var save_sb_cap = _sd_sb_cap;
+    var save_run = _sd_stroke_run;
+    var save_inner = _sd_sb_inner;
+    var save_edges = _sd_sb_edges;
+    var kprev = sd_grow_limit_set(1);      # no growth of any size can be served
+    _sd_stroke_run_cap = 4;
+    _sd_sb_inner_cap = 4;
+    var k1 = so_canvas(SD_AA_SUBSCANLINE);
+    check(sd_canvas_stroke_path(k1, g_curve, SO_WIDTH), SADISH_ERR_OOM);   # 120 — the round stroker
+    check(_sd_run_trunc, 1);                                           # 121 — a run point was dropped
+    var k2 = so_canvas(SD_AA_SUBSCANLINE);
+    check(sd_canvas_stroke_path_ex(k2, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 122
+    var k3 = so_canvas(SD_AA_SUBSCANLINE);
+    check(sd_canvas_stroke_path_dash(k3, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML,
+        g_pat, 2, 0), SADISH_ERR_OOM);                                   # 123
+    _sd_stroke_run_cap = save_run_cap;
+    _sd_sb_inner_cap = save_inner_cap;
+    # The BATCH's own backstop: a unit that cannot reserve its edges flushes, and an edge arriving
+    # at the full array with no growth to be had is dropped and recorded — which the flush turns
+    # into the call's refusal.
+    _sd_sb_cap = 4;
+    var k4 = so_canvas(SD_AA_SUBSCANLINE);
+    check(sd_canvas_stroke_path_ex(k4, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
+      SADISH_ERR_OOM);                                                 # 124
+    check(_sd_stroke_oom, 1);                                          # 125 — carried by the flag
+    check(_sd_sb_trunc, 0);                                            # 126 — and the flush cleared it
+    _sd_sb_cap = save_sb_cap;
+    sd_grow_limit_set(kprev);
+    check(sd_grow_limit_get(), SD_GROW_LIMIT_DEFAULT);                 # 127
+    check(_sd_stroke_run, save_run);                                   # 128 — no block was replaced
+    check(_sd_sb_inner, save_inner);                                   # 129
+    check(_sd_sb_edges, save_edges);                                   # 130
+    var k5 = so_canvas(SD_AA_SUBSCANLINE);
+    check(draw_case(1, k5), SADISH_OK);                                # 131 — and the next stroke...
+    check(cov_diff(k5, so_ref(1, SD_AA_SUBSCANLINE)), 0);              # 132 ⭐ ...is the clean picture
+    check(_sd_run_trunc, 0);                                           # 133 — reset per call, as ever
+
+    # ── J) NOTHING MOVED ──────────────────────────────
+    # ⭐ THE WHOLE SUITE'S STARVATION, ANSWERED IN ONE BATTERY: every case on every engine, drawn
+    # again now, against the pictures taken in group A before the first refusal.
+    bad = 0;
+    c = 0;
+    while (c < SO_CASES) {
+        var jm = SD_AA_SUBSCANLINE;
+        while (jm <= SD_AA_AREA) {
+            var jcv = so_canvas(jm);
+            if (draw_case(c, jcv) != SADISH_OK) { bad = bad + 1; }
+            bad = bad + cov_diff(jcv, so_ref(c, jm));
+            jm = jm + 1;
+        }
+        c = c + 1;
+    }
+    check(bad, 0);                                                     # 134
+    check(_sd_sb_n, 0);                                                # 135 — the batch is empty
+    check(_sd_sb_trunc, 0);                                            # 136 — and whole
+    check(_sd_run_trunc, 0);                                           # 137
+    check(_sd_dash_trunc, 0);                                          # 138
+    check(_sd_stroke_oom, 0);                                          # 139
+    check(_sd_fill_trunc, 0);                                          # 140
+    check(_sd_stroke_run != 0, 1);                                     # 141
+    check(_sd_stroke_fbuf != 0, 1);                                    # 142
+    check(_sd_stroke_fctx != 0, 1);                                    # 143
+    check(_sd_sb_inner != 0, 1);                                       # 144
+    check(_sd_sb_trig != 0, 1);                                        # 145
+    check(_sd_dash_flags != 0, 1);                                     # 146
+    check(_sd_dash_rec != 0, 1);                                       # 147
+    check(_sd_fill_cross_cap >= _sd_sb_cap, 1);                        # 148 — the borrowing invariant
+    check(SD_FLATTEN_CAP, 8192);                                       # 149 — the knob is back
+    check(sd_grow_limit_get(), SD_GROW_LIMIT_DEFAULT);                 # 150 — untouched throughout
+    check(sd_alloc_get(), 0);                                          # 151 — every scope unwound
+    # And a warm styled stroke still costs the global heap nothing but its canvas.
+    gh = alloc_used();
+    var jlast = so_canvas(SD_AA_SUBSCANLINE);
+    check(draw_case(11, jlast), SADISH_OK);                            # 152
+    check(alloc_used() - gh, 48 + SO_W * SO_H);                        # 153 — the canvas, and only it
+
+    if (g_fails == 0) {
+        var ok = "stroke_oom_test: PASS (every stroke entry reports a refusal, nothing faults, nothing moved)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var badm = "stroke_oom_test: FAIL\n";
+        syscall(1, 2, badm, strlen(badm));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

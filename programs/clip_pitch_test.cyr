@@ -7,7 +7,7 @@
 # is addressed `y * w + x`. Through 0.6.0 the three consumers of the mask — sd_fill_impl's
 # SUBSCANLINE loop, _sd_area_fill and the styled flush _sd_sb_flush — read it `py * stride + px`,
 # the COVERAGE pitch, while all three producers wrote it packed. Filed as
-# docs/development/issues/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md; the
+# docs/development/issues/archived/2026-09-15-clip-masks-written-packed-but-read-by-canvas-stride.md; the
 # 0.6.0 stroke verifier's mutation "clip mask read by w" survived as EQUIVALENT because no canvas
 # could tell the two apart. This suite is the canvas that can.
 #
@@ -197,6 +197,57 @@ fn cp_surf_diff(sa, sb): i64 {
         y = y + 1;
     }
     return d;
+}
+
+# Pixels that differ between two surfaces in ALL FOUR BYTES — group K's oracle for the
+# PREMULTIPLIED blits, whose real answer is the alpha byte sd_surface_pixel_at drops.
+fn cp_surf_diff_rgba(sa, sb): i64 {
+    var d = 0;
+    var y = 0;
+    while (y < CP_H) {
+        var x = 0;
+        while (x < CP_W) {
+            if (sd_surface_rgba_at(sa, x, y) != sd_surface_rgba_at(sb, x, y)) { d = d + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return d;
+}
+
+# Pixels of `s` that are not still transparent black — a blit that painted nothing scores 0, and a
+# comparison of two surfaces nothing painted would pass while proving nothing.
+fn cp_surf_ink(s): i64 {
+    var n = 0;
+    var y = 0;
+    while (y < CP_H) {
+        var x = 0;
+        while (x < CP_W) {
+            if (sd_surface_rgba_at(s, x, y) != 0) { n = n + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return n;
+}
+
+# Pixels of `s` whose alpha byte is PARTIAL (1..254). Only a composited alpha can leave one: the
+# straight blits force byte 3 to 255, so this is how group K knows the premultiplied store ran.
+fn cp_surf_partial_alpha(s): i64 {
+    var n = 0;
+    var y = 0;
+    while (y < CP_H) {
+        var x = 0;
+        while (x < CP_W) {
+            var a = (sd_surface_rgba_at(s, x, y) >> 24) & 255;
+            if (a > 0) {
+                if (a < 255) { n = n + 1; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return n;
 }
 
 # Coverage summed over the window pixels OUTSIDE the clip rectangle — 0 or the clip leaked.
@@ -611,6 +662,71 @@ fn main(): i64 {
     check(cp_surf_diff(jsa, jsc) > 0, 1);                                            # 104
     check(cp_surf_diff(jsc, jse) > 0, 1);                                            # 105
     check(cp_guard_bad(), 0);                                                        # 106 — a blit only reads
+
+    # ── K) THE THREE COVERAGE LOADS GROUP J COULD NOT REACH ────────────────
+    # ⭐ WHY THIS GROUP EXISTS. Group J's header — and the filing's closing paragraph — read as a
+    # closed class ("the three blit loads"). They are not the only three. RE-MEASURED at 0.7.1,
+    # pushing any ONE of these to the packed index `y * cw + x` left ALL 27 SUITES GREEN:
+    #   · sd_canvas_blit_gradient's own loop (src/raster.cyr) — it predates the 0.7.0 fix and group J
+    #     never calls it: J drives sd_canvas_blit_at, sd_canvas_blit_paint_at and _sd_paint_blit_point.
+    #   · the `pm != 0` coverage argument in _sd_paint_blit_run (src/paint.cyr) — the pointer handed
+    #     to _sd_premul_paint_px. Group J drives that loop only at pm = 0, where the byte is the `a`
+    #     load above it (which J does pin); at pm != 0 the store re-reads coverage through its OWN
+    #     expression, reached only from sd_canvas_blit_paint_premul_at / _premul.
+    #   · the same argument in _sd_paint_blit_point, for a FOCAL gradient or a gradient matrix.
+    # All three are CORRECT in the tree; none was gated. No source change — this group is the gate.
+    # ⚠ The `a != 0` test above each store still reads the STRIDE, so a mis-addressed store argument
+    # paints exactly the pixels it should and paints them the WRONG WEIGHT: the oracle has to compare
+    # bytes, not presence. And for the premultiplied pair it has to compare FOUR bytes — the alpha is
+    # the byte those blits exist for, and sd_surface_pixel_at drops it.
+    # ⭐ THE TELL-TALE, by hand (CP_PITCH = 16, CP_W = 10, sentinel 90): a packed read at (x, y)
+    # takes buffer byte y * 10 + x, which at a 16-pitch is row (y * 10 + x) / 16, column
+    # (y * 10 + x) % 16. Row 0 maps onto itself (0..9 < 16) — so row 0 can never show this, and a
+    # comparison confined to it would pass. Row 1 reads bytes 10..19: SIX of them are row 0's
+    # PADDING (the sentinel 90, a coverage no fill writes) and the rest are row 1's columns 0..3.
+    # Every offset a packed reader reaches stays inside the 9-row buffer (max 6 * 10 + 9 = 69 < 112),
+    # so the failure is deterministic and owes nothing to the heap.
+    cp_rig();
+    var pkk = sd_canvas_new(CP_W, CP_H);
+    var kell = cp_ell();
+    sd_canvas_stroke_path_ex(g_cp_cv, kell, 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, 4 * SD_ONE);
+    sd_canvas_stroke_path_ex(pkk, kell, 3 * SD_ONE, SD_CAP_SQUARE, SD_JOIN_MITER, 4 * SD_ONE);
+    check(cp_diff_packed(pkk), 0);                                                   # 107 — same coverage
+    # K1. sd_canvas_blit_gradient — the 0.4.0 linear blit, and its own coverage load.
+    var ksa = sd_surface_new(CP_W, CP_H);
+    var ksb = sd_surface_new(CP_W, CP_H);
+    check(sd_canvas_blit_gradient(g_cp_cv, ksa, 0, 0, 16711680, CP_W - 1, CP_H - 1, 255),   # 108
+      SADISH_OK);
+    check(sd_canvas_blit_gradient(pkk, ksb, 0, 0, 16711680, CP_W - 1, CP_H - 1, 255),       # 109
+      SADISH_OK);
+    check(cp_surf_diff(ksa, ksb), 0);                                                # 110 — THE load
+    check(cp_surf_ink(ksa) > 0, 1);                                                  # 111 — it painted
+    # K2. sd_canvas_blit_paint_premul_at, LINEAR: _sd_paint_blit_run's pm != 0 branch. The
+    # destinations are fresh (transparent) surfaces, so the composited alpha is the coverage itself.
+    var kgl = sd_gradient_linear(0, 0, CP_W * SD_ONE, 0);
+    sd_gradient_add_stop(kgl, 0, 16711680);
+    sd_gradient_add_stop(kgl, SD_ONE, 255);
+    var ksc = sd_surface_new(CP_W, CP_H);
+    var ksd = sd_surface_new(CP_W, CP_H);
+    check(sd_canvas_blit_paint_premul_at(g_cp_cv, ksc, kgl, 0, 0), SADISH_OK);       # 112
+    check(sd_canvas_blit_paint_premul_at(pkk, ksd, kgl, 0, 0), SADISH_OK);           # 113
+    check(cp_surf_diff_rgba(ksc, ksd), 0);                                           # 114 — THE load
+    check(cp_surf_partial_alpha(ksc) > 0, 1);                                        # 115 — premul ran
+    # K3. The same through _sd_paint_blit_point: a FOCAL radial, focus off the centre.
+    var kgf = sd_gradient_radial_focal(5 * SD_ONE, 3 * SD_ONE, 4 * SD_ONE, 3 * SD_ONE, 2 * SD_ONE);
+    sd_gradient_add_stop(kgf, 0, 16711680);
+    sd_gradient_add_stop(kgf, SD_ONE, 255);
+    var kse = sd_surface_new(CP_W, CP_H);
+    var ksf = sd_surface_new(CP_W, CP_H);
+    check(sd_canvas_blit_paint_premul_at(g_cp_cv, kse, kgf, 0, 0), SADISH_OK);       # 116
+    check(sd_canvas_blit_paint_premul_at(pkk, ksf, kgf, 0, 0), SADISH_OK);           # 117
+    check(cp_surf_diff_rgba(kse, ksf), 0);                                           # 118 — THE load
+    check(cp_surf_partial_alpha(kse) > 0, 1);                                        # 119 — premul ran
+    # The three pictures must differ from each other, and the premultiplied pair from the straight
+    # one — or the comparisons above are three views of the same blit.
+    check(cp_surf_diff_rgba(ksa, ksc) > 0, 1);                                       # 120
+    check(cp_surf_diff_rgba(ksc, kse) > 0, 1);                                       # 121
+    check(cp_guard_bad(), 0);                                                        # 122 — read-only
 
     if (g_fails == 0) {
         var ok = "clip_pitch_test: PASS (clip masks are packed w*h on a canvas of any stride)\n";

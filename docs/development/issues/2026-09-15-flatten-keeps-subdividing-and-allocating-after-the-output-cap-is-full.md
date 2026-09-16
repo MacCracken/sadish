@@ -1,13 +1,17 @@
 # `sd_path_flatten` keeps subdividing — and allocating mid-points — after its 8,192-point output is full
 
-**Status:** 🟡 **OPEN — the BOUND shipped in 0.7.1; the second suggested fix did not.** The mid-point
-waste, the cross-curve stop and the per-operation budget are all in, and every figure in the closing
-section at the foot of this file was RE-MEASURED 2026-09-15 against 0.7.1 (HEAD `f722e8c`) and
-reproduced. What is NOT in: a truncated contour is still **filled open**, there is no flag on the
-polyline, STROKES get no error at all, and an unwrapped `sd_canvas_fill_path` of an untrusted outline
-— the path this filing's own Severity line is about — is still not bounded by the budget. See **Still
-open** at the foot. ⛔ This line read "🟢 CLOSED — FIXED in sadish 0.7.1" until that re-audit; a reader
-of the Status line alone came away with the wrong picture.
+**Status:** 🟡 **OPEN — the BOUND shipped in 0.7.1, the FILL got the budget's scope in 0.7.2, and the
+REPORTING half of the second suggested fix still has not.** The mid-point waste, the cross-curve stop
+and the per-operation budget are all in, and every figure in the closing section at the foot of this
+file was RE-MEASURED 2026-09-15 against 0.7.1 (HEAD `f722e8c`) and reproduced. ⭐ **0.7.2 closed
+Still-open item 3**, the one the Severity line is about: `sd_fill_impl` now opens ONE flatten
+operation for the whole fill, so an unwrapped `sd_canvas_fill_path` of an untrusted outline is
+bounded by the budget and `sd_flatten_degraded()` answers for it (MEASURED: the hostile 4,096-quad
+fill 16,711,680 B → **1,044,480 B**, 1,044,480 → **65,280** allocations, and the same figure at 1,024
+quads — the work no longer grows with the curve count). What is STILL NOT in: a truncated contour is
+filled open, there is no flag on the polyline, and STROKES get no error at all. See **Still open** at
+the foot. ⛔ This line read "🟢 CLOSED — FIXED in sadish 0.7.1" until that re-audit; a reader of the
+Status line alone came away with the wrong picture.
 Was 🟡 OPEN — MEASURED on sadish **0.6.0** (and identically on 0.5.5 and 0.7.0).
 **Filed:** 2026-09-15, by **rekha** (0.3.11 audit — a fresh security review measured it through rekha's
 draw path; re-measured here against sadish alone).
@@ -156,13 +160,78 @@ count at all — the 1,024 and 4,096 rows are the same figure, which is the budg
 | 0.7.0 | 50,135,040 | 3,133,440 |
 | 0.7.1 | **16,711,680** | **1,044,480** |
 | 0.7.1 inside `sd_flatten_op_begin/end` | **1,044,480** | **65,280** |
+| **0.7.2, unwrapped** | **1,044,480** | **65,280** |
 
-⚠ raster.cyr flattens ONE CURVE VERB at a time into a fixed per-curve buffer, so each of those calls
-is its own flatten operation and the budget bounds one curve there (≤ 256 points), not the fill. The
-3× is the mid-point fix alone. A consumer that wants a whole untrusted fill bounded scopes it with
-the public `sd_flatten_op_begin()` / `sd_flatten_op_end()` — the third row, 48× under 0.7.0 — and
-reads `sd_flatten_degraded()` afterwards. Giving the fill that scope by default is a one-line change
-inside `sd_fill_impl`, which this repair did not touch.
+⚠ raster.cyr flattens ONE CURVE VERB at a time into a fixed per-curve buffer. Through 0.7.1 each of
+those calls was its own flatten operation, so the budget bounded one curve there (≤ 256 points) and
+not the fill; the 3× is the mid-point fix alone. A consumer that wanted a whole untrusted fill bounded
+had to scope it with the public `sd_flatten_op_begin()` / `sd_flatten_op_end()` — the third row, 48×
+under 0.7.0 — and read `sd_flatten_degraded()` afterwards.
+⭐ **0.7.2 made that the default** (fourth row, MEASURED on the same repro): `sd_fill_impl` opens the
+operation itself, so wrapping is now a no-op in cost rather than the difference between bounded and
+unbounded. It is not the one-line change this paragraph used to predict — the open is LAZY, at the
+first curve the fill really flattens, because `sd_flatten_degraded()`'s contract is that a fill of a
+path with no curve verbs opens no operation and leaves the standing verdict alone (an unconditional
+`sd_flatten_op_begin()` at the top of `sd_fill_impl` would clear a consumer's verdict on every
+rectangle it draws — MEASURED as a mutation: it passes every other check in the suite and fails
+`flatten_bound_test` #334 and #342). See Still open, item 3.
+
+### 4. THE FILL IS ONE OPERATION (0.7.2) — Still-open item 3
+
+`sd_fill_impl` opens a flatten operation at the first curve verb it really flattens and closes it when
+the verb walk ends. Ten lines of code in three places — a flag, an open in each of the two curve
+branches, one close — not the one line this file predicted, and the shape of them is the contract:
+the open is inside the `qe != 0` / `ke != 0` guards (a curve before any moveto is skipped, so it opens
+nothing), it happens at most once a fill (a flag, not per verb), and the close is paired with that
+flag (so it can never end a level the CONSUMER opened). Nothing between the open and the close
+returns, so the nesting depth cannot leak.
+
+**Proof the gate bites** — MEASURED on the 0.7.2 tree, each mutation applied ALONE and reverted, with
+`flatten_bound_test`, `clip_pitch_test`, `integration_test`, `alloc_test`, `grow_edges_test`,
+`oom_test` and `area_test` re-run under each:
+
+| mutation of the 0.7.2 change | what fails |
+|---|---|
+| the QUAD branch's open deleted | `flatten_bound_test` 102, 103, 104, 307, 308 — no other suite |
+| the CUBIC branch's open deleted | 309, 310, 354, 355 — no other suite |
+| the close deleted | 78 (got 33, want 98), then the suite dies (rc 139): the depth never returns to 0, so every later flatten is nested, the point count never resets, and group G's tail walk reads 98 points out of a polyline that now holds 33 |
+| the open made unconditional (this file's "one-line change") | 334, 342 — the standing-verdict contract, and nothing else |
+| the close made unconditional (`fop != 0` guard dropped) | 338 — it ends a level the consumer opened |
+| `fop = 1` never set (an open per curve, one close) | 78, then rc 139, as above |
+| the close moved below the closing edge-add | **EQUIVALENT** — `sd_edge_add` flattens nothing, so the operation covers the same flattens; all 7 suites stay green, as expected |
+
+⛔⛔ **AND WHAT RE-MEASURING 102/103/104 TOOK AWAY, which a review caught and this filing records so
+it cannot happen again.** `sd_flatten_quad` and `sd_flatten_cubic` open a flatten operation of their
+OWN around each curve (`src/path.cyr`). Once `sd_fill_impl` opens one first, those two begins nest
+inside it for a fill — so the pair is now the depth-0 operation for exactly ONE caller left:
+`stroke.cyr`, which walks a path one curve verb at a time and never opens a scope (`_sd_round_walk`
+`src/stroke.cyr:280`/`:294` and `_sd_styled_walk` `:1257`/`:1273`, at 0.7.2 — the round walk was
+still inline in `sd_canvas_stroke_path` at 0.7.1, `:247`/`:261`; the stroker's own fills go through
+`sd_canvas_fill_union` with lineto-only polygons, which open nothing). Nothing else resets
+`_sd_flat_used` for an unwrapped stroke. Checks 102/103/104 were that pair's only gate, and
+re-measuring them for the fill scope left it ungated: MEASURED on the 0.7.2 tree, deleting the
+begin/end from `sd_flatten_quad` ALONE left **all 27 suites green**, and so did deleting both pairs.
+The behaviour it guards is real — MEASURED at a budget of 64 points, ten identical unwrapped strokes
+of one 4-cubic circle on a fresh 64×64 canvas: **126,930** coverage units every time with the pair,
+and **126,930 four times then 114,300 with `degraded()` = 1 for ever after** without it, because
+`_sd_flat_used` then accumulates for the life of the PROCESS. ⇒ `flatten_bound_test` **group P**
+(checks 359-372) replaces the lost gate: 360/361 drive the plain stroker's cubic and quad branches,
+362/363 the styled walk's, each ten strokes deep against a MEASURED ink figure and
+`sd_flatten_degraded()` == 0; 364-369 are the anti-vacuity half (the same stroke repeated inside ONE
+consumer operation shares one budget, so the fifth is cut to chords — the budget really is spendable
+at 64); 370-372 restore the default and re-check the whole picture.
+
+| mutation of code the re-measure un-pinned | what fails |
+|---|---|
+| `sd_flatten_quad`'s own begin/end deleted | `flatten_bound_test` 361, 363 — no other suite (before group P: nothing, in any of the 27) |
+| `sd_flatten_cubic`'s own begin/end deleted | 360, 362, 372 — no other suite (before group P: nothing) |
+| both deleted | 360, 361, 362, 363, 372 — no other suite (before group P: nothing) |
+
+**Byte-identical**, as 0.7.1 was: all 27 suites pass with their assertions unedited except the three
+group-H figures this deliberately moves (102: 16,711,680 → 1,044,480 B; 103: 1,044,480 → 65,280 calls;
+104: `sd_flatten_degraded()` 0 → 1 — the verdict the unwrapped consumer used to be denied), agnos's
+`refagree` prints *BYTE-IDENTICAL on all 200 paths* against the 0.7.2 `dist/`, and rekha's 23 suites
+and dhancha's 18 pass against it with no `undefined function`.
 
 ### Geometry
 
@@ -177,11 +246,12 @@ Truncation remains reportable (`sd_flatten_truncated()`, `_sd_flat_trunc`); degr
 separate verdict (`sd_flatten_degraded()`).
 ⛔ This sentence used to end "unchanged since 0.6.1", and both halves were wrong. **There is no 0.6.1**
 in this repo — no tag (0.6.0 then 0.7.0) and no CHANGELOG section; `_sd_flat_trunc` and the growable
-output shipped in **0.7.0** (`536a3b4`), and the same phantom label sits in `src/path.cyr:305-307` and
-`:698`. And it is not unchanged: the PUBLIC accessor `sd_flatten_truncated()` does not exist anywhere
+output shipped in **0.7.0** (`536a3b4`). ⭐ The same phantom label sat in `src/path.cyr` twice and in 22
+other places across `src/` and `programs/`; all 24 were corrected to 0.7.0 in `cc6fd75`, after this
+paragraph was written. And it is not unchanged: the PUBLIC accessor `sd_flatten_truncated()` does not exist anywhere
 in 0.7.0's src (`git show 536a3b4:src/path.cyr` — 0 hits), it is **new in 0.7.1**; `_sd_flat_trunc`
-gained a set site in `_sd_flat_put` (`src/path.cyr:498`), had its clear moved before the empty-path
-return (`:713`), and is now saved and restored around a fill by raster.cyr.
+gained a set site in `_sd_flat_put`, had its clear moved before the empty-path return in
+`sd_path_flatten`, and is now saved and restored around a fill by raster.cyr.
 
 ### ⚠ What the two verdicts do and do not answer for
 
@@ -192,62 +262,115 @@ return (`:713`), and is now saved and restored around a fill by raster.cyr.
   the SAME release, out of the sibling filing
   `2026-09-15-path-construction-stores-through-a-refused-allocation.md`: `sd_fill_impl` scopes the
   flatten's truncation verdict to the call and returns **`SADISH_ERR_OOM`** when that fill lost points
-  (`src/raster.cyr:606-606`, `:676-679`), pinned by `programs/flatten_bound_test.cyr` check #271 (the
+  (`src/raster.cyr` `sd_fill_impl`: `flat_was` at its verb walk, `flat_lost` / `flat_rc` after it —
+  `:606` and `:676-679` at 0.7.1, `:643` and `:727-730` at 0.7.2, which is why this file's own README
+  says to cite the FUNCTION), pinned by `programs/flatten_bound_test.cyr` check #271 (the
   assertion that changed with it, `SADISH_OK` → `SADISH_ERR_OOM`). The ink figures stand as MEASURED:
   a 20 px circle of 4 cubics on 64×64 under a hook granting 5 allocations paints 81,029 of 312,280
   coverage units with `truncated()` = 1 — it now says so in its return code too. (0.7.0 did not get
   that far: it dereferenced the refused `SdPoint` and died.) ⚠ The same stale sentence is in the
-  shipped source comment at `src/path.cyr:408-412`, and `cyrius distlib` copies it into
-  `dist/sadish.cyr`, where a consumer reads it. ⚠ Nothing was folded into `_sd_fill_trunc`, and there
-  is still no public fill-truncation accessor; raster.cyr took the per-call scoping route instead.
+  shipped source comment — `sd_flatten_truncated`'s own `@public` header in `src/path.cyr`
+  (`:408-412` at 0.7.1; that header is `:466-479` at 0.7.2) — and `cyrius distlib` copies it into
+  `dist/sadish.cyr`, where a consumer reads it. ⛔ **That claim is STALE as of 0.7.2, checked
+  2026-09-16 — the pointer above is updated, the sentence is left standing.** 0.7.2 rewrote the
+  header, which now opens *"IT IS NO LONGER THE ONLY WITNESS, and the header said it was through
+  0.7.1"*; `grep -rn "do not clear it"` over `src/*.cyr` and `dist/sadish.cyr` returns **0 hits**, so
+  the bundle no longer carries it either. ⚠ Nothing was folded into `_sd_fill_trunc`, and there is
+  still no public fill-truncation accessor; raster.cyr took the per-call scoping route instead.
 - `sd_flatten_degraded()` belongs to the last **operation**, and is cleared when the next one opens
   at nesting depth 0. Every `sd_path_flatten` is an operation — an empty path included, which is why
-  both verdicts are cleared BEFORE the empty-path return — and so is every single curve verb a fill
-  flattens. ⚠ A fill of a path with **no curve verbs** opens none at all, so it leaves whichever
-  verdict was already standing. A consumer that wants an answer for one particular draw scopes it
-  with `sd_flatten_op_begin()` / `sd_flatten_op_end()`. ⚠ That last sentence has **no check in the
-  suite** — re-verified by hand 2026-09-15 (`degraded()` == 1 survives a lineto-only fill; a curve
-  fill clears it), so the behaviour holds, but a maintainer can break it silently.
+  both verdicts are cleared BEFORE the empty-path return — and since 0.7.2 so is every FILL that
+  flattens at least one curve (0.7.1: every single curve verb, separately). ⚠ A fill of a path with
+  **no curve verbs** opens none at all, so it leaves whichever verdict was already standing. A
+  consumer that wants an answer for one particular draw scopes it with `sd_flatten_op_begin()` /
+  `sd_flatten_op_end()`. ⭐ That last sentence had **no check in the suite** through 0.7.1 —
+  re-verified by hand 2026-09-15, so the behaviour held, but a maintainer could break it silently.
+  **0.7.2 pinned it**: `flatten_bound_test` group O checks **331-334** (a `degraded()` == 1 verdict
+  established by a budgeted flatten survives a lineto-only fill that really fills 261,120 coverage
+  units), **340-342** (the same for a path whose only curve verbs sit before its first moveto, which
+  are skipped and so flatten nothing), **335-339** (that fill neither opens nor closes a level of a
+  consumer's own scope: begin, begin, fill, end → 1, end → 0) and **343-344** (the other half — a
+  fill that DOES flatten a curve answers for itself and clears what it inherited).
 
 ---
 
-## Still open (re-audited 2026-09-15 against 0.7.1, HEAD `f722e8c`)
+## Still open (re-audited 2026-09-15 against 0.7.1, HEAD `f722e8c`; item 3 closed by 0.7.2)
 
-Three of the "Suggested fix" asks above are not met by the shipped code. Each is MEASURED, and each is
-already stated somewhere in the body — the Status line is what did not say so.
+Three of the "Suggested fix" asks above were not met by the shipped code. Each is MEASURED, and each
+is already stated somewhere in the body — the Status line is what did not say so. **Item 3 is now
+closed; items 1 and 2 are still open and this filing cannot be archived until they are.**
 
 1. **"a truncated contour is refused or clearly degraded, rather than filled open"** — it is still
-   filled open. `src/raster.cyr:593` says so in the tree: *"The canvas still holds that partial
-   picture — the caller decides whether to clear and retry."* Nothing is refused. There is no flag on
-   the polyline either: `SdPolyline` is still 16 B, points + count (`src/path.cyr:288-294`). What
-   shipped is a sticky global verdict plus a return code.
-2. **The `/stroke` half of the same bullet** — not done. `src/raster.cyr:597-597`: *"Strokes are NOT
-   covered by this return."* `sd_canvas_fill_union`'s result is discarded at `src/stroke.cyr:139` and
-   `:156`, so a stroke of a starved path still returns success.
-3. **"whatever replaces the cap should still bound total flatten work per call"** — bounded for
-   `sd_path_flatten`, NOT for a fill by default, which is the path the Severity line is about
-   (rekha → dhancha → crab, glyph outlines from font files every frame). A fill opens ONE operation
-   per curve verb, so the budget bounds one curve (≤ 256 points), not the fill. MEASURED 2026-09-15:
-   an unwrapped `sd_canvas_fill_path` of the hostile path costs 261,120 allocations / 4,177,920 B at
-   1,024 quads and 1,044,480 / 16,711,680 B at 4,096 — still exactly linear in the curve count at 255
-   allocations per curve, i.e. this filing's consequence 1 survives for fills at 1/3 the old cost.
-   Wrapped in `sd_flatten_op_begin`/`_end` it is 65,280 at both sizes. ⚠ And the unwrapped consumer
-   gets no warning: `sd_flatten_degraded()` reads **0** after both unwrapped fills (asserted as
-   intended at check #104). The consumer has to KNOW to scope it. The ⚠ block above names the fix —
-   "a one-line change inside `sd_fill_impl`, which this repair did not touch".
+   filled open. `sd_fill_impl` (`src/raster.cyr:595` at 0.7.2) says so in the tree: *"The canvas
+   still holds that partial picture — the caller decides whether to clear and retry."* Nothing is
+   refused. There is no flag on the polyline either: `SdPolyline` is still 16 B, points + count
+   (`SD_POLYLINE_*_OFFSET`, `src/path.cyr:352-354` at 0.7.2). What shipped is a sticky global verdict
+   plus a return code.
+2. **The `/stroke` half of the same bullet** — not done. `sd_fill_impl`'s note
+   (`src/raster.cyr:597` at 0.7.1): *"Strokes are NOT covered by this return."*
+   `sd_canvas_fill_union`'s result is discarded in `sd_stroke_seg` and `sd_stroke_disc`
+   (`src/stroke.cyr:139` and `:156` at 0.7.1), so a stroke of a starved path still returns success.
+   ⛔ **The tree says neither of those things any more, checked 2026-09-16 — this is 0.7.1's finding,
+   and it is left standing rather than re-pointed.** 0.7.2 rewrote the note to *"Strokes were NOT
+   covered by this return through 0.7.1 … Since 0.7.2 each stroke entry scopes the verdict the same
+   way and returns SADISH_ERR_OOM itself"* (`sd_fill_impl`, `src/raster.cyr:599-602`), and
+   `sd_stroke_seg` / `sd_stroke_disc` now RETURN `sd_canvas_fill_union`'s result
+   (`src/stroke.cyr:178`, `:201`). Whether the ask is closed is the sibling filing's 0.7.2 closing
+   section, not a line number.
+3. ~~**"whatever replaces the cap should still bound total flatten work per call"**~~ — **CLOSED in
+   0.7.2** (`src/raster.cyr` `sd_fill_impl`, gated by `programs/flatten_bound_test.cyr` group O and
+   by group H's re-measured 102/103/104).
+   The finding stood as follows. Bounded for `sd_path_flatten`, NOT for a fill by default, which is
+   the path the Severity line is about (rekha → dhancha → crab, glyph outlines from font files every
+   frame): a fill opened ONE operation per curve verb, so the budget bounded one curve (≤ 256 points),
+   not the fill. MEASURED 2026-09-15 on 0.7.1, an unwrapped `sd_canvas_fill_path` of the hostile path:
+   261,120 allocations / 4,177,920 B at 1,024 quads and 1,044,480 / 16,711,680 B at 4,096 — exactly
+   linear in the curve count at 255 allocations a curve. And the unwrapped consumer got no warning:
+   `sd_flatten_degraded()` read **0** after both (asserted as intended at check #104).
+   **RE-MEASURED on 0.7.2**, same repro, same hook, the fill now scoping its own operation:
+
+   | one unwrapped `sd_canvas_fill_path`, 64x64 | 0.7.1 | 0.7.2 |
+   |---|---:|---:|
+   | 1,024 maximally non-flat quads | 4,177,920 B / 261,120 | **1,044,480 B / 65,280** |
+   | 4,096 maximally non-flat quads | 16,711,680 B / 1,044,480 | **1,044,480 B / 65,280** |
+   | 1,024 depth-8 cubics | 3,784,704 B / 236,544 | **1,044,096 B / 65,256** |
+   | 4,096 depth-8 cubics | 15,138,816 B / 946,176 | **1,044,096 B / 65,256** |
+   | `sd_flatten_degraded()` after it | 0 | **1** |
+
+   ⇒ 16.0× the bytes at 4,096 quads, 14.5× for the cubics, and the 1,024 and 4,096 rows are now the
+   same figure — which is what "bounded" means. Wrapping in `sd_flatten_op_begin`/`_end` still works
+   and now costs exactly the same, so a consumer that already scopes its draws is unaffected.
+   ⚠ **The trade, decided on measurement rather than taste.** A path whose ONE fill emits more than
+   `SD_FLATTEN_BUDGET_DEFAULT` = 65,536 points now degrades its remaining curves to chords mid-fill.
+   Points emitted by one fill, MEASURED on this tree at the fill's own tolerance (`SD_ONE >> 2`):
+   a circle of 4 cubics from 8 px to 4,096 px radius **16 → 256**; a rounded rect from 200x100 r=16 to
+   1920x1080 r=240 **16 → 64**; a 64-cubic blob at radius 1,024 px **1,536**; these suites' own curve
+   paths (area, stroke_style, mixed) **14 → 26**; `grow_edges_test`'s `cubic_ring(3000)`, the largest
+   curve path in the tree, **8,600**; one synthetic ASCII glyph from a ~13 px em to a ~2,048 px em
+   **60 → 960**; all 95 of them as ONE path — a whole label in one fill — **2,396 → 26,394**.
+   ⇒ The largest legitimate fill anywhere in this repo or its glyph corpus spends **40 %** of the
+   budget, the largest single glyph 1.5 %, a UI shape under 3 %. The default degrades a ONE-PATH label
+   at about 1,889 glyphs at a 32 px em, 649 at 208 px, 236 at 2,048 px — per PATH, not per draw.
+   **The default is therefore unchanged at 65,536**, which also keeps `sd_path_flatten`'s own figures
+   (the table above) and README's published constant true.
+   ⚠ A starved fill is still `SADISH_ERR_OOM` and a degraded one is still `SADISH_OK` plus
+   `sd_flatten_degraded()` — degrading is not losing (group O checks 353-358; group M6 unedited).
 
 ⚠ Bullet 1's letter, for anyone auditing site by site: `sd_flat_emit` does not "return a full flag" —
-it still `return 0;` unconditionally (`src/path.cyr:475-488`) and the verdict travels in the
+it still `return 0;` unconditionally (`src/path.cyr:549` at 0.7.2) and the verdict travels in the
 module-global `_sd_flat_full`; the pre-subdivision test is `_sd_flat_full == ctx`, not
-`count >= cap`. `(count, cap)` is consulted only by `_sd_flat_enter` (`src/path.cyr:531`), when a
-verdict is already standing. Consequence the body does not state: a FOREIGN ctx handed in already full
-with no verdict standing costs one descent to the first leaf and one dropped point per curve, not one
-comparison. Bounded, and gated as intended (checks #290 / #301: 3 calls, then 1).
+`count >= cap`. `(count, cap)` is consulted only by `_sd_flat_enter` (`src/path.cyr:603` at 0.7.2),
+when a verdict is already standing. Consequence the body does not state: a FOREIGN ctx handed in
+already full with no verdict standing costs one descent to the first leaf and one dropped point per
+curve, not one comparison. Bounded, and gated as intended (checks #290 / #301: 3 calls, then 1).
 
-⛔ One structural note from the re-audit: `programs/flatten_bound_test.cyr` (304 checks) is the **only**
-suite that failed for any of 20 one-site reversions of this repair — including the `src/raster.cyr`
-one. The bound, both verdicts and the geometry byte-identity all rest on that single program; nothing
-in the other 26 suites would notice if it were deleted.
+⛔ One structural note from the re-audit: `programs/flatten_bound_test.cyr` (304 checks at 0.7.1, **372
+at 0.7.2** — group O's 54 and group P's 14) is the **only** suite that failed for any of 20 one-site
+reversions of this repair — including the `src/raster.cyr` one. The bound, both verdicts and the
+geometry byte-identity all rest on that single program; nothing in the other 26 suites would notice if
+it were deleted. ⚠ Still true of 0.7.2: of the seven one-site mutations of the fill scope, **six fail
+this suite and no other** (the seventh is equivalent), and so do all three mutations of the stroker's
+per-curve operation (group P) — a full 27-suite sweep was run under each.
 
 **Downstream:** *"rekha will add a regression case for this to its hostile corpus once sadish ships
 the bound"* — unverifiable from this repo, and nothing here tracks whether it happened.

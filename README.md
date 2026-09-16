@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.7.1
+Version: 0.7.2
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -87,10 +87,9 @@ toolkit are all **consumers**, not re-implementations.
     allocations to **3,076,136 B / 65,287**, and the recursion stops once the
     output is full.
   - **A per-operation flatten budget** — `SD_FLATTEN_BUDGET_DEFAULT` = 65,536
-    points, `sd_flatten_budget_set` / `_get`, `sd_flatten_degraded`. ⚠ A fill opens
-    one operation PER CURVE VERB: wrap a draw in `sd_flatten_op_begin()` /
-    `_end()` to bound it as a whole (MEASURED on that path: 16,711,680 B
-    unwrapped, **1,044,480 B** wrapped).
+    points, `sd_flatten_budget_set` / `_get`, `sd_flatten_degraded`. ⚠ Through
+    0.7.1 a fill opened one operation PER CURVE VERB, so the budget did not bound
+    a whole fill; **0.7.2 scopes the fill** (see below).
   - **`sd_path_new_cap(n_verbs, n_points)`** — a path at a caller-known capacity,
     for consumers that know the size before the first moveto.
   - **A refused allocation is a return code, not a fault** — every `sd_alloc`
@@ -99,6 +98,23 @@ toolkit are all **consumers**, not re-implementations.
     instead of painting a wrong picture under `SADISH_OK`.
   - **A drawing verb before any moveto** no longer dereferences a null point
     (SIGSEGV on 0.7.0 and 0.6.0 alike); every walk skips such verbs, as SVG does.
+- **v0.7.2 — the residue a 0.7.1 audit found (shipped).** Four filings marked
+  closed turned out to have unmet asks of their own; this is them:
+  - **Strokes survive a refusing hook** — `sd_canvas_stroke_path` / `_ex` /
+    `_dash` return `SADISH_ERR_OOM` instead of faulting (SIGSEGV on 0.7.1) or
+    under-drawing in silence; `src/alloc.cyr`'s seam contract now says what is
+    true, including what still faults.
+  - **A fill is ONE flatten operation** — the budget bounds a whole untrusted
+    outline, not one curve of it: the hostile repro falls 16,711,680 B →
+    **1,044,480 B** unwrapped. ⚠ Past the 65,536-point budget a fill now degrades
+    its remaining curves to chords and says so; the largest legitimate fill
+    measured anywhere here spends 40 % of it.
+  - **`sd_path_new_cap` sizes verbs and points separately** — the proposal's
+    78,656 B target for the ASCII glyph set, to the byte (5.51x less than
+    `sd_path_new`). ⛔ `SD_PATH_RESERVED_OFFSET` is removed and `sd_path_grow`
+    gained an argument.
+  - **Three coverage loads and three shipped headers** that no suite could tell
+    apart, or that stated the opposite of the code, are pinned and corrected.
 - **next (candidates, none started):** inline `(x, y)` storage in `SdPath` instead
   of `SdPoint` pointers — an ABI change rekha measured as worth 78,656 → 58,672 B
   for the ASCII glyph set and one fewer allocation per point; separate verb/point
@@ -140,7 +156,8 @@ dhancha also carry a `path = "../sadish"` dev override). The complete 2D vector
 core — fill, stroke, gradient, affine transforms, clip, and analytic AA — is
 live as of **v0.4.0**; styled strokes, gradient paint and exact 2-axis coverage
 as of **v0.6.0**; dashes, focal gradients and premultiplied output as of **v0.7.0**;
-bounded flattening and checked allocations as of **v0.7.1**.
+bounded flattening and checked allocations as of **v0.7.1**; hook-safe strokes and
+bounded fills as of **v0.7.2**.
 
 ## Dependencies
 
@@ -161,7 +178,7 @@ cyrius build programs/smoke.cyr build/sadish-smoke    # link-check
 # RUN tests (each self-checks and exits non-zero on failure)
 for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present blend alloc \
          stride stroke_style paint area integration grow_edges paint_focal premul \
-         dash clip_pitch paint_premul flatten_bound oom; do
+         dash clip_pitch paint_premul flatten_bound oom stroke_oom path_cap; do
   cyrius build "programs/${t}_test.cyr" "build/${t}_test" && "./build/${t}_test"
 done
 ```
