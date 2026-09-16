@@ -349,7 +349,9 @@ fn main(): i64 {
     var kc = sd_canvas_new(24, 8);
     var g0 = alloc_used();
     check(sd_canvas_stroke_path_dash(kc, kl, 2 * ONE, BU, MI, 4 * ONE, kp, 2, 0), SADISH_OK); # 2
-    check(alloc_used() - g0, 65536 + 8192 + 64);                  # 3 — MEASURED: 73,792 B, once
+    # ⚠ 0.9.0: the piece buffer holds INLINE (x, y) — 8,192 * 16 B, not 8,192 pointers — and the
+    # four 64 B cut-point SdPoint records are gone with the pointers. 73,792 -> 139,264 B, once.
+    check(alloc_used() - g0, 131072 + 8192);                      # 3 — MEASURED: 139,264 B, once
     check(_sd_dash_cap, 8192);                                    # 4
     g0 = alloc_used();
     sd_canvas_stroke_path_dash(kc, kl, 2 * ONE, BU, MI, 4 * ONE, kp, 2, 0);
@@ -851,8 +853,9 @@ fn main(): i64 {
     check(_sd_dash_trunc, 0);                                     # 123
 
     # ── P) THE PIECE BUFFER GROWS, AND CARRIES THE CURVE FLAGS OVER ────
-    # ⭐ One dash of 9,013 points needs 9,013 slots: the buffer doubles to 16,384 (16,384 * 8 ptrs +
-    # 16,384 flag bytes = 147,456 B, once). The path is the CUSP followed by 9,000 distinct points,
+    # ⭐ One dash of 9,013 points needs 9,013 slots: the buffer doubles to 16,384 (16,384 * 16 B of
+    # inline points + 16,384 flag bytes = 278,528 B, once; 147,456 B through 0.8.0, when a slot was
+    # an 8 B pointer). The path is the CUSP followed by 9,000 distinct points,
     # so the flags that make the stroker round its 150° turn are written at slots 1..12 — long
     # before the growth at slot 8,192 — and a growth that did not copy them would mitre the cusp
     # back into the 6 px spike stroke_style_test pins. The solid stroke runs FIRST so the run, the
@@ -867,11 +870,15 @@ fn main(): i64 {
     var pa = arena_used(g_arena);
     g0 = alloc_used();
     sd_canvas_stroke_path_dash(pd, pv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0);
-    check(alloc_used() - g0, 131072 + 16384);                     # 127 — MEASURED: 147,456 B
-    # 0.7.1: the cubic's 13 EMITTED mid-points x 16 B. Was 1,248 B — 13 subdivision nodes x 6
+    check(alloc_used() - g0, 262144 + 16384);                     # 127 — MEASURED: 278,528 B
+    # 0.7.1: the cubic's EMITTED mid-points x 16 B. Was 1,248 B — 13 subdivision nodes x 6
     # sd_pt_mid each — until the recursion started carrying coordinates and allocating only the
     # one mid per node that reaches the output.
-    check(arena_used(g_arena) - pa, 208);                         # 128 — the cubic's mid-points
+    # ⚠ 0.9.0: 208 -> 224 B, ONE more SdPoint. The path's points are inline coordinates now, so the
+    # curve's own ENDPOINT has no record to hand to the flatten and is materialised like any other
+    # emitted point (src/path.cyr's _sd_flatten_cubic_xy). It is +16 B per CURVE VERB flattened,
+    # against the 16 B and one sd_alloc per POINT that building the path no longer pays.
+    check(arena_used(g_arena) - pa, 224);                         # 128 — the cubic's mid-points
     check(_sd_dash_cap, 16384);                                   # 129
     check(cov_diff(pd, pref), 0);                                 # 130 — the flags crossed intact
     check(lit_rows(pd, 0, 9), 0);                                 # 131 — and no miter spike
@@ -879,7 +886,7 @@ fn main(): i64 {
     pa = arena_used(g_arena);
     sd_canvas_stroke_path_dash(pd2, pv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0);
     check(alloc_used() - g0, 0);                                  # 132 — warm: 0 B of buffer
-    check(arena_used(g_arena) - pa, 208);                         # 133 — and the mid-points again
+    check(arena_used(g_arena) - pa, 224);                         # 133 — and the mid-points again
     check(sd_alloc_set(0), &hook_alloc);                          # 134
     arena_reset(g_arena);
     check(_sd_dash_trunc, 0);                                     # 135

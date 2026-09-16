@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.8.0
+Version: 0.9.0
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -129,10 +129,16 @@ toolkit are all **consumers**, not re-implementations.
   - **The presenter's `open()` is reachable without a display** —
     `sd_present_open_fd` / `_path`, gated over a regular file with descriptors
     counted; it also gates three `memset`s that only a reused arena can see.
-- **next: v0.9.0 — inline `(x, y)` storage in `SdPath`** instead of `SdPoint`
-  pointers: rekha measured 78,656 → 58,672 B for the ASCII glyph set and one fewer
-  allocation per point. ⚠ An ABI break — 14 reads across 6 rekha programs walk the
-  points array — so it ships alone, with a filing into rekha carrying the port.
+- **v0.9.0 — `SdPath` stores its points inline (shipped).** x at +0, y at +8, 16 B
+  a slot, instead of 8 B pointers to 16 B `SdPoint`s. The ASCII glyph set goes
+  78,656 → **58,672 B** and 2,783 → **285** allocations; a path is three
+  allocations whatever it holds. New accessors `sd_path_point_x` / `_y` /
+  `sd_path_verb_at` end the coupling that made this a breaking change at all.
+  ⚠ `SD_GROW_LIMIT_DEFAULT` doubled to 16 MiB so the strokable path length is
+  unchanged (a run point went 8 B → 16 B); the fill's edge bound doubles with it.
+  ⚠ **rekha must port** — 4 of its 23 suites read the old layout and SIGSEGV;
+  dhancha is unaffected. Filed with the port in
+  `rekha/docs/development/issues/2026-09-16-sadish-0.9.0-inlines-path-points-…`.
 - **later (candidates):** a premultiplied AGNOS `blit#39` fast path; rekha adopting
   `sd_path_new_cap` (`proposals/2026-09-15-path-capacity-…` item 3); and
   `sd_present_open`'s single remaining ungated line, which only a display can gate.
@@ -173,7 +179,7 @@ live as of **v0.4.0**; styled strokes, gradient paint and exact 2-axis coverage
 as of **v0.6.0**; dashes, focal gradients and premultiplied output as of **v0.7.0**;
 bounded flattening and checked allocations as of **v0.7.1**; hook-safe strokes and
 bounded fills as of **v0.7.2**; exact-size piece paths and a self-describing
-polyline as of **v0.8.0**.
+polyline as of **v0.8.0**; inline path points as of **v0.9.0**.
 
 ## Dependencies
 
@@ -195,7 +201,7 @@ cyrius build programs/smoke.cyr build/sadish-smoke    # link-check
 for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present blend alloc \
          stride stroke_style paint area integration grow_edges paint_focal premul \
          dash clip_pitch paint_premul flatten_bound oom stroke_oom path_cap \
-         present_open; do
+         present_open inline_points; do
   cyrius build "programs/${t}_test.cyr" "build/${t}_test" && "./build/${t}_test"
 done
 ```

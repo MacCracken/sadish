@@ -11,7 +11,7 @@
 #   C. that dispatch honours the clip mask and MAX-combines with existing coverage;
 #   D. gradient paint through AREA coverage onto a WRAPPED surface equals sd_canvas_blit_at;
 #   E. a drawing verb before any MOVETO faults nothing, and paints nothing (0.7.1);
-#   F. sadish_version() == 800.
+#   F. sadish_version() == 900.
 # Exit code = failed checks; each failure prints its check number.
 
 include "src/lib.cyr"
@@ -83,8 +83,10 @@ fn main(): i64 {
     var a0 = arena_used(g_arena);
     check(it_stroke(cv, ell), SADISH_OK);                              # 3
     var first_cost = alloc_used() - g0;
-    # fill scratch 589,896 + stroke batch 270,592 + area accumulator (24 + 1) * 8 = 200
-    check(first_cost, 589896 + 270592 + 200);                          # 4
+    # fill scratch 655,432 + stroke batch 270,592 + area accumulator (24 + 1) * 8 = 200
+    # ⚠ The fill scratch was 589,896 B through 0.8.0: 0.9.0's inline (x, y) points make the
+    # stroker's run 16 B a slot instead of an 8 B pointer, +65,536 B on the global heap, once.
+    check(first_cost, 655432 + 270592 + 200);                          # 4
     check(arena_used(g_arena) - a0, 0);                                # 5 — not one byte on the hook
     var cv2 = sd_canvas_new(24, 16);                                    # (on the arena — fine)
     sd_canvas_set_aa(cv2, SD_AA_AREA);
@@ -212,7 +214,7 @@ fn main(): i64 {
     if (it_right_sum(bcv3, 0) <= 0) { g_fails = g_fails + 1; }         # 43 — the triangle is there
 
     # ---- F. version probe -----------------------------------------------------------------------
-    check(sadish_version(), 800);                                      # 44
+    check(sadish_version(), 900);                                      # 44
 
     if (g_fails == 0) {
         var ok = "integration_test: PASS (AREA styled strokes, clip/MAX, paint on wrapped, first-use alloc)\n";

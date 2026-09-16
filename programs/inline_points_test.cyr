@@ -1,0 +1,740 @@
+# programs/inline_points_test.cyr — RUN test for 0.9.0's INLINE (x, y) POINT STORAGE in SdPath.
+#
+# An SdPath's points array held 8 B POINTERS to 16 B SdPoint records through 0.8.0 — 24 B and one
+# sd_alloc per point — and holds the COORDINATES THEMSELVES, 16 B a slot, from 0.9.0. The ABI break
+# and the accessors that close it (sd_path_point_x / sd_path_point_y / sd_path_verb_at) are
+# src/path.cyr's header; the byte figures the change was made for are
+# docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md and
+# programs/path_cap_test.cyr group L (95 ASCII-shaped paths: 78,656 B -> 58,672 B, 2,783 sd_alloc
+# calls -> 285).
+#
+# ⛔ WHAT THIS SUITE OWNS, AND WHY IT IS NOT IN path_cap_test. path_cap_test owns the CAPACITY
+# contract and its byte totals; this file owns the four things the storage change itself introduces,
+# none of which a byte total can see:
+#   A  the accessors ARE the layout — every verb type's coordinates round-trip, and a raw read at
+#      `points + i * 16` agrees with them (the read the rekha filing asks consumers to replace)
+#   B  (0, 0) IS A POINT. Every walk in the tree used `cur != 0` to mean "no moveto yet"; a point is
+#      two coordinates now, so that test had to become a flag or a path at the ORIGIN would draw
+#      nothing. This is the regression a picture-only gate cannot see: refagree's 200 paths and this
+#      suite's own corpus are all off the origin.
+#   C  a LOST POINT SLOT IS SILENT NOW. Through 0.8.0 a slot the growth failed to copy read back as
+#      a null SdPoint and the next walk FAULTED; inline, it reads back as the coordinate (0, 0) — a
+#      valid point at the origin, a wrong picture, no crash. So both halves of every growth are read
+#      back coordinate by coordinate here.
+#   D  the OOM contract at its new shape: a builder on a path with room allocates NOTHING and cannot
+#      be refused, so the only refusal left is a growth, and it must leave the path exactly as it was.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "inline_points_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- hooks ----------------------------------------------------------------------------------
+var g_bytes = 0;
+var g_calls = 0;
+
+fn hook_count(n): i64 {
+    g_calls = g_calls + 1;
+    g_bytes = g_bytes + n;
+    return alloc(n);
+}
+
+# Grants its first g_grant allocations, then refuses every one.
+var g_grant = 0;
+
+fn hook_grant(n): i64 {
+    g_calls = g_calls + 1;
+    if (g_grant <= 0) { return 0; }
+    g_grant = g_grant - 1;
+    g_bytes = g_bytes + n;
+    return alloc(n);
+}
+
+fn reset_counts(): i64 {
+    g_bytes = 0;
+    g_calls = 0;
+    return 0;
+}
+
+# ---- helpers --------------------------------------------------------------------------------
+# The raw read a consumer would write against the layout: point i's x and y, straight out of the
+# array. ⛔ This is the SHAPE of rekha's 14 broken reads, ported — it is here so that the accessors
+# are pinned against the layout they publish, and so that a future layout move breaks BOTH.
+fn raw_point_x(path, i): i64 {
+    return load64(load64(path + SD_PATH_POINTS_OFFSET) + i * SD_PATH_PT_SIZE);
+}
+
+fn raw_point_y(path, i): i64 {
+    return load64(load64(path + SD_PATH_POINTS_OFFSET) + i * SD_PATH_PT_SIZE + 8);
+}
+
+# n linetos at (base + k * step, base - k * step) after a moveto at (base, base): every coordinate
+# distinct, and none of them 0 unless `base` is 0.
+fn ramp(p, n, base, step): i64 {
+    sd_path_moveto(p, base, base);
+    var k = 1;
+    while (k <= n) {
+        sd_path_lineto(p, base + k * step, base - k * step);
+        k = k + 1;
+    }
+    return p;
+}
+
+# Does ramp(p, n, base, step) read back exactly? Returns the number of coordinates that do not.
+fn ramp_damage(p, n, base, step): i64 {
+    var bad = 0;
+    if (sd_path_point_x(p, 0) != base) { bad = bad + 1; }
+    if (sd_path_point_y(p, 0) != base) { bad = bad + 1; }
+    var k = 1;
+    while (k <= n) {
+        if (sd_path_point_x(p, k) != base + k * step) { bad = bad + 1; }
+        if (sd_path_point_y(p, k) != base - k * step) { bad = bad + 1; }
+        k = k + 1;
+    }
+    return bad;
+}
+
+fn cov_sum(cv): i64 {
+    var n = sd_canvas_width(cv) * sd_canvas_height(cv);
+    var stride = sd_canvas_stride(cv);
+    var w = sd_canvas_width(cv);
+    var cov = sd_canvas_coverage(cv);
+    var s = 0;
+    var y = 0;
+    while (y < sd_canvas_height(cv)) {
+        var x = 0;
+        while (x < w) {
+            s = s + load8(cov + y * stride + x);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return s;
+}
+
+fn cov_diff(a, b): i64 {
+    var w = sd_canvas_width(a);
+    var h = sd_canvas_height(a);
+    var d = 0;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            if (sd_canvas_coverage_at(a, x, y) != sd_canvas_coverage_at(b, x, y)) { d = d + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return d;
+}
+
+# A closed square with its lower-left corner at (ox, oy), side `side`.
+fn square_at(ox, oy, side): i64 {
+    var p = sd_path_new();
+    sd_path_moveto(p, ox, oy);
+    sd_path_lineto(p, ox + side, oy);
+    sd_path_lineto(p, ox + side, oy + side);
+    sd_path_lineto(p, ox, oy + side);
+    sd_path_close(p);
+    return p;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var ONE = SD_ONE;
+    var HALF = SD_ONE / 2;
+
+    # ── A) THE SLOT, THE ACCESSORS, AND THE LAYOUT THEY PUBLISH ────────────
+    check(SD_PATH_PT_SIZE, 16);                                        # 1 — x at +0, y at +8
+    check(SD_POINT_SIZE, 16);                                          # 2 — ⚠ the same 16, a
+    #                                                                    DIFFERENT thing: a
+    #                                                                    standalone SdPoint record,
+    #                                                                    which this release keeps
+    check(SD_PATH_SIZE, 48);                                           # 3 — the record did not grow
+    check(SD_PATH_POINTS_OFFSET, 16);                                  # 4 — and +16 is still points
+    var ap = sd_path_new();
+    sd_path_moveto(ap, 3 * ONE, 5 * ONE);
+    sd_path_lineto(ap, 7 * ONE, 11 * ONE);
+    sd_path_quadto(ap, 13 * ONE, 17 * ONE, 19 * ONE, 23 * ONE);
+    sd_path_cubicto(ap, 29 * ONE, 31 * ONE, 37 * ONE, 41 * ONE, 43 * ONE, 47 * ONE);
+    sd_path_close(ap);
+    check(sd_path_verb_count(ap), 5);                                  # 5 — five verbs
+    check(sd_path_point_count(ap), 7);                                 # 6 — 1 + 1 + 2 + 3, close 0
+    # every verb type's coordinates, through the accessors, in order
+    check(sd_path_point_x(ap, 0), 3 * ONE);                            # 7 — moveto
+    check(sd_path_point_y(ap, 0), 5 * ONE);                            # 8
+    check(sd_path_point_x(ap, 1), 7 * ONE);                            # 9 — lineto
+    check(sd_path_point_y(ap, 1), 11 * ONE);                           # 10
+    check(sd_path_point_x(ap, 2), 13 * ONE);                           # 11 — quadto control
+    check(sd_path_point_y(ap, 2), 17 * ONE);                           # 12
+    check(sd_path_point_x(ap, 3), 19 * ONE);                           # 13 — quadto end
+    check(sd_path_point_y(ap, 3), 23 * ONE);                           # 14
+    check(sd_path_point_x(ap, 4), 29 * ONE);                           # 15 — cubicto c1
+    check(sd_path_point_y(ap, 4), 31 * ONE);                           # 16
+    check(sd_path_point_x(ap, 5), 37 * ONE);                           # 17 — cubicto c2
+    check(sd_path_point_y(ap, 5), 41 * ONE);                           # 18
+    check(sd_path_point_x(ap, 6), 43 * ONE);                           # 19 — cubicto end
+    check(sd_path_point_y(ap, 6), 47 * ONE);                           # 20
+    # the verbs, through sd_path_verb_at
+    check(sd_path_verb_at(ap, 0), SD_VERB_MOVETO);                     # 21
+    check(sd_path_verb_at(ap, 1), SD_VERB_LINETO);                     # 22
+    check(sd_path_verb_at(ap, 2), SD_VERB_QUADTO);                     # 23
+    check(sd_path_verb_at(ap, 3), SD_VERB_CUBICTO);                    # 24
+    check(sd_path_verb_at(ap, 4), SD_VERB_CLOSE);                      # 25 — close carries no point
+    # ⛔ THE ACCESSOR IS THE LAYOUT: a raw walk of `points + i * 16` reads exactly what
+    # sd_path_point_x / _y return. This is what the rekha filing's replacement line is checked
+    # against — if these two ever disagree the accessors are lying about the record.
+    var abad = 0;
+    var ai = 0;
+    while (ai < sd_path_point_count(ap)) {
+        if (raw_point_x(ap, ai) != sd_path_point_x(ap, ai)) { abad = abad + 1; }
+        if (raw_point_y(ap, ai) != sd_path_point_y(ap, ai)) { abad = abad + 1; }
+        if (sd_path_verb_at(ap, ai) != load64(load64(ap + SD_PATH_VERBS_OFFSET) + ai * 8)) {
+            abad = abad + 1;
+        }
+        ai = ai + 1;
+    }
+    check(abad, 0);                                                    # 26 — accessor == raw read
+    # and the slots really are 16 B apart, not 8: point 1's x sits two words past point 0's
+    check(load64(load64(ap + SD_PATH_POINTS_OFFSET) + 16), 7 * ONE);   # 27 — x of point 1
+    check(load64(load64(ap + SD_PATH_POINTS_OFFSET) + 24), 11 * ONE);  # 28 — y of point 1
+
+    # ── B) NEGATIVE, SUB-PIXEL AND LARGE COORDINATES SURVIVE ────────────
+    # ⚠ Two i64s in a row: the y of one point is the neighbour of the next point's x, so a sign or a
+    # stride error shows here and nowhere else. 16.16 halves, thirds of a raw unit, negatives.
+    var bp = sd_path_new_cap(6, 6);
+    sd_path_moveto(bp, 0 - (3 * ONE + HALF), 0 - 1);
+    sd_path_lineto(bp, 1, 0 - (9 * ONE));
+    sd_path_lineto(bp, HALF, 0 - HALF);
+    sd_path_quadto(bp, 0 - 65535, 65535, 0 - (1000 * ONE), 1000 * ONE + 7);
+    sd_path_close(bp);
+    check(sd_path_point_x(bp, 0), 0 - (3 * ONE + HALF));               # 29 — negative, sub-pixel
+    check(sd_path_point_y(bp, 0), 0 - 1);                              # 30 — minus one raw unit
+    check(sd_path_point_x(bp, 1), 1);                                  # 31 — one raw unit
+    check(sd_path_point_y(bp, 1), 0 - (9 * ONE));                      # 32
+    check(sd_path_point_x(bp, 2), HALF);                               # 33 — half a pixel
+    check(sd_path_point_y(bp, 2), 0 - HALF);                           # 34
+    check(sd_path_point_x(bp, 3), 0 - 65535);                          # 35 — one raw unit inside -1
+    check(sd_path_point_y(bp, 3), 65535);                              # 36
+    check(sd_path_point_x(bp, 4), 0 - (1000 * ONE));                   # 37 — far off-canvas
+    check(sd_path_point_y(bp, 4), 1000 * ONE + 7);                     # 38
+    check(sd_path_point_count(bp), 5);                                 # 39
+
+    # ── C) EXACT CAPACITY IS THREE ALLOCATIONS, WHATEVER THE POINT COUNT ────────────
+    # ⛔ THE RELEASE, AS A COUNT. 0.8.0 made 3 + one per point; the arrays hold the coordinates now,
+    # so a path built at its own size is the record, the verb array and the point array — full stop.
+    var prev = sd_alloc_set(&hook_count);
+    reset_counts();
+    var cp = sd_path_new_cap(201, 200);
+    ramp(cp, 199, 4 * ONE, ONE);
+    sd_path_close(cp);
+    sd_alloc_set(prev);
+    check(sd_path_verb_count(cp), 201);                                # 40 — moveto + 199 + close
+    check(sd_path_point_count(cp), 200);                               # 41
+    check(g_calls, 3);                                                 # 42 — ⛔ THREE, for 200 points
+    check(g_bytes, 48 + 201 * 8 + 200 * 16);                           # 43 — 4,856 B, and no more
+    check(g_bytes, 4856);                                              # 44 — to the byte
+    check(sd_path_verb_cap(cp), 201);                                  # 45 — neither array grew
+    check(sd_path_point_cap(cp), 200);                                 # 46
+    check(ramp_damage(cp, 199, 4 * ONE, ONE), 0);                      # 47 — every coordinate back
+    # the same path through sd_path_new: the same three calls, a bigger point array
+    prev = sd_alloc_set(&hook_count);
+    reset_counts();
+    var cd = sd_path_new();
+    ramp(cd, 199, 4 * ONE, ONE);
+    sd_path_close(cd);
+    sd_alloc_set(prev);
+    # ⚠ FOUR, NOT THREE, AND IT IS THE DEFAULT CAPACITY'S NEW BOUNDARY: SD_PATH_PCAP is 128 slots
+    # (2,048 B — the same bytes 256 pointers cost through 0.8.0, halved with the slot so
+    # sd_path_new's first allocation stays 4,144 B), so a 200-point path doubles its point array
+    # ONCE. 4,144 + 4,096 = 8,240 B in 4 calls; 0.8.0 paid 4,144 + 200 x 16 = 7,344 B in 203.
+    check(g_calls, 4);                                                 # 48 — the one doubling
+    check(g_bytes, 8240);                                              # 49 — 48 + 2,048 + 2,048
+    #                                                                    + a 4,096 B point array
+    check(ramp_damage(cd, 199, 4 * ONE, ONE), 0);                      # 50 — and the same points
+
+    # ── D) GROWTH, PER ARRAY, READ BACK COORDINATE BY COORDINATE ────────────
+    # ⛔⛔ THE 0.8.0 SAFETY NET IS GONE AND THIS GROUP REPLACES IT. A point slot the growth failed to
+    # copy used to be a NULL SdPoint that the next walk dereferenced — a SIGSEGV, immediate and
+    # loud. Inline, it reads back as (0, 0): a point at the origin, a wrong picture, no crash. So
+    # every coordinate is read back after every doubling, on paths whose points are ALL non-zero
+    # (the ramp's base is 4.0 and its step ±1.0), where a zeroed slot cannot hide.
+    # D1. MORE POINTS THAN VERBS — 100 quadtos are 101 verbs and 201 points, so the point array
+    # doubles three times more than the verb array does, from the same start.
+    var d1 = sd_path_new_cap(8, 8);
+    sd_path_moveto(d1, 2 * ONE, 2 * ONE);
+    var dk = 1;
+    while (dk <= 100) {
+        sd_path_quadto(d1, 2 * ONE + dk * ONE, 3 * ONE, 2 * ONE + dk * ONE, 4 * ONE + dk);
+        dk = dk + 1;
+    }
+    check(sd_path_verb_count(d1), 101);                                # 51
+    check(sd_path_point_count(d1), 201);                               # 52 — twice the verbs
+    check(sd_path_verb_cap(d1), 128);                                  # 53 — 8 -> 128
+    check(sd_path_point_cap(d1), 256);                                 # 54 — 8 -> 256, one further
+    var d1bad = 0;
+    if (sd_path_point_x(d1, 0) != 2 * ONE) { d1bad = d1bad + 1; }
+    if (sd_path_point_y(d1, 0) != 2 * ONE) { d1bad = d1bad + 1; }
+    dk = 1;
+    while (dk <= 100) {
+        if (sd_path_point_x(d1, 2 * dk - 1) != 2 * ONE + dk * ONE) { d1bad = d1bad + 1; }
+        if (sd_path_point_y(d1, 2 * dk - 1) != 3 * ONE) { d1bad = d1bad + 1; }
+        if (sd_path_point_x(d1, 2 * dk) != 2 * ONE + dk * ONE) { d1bad = d1bad + 1; }
+        if (sd_path_point_y(d1, 2 * dk) != 4 * ONE + dk) { d1bad = d1bad + 1; }
+        dk = dk + 1;
+    }
+    check(d1bad, 0);                                                   # 55 — ⛔ all 201 points, both
+    #                                                                    coordinates, across five
+    #                                                                    doublings of the point array
+    # D2. MORE VERBS THAN POINTS — moveto + 300 closes is 301 verbs and ONE point. The verb array
+    # doubles six times; the point array must not move, and the one point must still be there.
+    var d2 = sd_path_new_cap(8, 8);
+    sd_path_moveto(d2, 6 * ONE + 7, 0 - (5 * ONE + 3));
+    dk = 0;
+    while (dk < 300) {
+        sd_path_close(d2);
+        dk = dk + 1;
+    }
+    check(sd_path_verb_count(d2), 301);                                # 56
+    check(sd_path_point_count(d2), 1);                                 # 57
+    check(sd_path_verb_cap(d2), 512);                                  # 58 — 8 -> 512
+    check(sd_path_point_cap(d2), 8);                                   # 59 — ⛔ UNTOUCHED
+    check(sd_path_point_x(d2, 0), 6 * ONE + 7);                        # 60 — and the point survived
+    check(sd_path_point_y(d2, 0), 0 - (5 * ONE + 3));                  # 61   every verb doubling
+    var d2bad = 0;
+    dk = 1;
+    while (dk <= 300) {
+        if (sd_path_verb_at(d2, dk) != SD_VERB_CLOSE) { d2bad = d2bad + 1; }
+        dk = dk + 1;
+    }
+    check(d2bad, 0);                                                   # 62 — and all 300 closes
+    check(sd_path_verb_at(d2, 0), SD_VERB_MOVETO);                     # 63
+    # D3. THE POINT GROWTH'S COPY LENGTH, ISOLATED. A path whose POINTS outnumber its verbs and
+    # whose coordinates are all distinct and non-zero: the copy at each doubling must move
+    # n_points * 16 B, not n_points * 8 (half the array) and not n_verbs * 16 (the wrong count).
+    # ⚠ MEASURED as mutations, each alone, against this check: `esz` left at 8 for the point array
+    # loses the upper half of every slot (#64 reports 800 bad coordinates); the copy length taken
+    # from n_verbs loses the tail of the array (#64 reports 400).
+    var d3 = ramp(sd_path_new_cap(8, 8), 399, 4 * ONE, ONE);
+    check(sd_path_point_count(d3), 400);                               # 64
+    check(ramp_damage(d3, 399, 4 * ONE, ONE), 0);                      # 65 — ⛔ 800 coordinates, six
+    #                                                                    doublings, every one intact
+    check(sd_path_point_cap(d3), 512);                                 # 66
+
+    # ── E) (0, 0) IS A POINT, NOT A SENTINEL ────────────
+    # ⛔⛔ THE REGRESSION NO PICTURE GATE WOULD HAVE CAUGHT. Every verb walk in the tree (the fill in
+    # src/raster.cyr, both strokers in src/stroke.cyr, sd_path_flatten in src/path.cyr) tested
+    # `cur != 0` for "no moveto yet" — free, while the current point was an SdPoint POINTER. A point
+    # is two coordinates now, so a path whose moveto is at the ORIGIN has cur == 0 and every drawing
+    # verb after it would be skipped: a blank canvas, SADISH_OK, no fault. Each walk carries an
+    # explicit has_cur flag instead, and this group is what says so.
+    # ⚠ refagree's 200 paths and every corpus in these suites draw away from the origin, which is
+    # why this needs its own checks rather than a comparison.
+    var ecv = sd_canvas_new(16, 16);
+    check(sd_canvas_fill_path(ecv, square_at(0, 0, 8 * ONE), SD_FILL_NONZERO), SADISH_OK);   # 67
+    check(cov_sum(ecv), 8 * 8 * 255);                                  # 68 — ⛔ 16,320: the square
+    #                                                                    at the origin really filled
+    var ecv2 = sd_canvas_new(16, 16);
+    sd_canvas_fill_path(ecv2, square_at(2 * ONE, 2 * ONE, 8 * ONE), SD_FILL_NONZERO);
+    check(cov_sum(ecv2), 8 * 8 * 255);                                 # 69 — the same square, moved
+    # the same, through each of the three walks that carry the flag
+    var ecv3 = sd_canvas_new(16, 16);
+    check(sd_canvas_stroke_path(ecv3, square_at(0, 0, 8 * ONE), 2 * ONE), SADISH_OK);   # 70
+    check(cov_sum(ecv3) > 0, 1);                                       # 71 — the round stroker
+    var ecv4 = sd_canvas_new(16, 16);
+    check(sd_canvas_stroke_path_ex(ecv4, square_at(0, 0, 8 * ONE), 2 * ONE, SD_CAP_BUTT,
+        SD_JOIN_MITER, 4 * ONE), SADISH_OK);                             # 72
+    check(cov_sum(ecv4) > 0, 1);                                       # 73 — the styled stroker
+    var epat = alloc(2 * 8);
+    store64(epat + 0, 3 * ONE);
+    store64(epat + 8, 2 * ONE);
+    var ecv5 = sd_canvas_new(16, 16);
+    check(sd_canvas_stroke_path_dash(ecv5, square_at(0, 0, 8 * ONE), 2 * ONE, SD_CAP_BUTT,
+        SD_JOIN_MITER, 4 * ONE, epat, 2, 0), SADISH_OK);                 # 74
+    check(cov_sum(ecv5) > 0, 1);                                       # 75 — and the dash walk
+    var eorigin = sd_path_new();
+    sd_path_moveto(eorigin, 0, 0);
+    sd_path_quadto(eorigin, 4 * ONE, 0 - (4 * ONE), 8 * ONE, 0);
+    var epl = sd_path_flatten(eorigin, ONE >> 2);
+    check(epl != 0, 1);                                                # 76
+    check(sd_polyline_count(epl) > 2, 1);                              # 77 — ⛔ sd_path_flatten too:
+    #                                                                    a curve FROM the origin is
+    #                                                                    flattened, not skipped
+    check(sd_point_x(load64(sd_polyline_points(epl) + 0)), 0);         # 78 — and the first point of
+    check(sd_point_y(load64(sd_polyline_points(epl) + 0)), 0);         # 79   the output IS (0, 0)
+    # ⚠ AND A DRAWING VERB BEFORE ANY MOVETO IS STILL SKIPPED — the flag's other half. A path whose
+    # first verb is a lineto draws nothing and does not fault (raster.cyr's contract since 0.7.1).
+    var enomove = sd_path_new();
+    sd_path_lineto(enomove, 4 * ONE, 4 * ONE);
+    sd_path_lineto(enomove, 8 * ONE, 4 * ONE);
+    var ecv6 = sd_canvas_new(16, 16);
+    check(sd_canvas_fill_path(ecv6, enomove, SD_FILL_NONZERO), SADISH_OK);   # 80
+    check(cov_sum(ecv6), 0);                                           # 81 — nothing drawn, no fault
+    var ecv7 = sd_canvas_new(16, 16);
+    check(sd_canvas_stroke_path(ecv7, enomove, 2 * ONE), SADISH_OK);   # 82
+    check(cov_sum(ecv7), 0);                                           # 83
+
+    # ── F) THE SAME GEOMETRY, THREE WAYS ────────────
+    # Capacity and storage are allocation decisions: the same outline at exact capacity, at the
+    # default capacity, and grown from (8, 8) fills to the same coverage, pixel for pixel.
+    var fa = square_at(3 * ONE + HALF, 2 * ONE, 9 * ONE + 1);
+    var fb = sd_path_new_cap(5, 4);
+    sd_path_moveto(fb, 3 * ONE + HALF, 2 * ONE);
+    sd_path_lineto(fb, 3 * ONE + HALF + 9 * ONE + 1, 2 * ONE);
+    sd_path_lineto(fb, 3 * ONE + HALF + 9 * ONE + 1, 2 * ONE + 9 * ONE + 1);
+    sd_path_lineto(fb, 3 * ONE + HALF, 2 * ONE + 9 * ONE + 1);
+    sd_path_close(fb);
+    var fcv1 = sd_canvas_new(20, 20);
+    var fcv2 = sd_canvas_new(20, 20);
+    sd_canvas_fill_path(fcv1, fa, SD_FILL_NONZERO);
+    sd_canvas_fill_path(fcv2, fb, SD_FILL_NONZERO);
+    check(cov_diff(fcv1, fcv2), 0);                                    # 84 — every pixel
+    check(cov_sum(fcv1) > 0, 1);                                       # 85
+    var fcv3 = sd_canvas_new(20, 20);
+    var fcv4 = sd_canvas_new(20, 20);
+    sd_canvas_stroke_path(fcv3, fa, 2 * ONE);
+    sd_canvas_stroke_path(fcv4, fb, 2 * ONE);
+    check(cov_diff(fcv3, fcv4), 0);                                    # 86 — and every stroke pixel
+    check(cov_sum(fcv3) > 0, 1);                                       # 87
+
+    # ── G) THE OOM CONTRACT AT ITS NEW SHAPE ────────────
+    # G1. A REFUSED POINT ARRAY is still 0, not a fault: the constructor's three requests are the
+    # record, the verb array and the point array, in that order.
+    prev = sd_alloc_set(&hook_grant);
+    reset_counts();
+    g_grant = 2;
+    check(sd_path_new_cap(40, 90), 0);                                 # 88 — the POINT array refused
+    check(g_calls, 3);                                                 # 89 — it asked three times
+    reset_counts();
+    g_grant = 3;
+    var g1 = sd_path_new_cap(40, 90);
+    sd_alloc_set(prev);
+    check(g1 != 0, 1);                                                 # 90 — three grants: a path
+    check(g_calls, 3);                                                 # 91 — and nothing more
+    # G2. A BUILDER ON A PATH WITH ROOM ALLOCATES NOTHING, so a hook that refuses everything cannot
+    # touch it. ⛔ This is the contract 0.9.0 replaces "a refused SdPoint returns OOM" with.
+    prev = sd_alloc_set(&hook_grant);
+    reset_counts();
+    g_grant = 0;
+    check(sd_path_moveto(g1, ONE, ONE), SADISH_OK);                    # 92 — no allocation to refuse
+    check(sd_path_cubicto(g1, ONE, ONE, 2 * ONE, 2 * ONE, 3 * ONE, 0), SADISH_OK);   # 93
+    sd_alloc_set(prev);
+    check(g_calls, 0);                                                 # 94 — ⛔ IT NEVER ASKED
+    check(sd_path_point_count(g1), 4);                                 # 95
+    check(sd_path_point_x(g1, 3), 3 * ONE);                            # 96 — and it stored the point
+    # G3. A REFUSED POINT GROWTH returns SADISH_ERR_OOM with the path exactly as it was — counts,
+    # coordinates and all — and the next call still works.
+    # 8 points in an 8-slot array, 8 verbs in a 64-slot one
+    var g3 = ramp(sd_path_new_cap(64, 8), 7, 4 * ONE, ONE);
+    check(sd_path_point_count(g3), 8);                                 # 97 — the point array is full
+    check(sd_path_verb_cap(g3), 64);                                   # 98 — the verb array is not
+    prev = sd_alloc_set(&hook_grant);
+    reset_counts();
+    g_grant = 0;
+    check(sd_path_lineto(g3, 99 * ONE, 0), SADISH_ERR_OOM);            # 99 — the growth is refused
+    sd_alloc_set(prev);
+    check(g_calls, 1);                                                 # 100 — one request, refused
+    check(sd_path_verb_count(g3), 8);                                  # 101 — nothing was pushed
+    check(sd_path_point_count(g3), 8);                                 # 102
+    check(sd_path_point_cap(g3), 8);                                   # 103 — and nothing grew
+    check(ramp_damage(g3, 7, 4 * ONE, ONE), 0);                        # 104 — every point intact
+    check(sd_path_lineto(g3, 99 * ONE, 0), SADISH_OK);                 # 105 — and it still grows
+    check(sd_path_point_cap(g3), 16);                                  # 106
+    check(sd_path_point_x(g3, 8), 99 * ONE);                           # 107
+    check(ramp_damage(g3, 7, 4 * ONE, ONE), 0);                        # 108 — across the growth
+
+    # ── H) THE CEILING, RE-DERIVED FOR THE 16 B SLOT ────────────
+    # ⛔ SD_PATH_CAP_MAX HALVED, 2^28 -> 2^27, AND THE ARITHMETIC IS WHY: the point array is
+    # `cap * 16` B now, and 2^27 * 16 = 2 GiB = lib/alloc.cyr's ALLOC_MAX — the largest block the
+    # stock allocator can ever serve. One constant bounds both arrays and takes the tighter slot.
+    # ⚠ The wrap this guards moved with it: `cap * 16` wraps mod 2^64 at 2^60, where `cap * 8` wrapped
+    # at 2^61. Both windows are far above the ceiling, so both are refused before the first sd_alloc
+    # — which is the whole point of a ceiling rather than a clamp.
+    check(SD_PATH_CAP_MAX, 134217728);                                 # 109 — 2^27
+    check(SD_PATH_CAP_MAX * 16, 2147483648);                           # 110 — exactly ALLOC_MAX
+    check(ALLOC_MAX, 2147483648);                                      # 111 — lib/alloc.cyr's own
+    prev = sd_alloc_set(&hook_grant);
+    g_grant = 0;
+    reset_counts();
+    check(sd_path_new_cap(8, SD_PATH_CAP_MAX + 1), 0);                 # 112 — over, on the points
+    check(g_calls, 0);                                                 # 113 — ⛔ never asked
+    reset_counts();
+    check(sd_path_new_cap(SD_PATH_CAP_MAX + 1, 8), 0);                 # 114 — over, on the verbs
+    check(g_calls, 0);                                                 # 115
+    # the 16 B slot's OWN wrap windows: j * 2^60 + 1, which `cap * 16` maps to a tiny positive count
+    var hw = 1;
+    var hbad = 0;
+    while (hw <= 7) {
+        if (sd_path_new_cap(8, hw * 1152921504606846976 + 1) != 0) { hbad = hbad + 1; }
+        if (sd_path_new_cap(8, hw * 1152921504606846976 + 8) != 0) { hbad = hbad + 1; }
+        hw = hw + 1;
+    }
+    check(hbad, 0);                                                    # 116 — 14 wrap windows, all
+    check(g_calls, 0);                                                 # 117 — refused without asking
+    sd_alloc_set(prev);
+    # AT the ceiling sadish still ASKS — the ceiling is a wrap guard, not a size policy — and only
+    # the allocation count tells sadish's refusal from the allocator's.
+    prev = sd_alloc_set(&hook_grant);
+    reset_counts();
+    g_grant = 0;
+    check(sd_path_new_cap(8, SD_PATH_CAP_MAX), 0);                     # 118 — AT it: refused by the
+    check(g_calls, 1);                                                 # 119   HOOK, after one ask
+    sd_alloc_set(prev);
+    # and the doubling ceiling moved with it, per array
+    var hp = sd_path_new_cap(16, 16);
+    store64(hp + SD_PATH_PCAP_OFFSET, SD_PATH_CAP_MAX);
+    store64(hp + SD_PATH_NPOINTS_OFFSET, SD_PATH_CAP_MAX);
+    prev = sd_alloc_set(&hook_grant);
+    reset_counts();
+    g_grant = 0;
+    check(sd_path_lineto(hp, ONE, ONE), SADISH_ERR_OOM);               # 120 — refused, not wrapped
+    sd_alloc_set(prev);
+    check(g_calls, 0);                                                 # 121 — and never asked
+
+    # ── I) THE ORIGIN, EXACTLY — WHAT GROUP E'S `> 0` CHECKS COULD NOT SEE ────────────
+    # ⛔ THIS GROUP EXISTS BECAUSE MUTATION TESTING FOUND GROUP E TOO WEAK. With the round stroker's
+    # LINETO test mutated back to `curx != 0`, the origin square's every lineto is skipped, the run
+    # is the moveto alone, and the stroker draws ONE DISC at the origin — which is still ink, so
+    # `cov_sum(ecv3) > 0` passed and the mutant lived through all 31 suites. A skipped verb is a
+    # DIFFERENT PICTURE, not an empty one, so it has to be pinned as a picture.
+    # ⚠ The figures below are MEASURED on this tree; each is an absolute total, because the point of
+    # them is that a self-comparison (the same path twice) cannot see a verb that both runs skip.
+    var icv1 = sd_canvas_new(16, 16);
+    sd_canvas_stroke_path(icv1, square_at(0, 0, 8 * ONE), 2 * ONE);
+    check(cov_sum(icv1), 11418);                                       # 122 — the ROUND stroker
+    var icv2 = sd_canvas_new(16, 16);
+    sd_canvas_stroke_path_ex(icv2, square_at(0, 0, 8 * ONE), 2 * ONE, SD_CAP_BUTT,
+      SD_JOIN_MITER, 4 * ONE);
+    check(cov_sum(icv2), 11475);                                       # 123 — the STYLED stroker
+    var icv3 = sd_canvas_new(16, 16);
+    sd_canvas_stroke_path_dash(icv3, square_at(0, 0, 8 * ONE), 2 * ONE, SD_CAP_BUTT,
+      SD_JOIN_MITER, 4 * ONE, epat, 2, 0);
+    check(cov_sum(icv3), 7140);                                        # 124 — and the DASH walk
+    # ⛔ A CLOSE AT x == 0, FOLLOWED BY A DRAWING VERB — the fill's OTHER `cur != 0` test, and the
+    # one no shape above reaches: after a close the current point returns to the subpath's start, so
+    # a close that is SKIPPED leaves the next lineto drawing from the last vertex instead. The two
+    # paths below are the same geometry written two ways — a close, and the explicit lineto back to
+    # the start that a close IS — so they must fill to the same pixels.
+    var ic = sd_path_new();
+    sd_path_moveto(ic, 0, 4 * ONE);
+    sd_path_lineto(ic, 8 * ONE, 4 * ONE);
+    sd_path_lineto(ic, 8 * ONE, 12 * ONE);
+    sd_path_lineto(ic, 0, 12 * ONE);
+    sd_path_close(ic);
+    sd_path_lineto(ic, 6 * ONE, 0);
+    var ie = sd_path_new();
+    sd_path_moveto(ie, 0, 4 * ONE);
+    sd_path_lineto(ie, 8 * ONE, 4 * ONE);
+    sd_path_lineto(ie, 8 * ONE, 12 * ONE);
+    sd_path_lineto(ie, 0, 12 * ONE);
+    sd_path_lineto(ie, 0, 4 * ONE);
+    sd_path_lineto(ie, 6 * ONE, 0);
+    var icv4 = sd_canvas_new(16, 16);
+    var icv5 = sd_canvas_new(16, 16);
+    check(sd_canvas_fill_path(icv4, ic, SD_FILL_NONZERO), SADISH_OK);  # 125
+    check(sd_canvas_fill_path(icv5, ie, SD_FILL_NONZERO), SADISH_OK);  # 126
+    check(cov_diff(icv4, icv5), 0);                                    # 127 — ⛔ the close ran
+    check(cov_sum(icv4), 16320);                                       # 128 — and it is this picture
+    # ⚠ AND THE SAME PAIR IS **NOT** EQUAL THROUGH THE ROUND STROKER — that is 0.4.0 semantics, not
+    # this release: a drawing verb after a CLOSE continues the CLOSED run there (so the run carries a
+    # closing segment back to the moveto point), where the explicit-lineto form is an open run. The
+    # two really do paint differently (MEASURED: 28 pixels apart), so the gate here is an absolute
+    # total rather than a comparison. src/stroke.cyr's sd_canvas_stroke_path_ex header states the
+    # same divergence for the ROUND/ROUND pair.
+    var icv6 = sd_canvas_new(16, 16);
+    var icv7 = sd_canvas_new(16, 16);
+    sd_canvas_stroke_path(icv6, ic, 2 * ONE);
+    sd_canvas_stroke_path(icv7, ie, 2 * ONE);
+    check(cov_diff(icv6, icv7), 28);                                   # 129 — 0.4.0's own semantic
+    check(cov_sum(icv6), 18741);                                       # 130 — and this is the ink
+
+    # ── J) THE TWO PUSHERS' OWN FULLNESS GUARDS, DRIVEN DIRECTLY ────────────
+    # ⛔ NOTHING INSIDE sadish REACHES THESE GUARDS. Every builder calls _sd_path_reserve first, so
+    # sd_path_push_point / sd_path_push_verb are always entered with room and their `n >= cap` tests
+    # are dead from in here. They are NOT dead from outside: both are in dist/sadish.cyr, both are
+    # documented as growing "if it is full", and sd_path_push_point's arity changed in 0.9.0 — which
+    # is exactly the moment a consumer reads its header and calls it.
+    # ⛔ MUTATION-PROVED, AND THIS GROUP IS WHY IT EXISTS: `n >= cap` -> `n > cap` in
+    # sd_path_push_point survived ALL 31 SUITES before these checks. The 9th point then lands one
+    # slot PAST an 8-slot array — 16 B of someone else's memory since 0.9.0, 8 B through 0.8.0 —
+    # and the call still returns SADISH_OK. A guard no test drives is a guard that is not there.
+    var jp = sd_path_new_cap(64, 8);
+    var jsent = sd_alloc(64);                                          # the bump allocator's next
+    store64(jsent + 0, 111111);                                        #   block: right behind the
+    store64(jsent + 8, 222222);                                        #   128 B point array
+    var jadj = 0;
+    if (load64(jp + SD_PATH_POINTS_OFFSET) + 8 * SD_PATH_PT_SIZE == jsent) { jadj = 1; }
+    check(jadj, 1);                                                    # 131 — ⚠ PINNED ON PURPOSE:
+    #                                        lib/alloc.cyr bumps, so the sentinel really is the
+    #                                        memory an over-run writes into. If this ever reads 0
+    #                                        the sentinel below has stopped gating anything, and
+    #                                        the suite says so here rather than passing quietly.
+    var jk = 0;
+    while (jk < 8) {
+        sd_path_push_point(jp, (jk + 1) * ONE, (jk + 21) * ONE);
+        jk = jk + 1;
+    }
+    check(sd_path_point_count(jp), 8);                                 # 132 — exactly full
+    check(sd_path_point_cap(jp), 8);                                   # 133 — the array has not grown
+    check(sd_path_push_point(jp, 999 * ONE, 888 * ONE), SADISH_OK);    # 134 — the 9th: the guard
+    check(sd_path_point_cap(jp), 16);                                  # 135 — ⛔ IT GREW. `n > cap`
+    #                                                                     leaves this 8 and writes
+    #                                                                     the point past the array
+    check(sd_path_point_count(jp), 9);                                 # 136
+    check(sd_path_point_x(jp, 8), 999 * ONE);                          # 137 — and it is readable
+    check(sd_path_point_y(jp, 8), 888 * ONE);                          # 138
+    check(load64(jsent + 0), 111111);                                  # 139 — ⛔ the neighbour is
+    check(load64(jsent + 8), 222222);                                  # 140 —   untouched
+    var jbad = 0;
+    jk = 0;
+    while (jk < 8) {
+        if (sd_path_point_x(jp, jk) != (jk + 1) * ONE) { jbad = jbad + 1; }
+        if (sd_path_point_y(jp, jk) != (jk + 21) * ONE) { jbad = jbad + 1; }
+        jk = jk + 1;
+    }
+    check(jbad, 0);                                                    # 141 — the first 8 survived
+    # J2. THE VERB PUSHER'S GUARD, the same way and equally unreached. Its element did not change
+    # size, so the blast radius is 8 B rather than 16 — the guard is no less load-bearing for it.
+    # ⭐ THE SENTINEL HERE IS THE PATH'S OWN POINT ARRAY: _sd_path_alloc asks for the record, then
+    # the verbs, then the points, on a bump allocator — so the slot one past a full verb array IS
+    # point 0's x, and a broken guard corrupts the same path it is building.
+    var jv = sd_path_new_cap(8, 8);
+    var jvadj = 0;
+    if (load64(jv + SD_PATH_VERBS_OFFSET) + 8 * 8 == load64(jv + SD_PATH_POINTS_OFFSET)) {
+        jvadj = 1;
+    }
+    check(jvadj, 1);                                                   # 142 — ⚠ the point array is
+    #                                        what an over-run writes into; pinned so that a change
+    #                                        in allocation order is reported, not silently tolerated
+    sd_path_push_point(jv, 7 * ONE, 5 * ONE);
+    jk = 0;
+    while (jk < 8) {
+        sd_path_push_verb(jv, SD_VERB_CLOSE);
+        jk = jk + 1;
+    }
+    check(sd_path_verb_cap(jv), 8);                                    # 143 — exactly full
+    check(sd_path_push_verb(jv, SD_VERB_MOVETO), SADISH_OK);           # 144 — the 9th
+    check(sd_path_verb_cap(jv), 16);                                   # 145 — ⛔ IT GREW
+    check(sd_path_verb_count(jv), 9);                                  # 146
+    check(sd_path_verb_at(jv, 8), SD_VERB_MOVETO);                     # 147 — and it is readable
+    check(sd_path_verb_at(jv, 7), SD_VERB_CLOSE);                      # 148 — the 8th still there
+    check(sd_path_point_x(jv, 0), 7 * ONE);                            # 149 — ⛔ and point 0, the
+    check(sd_path_point_y(jv, 0), 5 * ONE);                            # 150 —   neighbour, is whole
+
+    # ── K) A SUBPATH THAT RESTARTS AFTER A CLOSE, FROM (0, y) ────────────
+    # ⛔ _sd_sb_restart IS A FUNCTION THIS RELEASE CHANGED — it took one SdPoint and takes (cx, cy,
+    # has) — and its Y STORE was untested. MUTATION-PROVED: `store64(run + 8, cy)` -> `cx` survived
+    # ALL 31 SUITES, and moved 19 of an independent 416-measurement ink probe. It is reached ONLY by
+    # a drawing verb that FOLLOWS a close in _sd_styled_walk, and every such path the suites had
+    # restarted where the swap is invisible — x == y, or a coordinate the joins round away.
+    # ⇒ The shape that sees it: x and y DIFFER at the restart and one of them is 0, so writing x
+    # into the y slot reopens the subpath at (0, 0) instead of (0, 2 px). Group I's paths all restart
+    # at x == 0 too, but they restart the FILL's walk, which has no run to reopen.
+    # ⚠ Absolute totals again, for group I's reason: both halves of a comparison would move together.
+    var kp2 = sd_path_new();
+    sd_path_moveto(kp2, 0, 2 * ONE);
+    sd_path_lineto(kp2, 5 * ONE, 2 * ONE);
+    sd_path_lineto(kp2, 5 * ONE, 6 * ONE);
+    sd_path_lineto(kp2, 0, 6 * ONE);
+    sd_path_close(kp2);
+    sd_path_lineto(kp2, 9 * ONE, 9 * ONE);                             # ⛔ the restart: (0, 2 px)
+    sd_path_lineto(kp2, 3 * ONE, 11 * ONE);
+    sd_path_close(kp2);
+    check(sd_path_point_x(kp2, 0), 0);                                 # 151 — the restart point is
+    check(sd_path_point_y(kp2, 0), 2 * ONE);                           # 152 —   (0, 2 px): x != y
+    var kcv0 = sd_canvas_new(16, 16);
+    sd_canvas_set_aa(kcv0, 0);
+    check(sd_canvas_stroke_path_ex(kcv0, kp2, 2 * ONE, SD_CAP_BUTT, SD_JOIN_MITER,
+        4 * ONE), SADISH_OK);                                            # 153
+    check(cov_sum(kcv0), 16509);                                      # 154 — engine 0, BUTT/MITER
+    var kcv1 = sd_canvas_new(16, 16);
+    sd_canvas_set_aa(kcv1, 1);
+    sd_canvas_stroke_path_ex(kcv1, kp2, 2 * ONE, SD_CAP_BUTT, SD_JOIN_MITER, 4 * ONE);
+    check(cov_sum(kcv1), 16542);                                      # 155 — engine 1
+    var kcv2 = sd_canvas_new(16, 16);
+    sd_canvas_stroke_path_ex(kcv2, kp2, 2 * ONE, SD_CAP_ROUND, SD_JOIN_ROUND, 4 * ONE);
+    check(cov_sum(kcv2), 15455);                                      # 156 — ROUND/ROUND
+    var kcv3 = sd_canvas_new(16, 16);
+    sd_canvas_stroke_path_ex(kcv3, kp2, 2 * ONE, SD_CAP_SQUARE, SD_JOIN_BEVEL, 4 * ONE);
+    check(cov_sum(kcv3), 15867);                                      # 157 — SQUARE/BEVEL
+    var kcv4 = sd_canvas_new(16, 16);
+    check(sd_canvas_stroke_path_dash(kcv4, kp2, 2 * ONE, SD_CAP_BUTT, SD_JOIN_MITER,
+        4 * ONE, epat, 2, 0), SADISH_OK);                                # 158 — and the dash walk,
+    check(cov_sum(kcv4), 11270);                                      # 159 —   which shares it
+
+    # ── L) THE FILL'S CURVE SEAM: (cx, cy) IN THAT ORDER ─────────────────
+    # ⛔ sd_fill_edges_from TOOK ONE SdPoint AND TAKES TWO COORDINATES (0.9.0), so the fill's verb
+    # walk now hands it a PAIR at two call sites (src/raster.cyr, the QUADTO and the CUBICTO arms).
+    # A pair passed the wrong way round is the one mistake the old signature could not make, and
+    # MUTATION-PROVED it was thinly gated: swapping the QUADTO site's arguments was caught by
+    # area_test ALONE — which is opt-in — because the seam edge it corrupts runs from the MIRRORED
+    # current point to the curve's first flattened point, and on a path whose curve starts near the
+    # x == y diagonal that edge is nearly the one the fill wanted.
+    # ⇒ The shape that sees it: the curve starts FAR off the diagonal (2, 11) and its control pulls
+    # the first chord sharply away from the line the swap would draw. Absolute ink, both rules and
+    # both AA engines, so the swap moves a number in a suite that always runs.
+    var lq = sd_path_new();
+    sd_path_moveto(lq, 2 * ONE, 11 * ONE);                             # x != y, and far apart
+    sd_path_quadto(lq, 14 * ONE, 1 * ONE, 13 * ONE, 12 * ONE);
+    sd_path_lineto(lq, 3 * ONE, 13 * ONE);
+    sd_path_close(lq);
+    check(sd_path_point_x(lq, 0), 2 * ONE);                            # 160 — the curve's start,
+    check(sd_path_point_y(lq, 0), 11 * ONE);                           # 161 —   read back inline
+    var lcv0 = sd_canvas_new(16, 16);
+    sd_canvas_set_aa(lcv0, 0);
+    check(sd_canvas_fill_path(lcv0, lq, SD_FILL_NONZERO), SADISH_OK);  # 162
+    check(cov_sum(lcv0), 12873);                                       # 163 — engine 0, nonzero
+    var lcv1 = sd_canvas_new(16, 16);
+    sd_canvas_set_aa(lcv1, 1);
+    sd_canvas_fill_path(lcv1, lq, SD_FILL_NONZERO);
+    check(cov_sum(lcv1), 12870);                                       # 164 — engine 1
+    var lcv2 = sd_canvas_new(16, 16);
+    sd_canvas_fill_path(lcv2, lq, SD_FILL_EVEN_ODD);
+    check(cov_sum(lcv2), 12873);                                       # 165 — and the even-odd rule
+    # L2. THE CUBICTO ARM, the mirror site, which no mutation had reached at all.
+    var lk = sd_path_new();
+    sd_path_moveto(lk, 3 * ONE, 12 * ONE);
+    sd_path_cubicto(lk, 15 * ONE, 2 * ONE, 1 * ONE, 3 * ONE, 13 * ONE, 13 * ONE);
+    sd_path_close(lk);
+    check(sd_path_point_x(lk, 0), 3 * ONE);                            # 166
+    check(sd_path_point_y(lk, 0), 12 * ONE);                           # 167
+    var lcv3 = sd_canvas_new(16, 16);
+    sd_canvas_set_aa(lcv3, 0);
+    check(sd_canvas_fill_path(lcv3, lk, SD_FILL_NONZERO), SADISH_OK);  # 168
+    check(cov_sum(lcv3), 6632);                                        # 169 — engine 0
+    var lcv4 = sd_canvas_new(16, 16);
+    sd_canvas_set_aa(lcv4, 1);
+    sd_canvas_fill_path(lcv4, lk, SD_FILL_NONZERO);
+    check(cov_sum(lcv4), 6594);                                        # 170 — engine 1
+    var lcv5 = sd_canvas_new(16, 16);
+    sd_canvas_fill_path(lcv5, lk, SD_FILL_EVEN_ODD);
+    check(cov_sum(lcv5), 6632);                                        # 171 — even-odd
+
+    if (g_fails == 0) {
+        var ok = "inline_points_test: PASS (inline (x, y), the accessors, the origin, growth, OOM)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "inline_points_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

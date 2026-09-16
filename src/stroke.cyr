@@ -108,8 +108,9 @@
 # ⛔⛔ A REFUSED ALLOCATION IS A RETURN CODE, NOT A FAULT AND NOT A SILENT UNDER-DRAW (0.7.2).
 # All three public entries — sd_canvas_stroke_path, sd_canvas_stroke_path_ex,
 # sd_canvas_stroke_path_dash — return SADISH_ERR_OOM for a refusal at ANY allocation they reach:
-# the round stroker's per-piece SdPaths and the SdPoints inside them, and a curve's flatten
-# mid-points, all on the consumer's seam; the process-lifetime scratch and its growths (the fill /
+# the round stroker's per-piece SdPaths (⚠ and, through 0.8.0, the SdPoints inside them — a piece
+# path's points are inline coordinates since 0.9.0, so its three requests are all it makes) and a
+# curve's flatten points, all on the consumer's seam; the process-lifetime scratch and its growths (the fill /
 # stroke scratch, the batch, the run, the curve flags, the dash piece buffer, the flush's row
 # accumulator), all on the global alloc. Closes the STROKE half of
 # docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md.
@@ -156,10 +157,11 @@ var SD_MITER_LIMIT_MAX = 67108864;
 # perpendicular (magnitude via sd_isqrt), fill-union it. Round caps + round
 # joins come from a disc at every vertex, so no bevel/miter math is needed.
 # Each piece is MAX-unioned so overlaps combine regardless of winding.
-# Returns SADISH_OK, or SADISH_ERR_OOM when the piece path, one of its four SdPoints or the fill
-# underneath is refused — this piece then draws NOTHING (the half-built path is abandoned to an
-# allocator with no free()), and every piece already drawn stays on the canvas. ⚠ 7 sd_alloc calls
-# a rect on the consumer's seam: the path's record + verbs + points, then one SdPoint a corner.
+# Returns SADISH_OK, or SADISH_ERR_OOM when the piece path or the fill underneath is refused —
+# this piece then draws NOTHING (the half-built path is abandoned to an allocator with no free()),
+# and every piece already drawn stays on the canvas. ⚠ 3 sd_alloc calls a rect on the consumer's
+# seam: the path's record + verbs + points, and NOTHING per corner (0.9.0; 7 through 0.8.0, when
+# each corner was a 16 B SdPoint of its own).
 #
 # ⭐ THE PATH IS OPENED AT ITS EXACT SIZE (0.8.0) — item 2 of
 # docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md's "Still open": this is
@@ -169,15 +171,19 @@ var SD_MITER_LIMIT_MAX = 67108864;
 # SD_PATH_CAP_MIN = 8, so each array is opened at 8 and neither can grow here — the path is built
 # with 3 VERB SLOTS AND 4 POINT SLOTS SPARE.
 # ⚠ THAT SLACK IS REAL, SO ADDING ONE CALL BELOW DOES NOT BUY A DOUBLING — MEASURED, at these same
-# arguments: one extra lineto is 256 B in 8 sd_allocs (6 verbs, 5 points, both capacities still 8),
-# three extra 288 B in 10 (8 verbs, 7 points, the verb array exactly full), and neither array has
-# moved. The verb array first doubles at the NINTH verb — moveto + 7 linetos + close — which is
-# 432 B in 12 with vcap 8 -> 16; the point array at the ninth point, one lineto later.
+# arguments: one extra lineto is the SAME 240 B in the SAME 3 sd_allocs (6 verbs, 5 points, both
+# capacities still 8), three extra likewise (8 verbs, 7 points, the verb array exactly full), and
+# neither array has moved. The verb array first doubles at the NINTH verb — moveto + 7 linetos +
+# close — which is 368 B in 4 with vcap 8 -> 16; the point array at the ninth point, one lineto
+# later. ⚠ Through 0.8.0 each added lineto also bought a 16 B SdPoint, so those rows read 256 B in
+# 8 and 288 B in 10; inline (x, y) makes an added point free until an array actually overflows.
 # ⇒ What FAILS when the five calls below become six is group N's COUNT checks in
 # programs/path_cap_test.cyr (5 verbs, 4 points), NOT its capacity checks: those do not move until
 # the fourth extra lineto. Group N8 pins the whole boundary, so these numbers stay honest.
-# ⭐ MEASURED on the seam, per call: 4,208 B -> 240 B in the SAME 7 allocations (176 B of path —
-# 48 + 64 + 64 — plus the four 16 B SdPoints); the closed 8x8 rect stroke 34,432 B -> 3,232 B.
+# ⭐ MEASURED on the seam, per call: 4,208 B (0.7.2) -> 240 B (0.8.0) -> 240 B in THREE allocations
+# (0.9.0) — the same bytes, re-spent: 48 + 64 of verbs + 128 of INLINE points, where 0.8.0 paid
+# 48 + 64 + 64 plus four 16 B SdPoints in seven calls. The closed 8x8 rect stroke 34,432 ->
+# 3,232 -> 2,720 B, and 104 -> 24 sd_alloc calls (programs/path_cap_test.cyr group N).
 fn sd_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
     var dx = bx - ax;
     var dy = by - ay;
@@ -199,20 +205,22 @@ fn sd_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
 
 # A radius-hw disc (16-gon) at (cx, cy) — round cap / round join filler.
 # SADISH_OK, or SADISH_ERR_OOM on a refusal (nothing of this disc drawn), as sd_stroke_seg.
-# ⚠ 19 sd_alloc calls a disc: the path's three, then one SdPoint per vertex.
+# ⚠ 3 sd_alloc calls a disc — the path's three, and nothing per vertex (0.9.0; 19 through 0.8.0,
+# when each of the sixteen vertices was an SdPoint on the seam).
 #
 # ⭐ EXACT CAPACITY, LIKE sd_stroke_seg (0.8.0) — the second of the proposal's two in-tree sites.
 # ⛔ THE 17 AND THE 16 ARE THE `while (k < 16)` BELOW, COUNTED: 16 iterations emit one moveto and 15
 # linetos, then sd_path_close adds the 17th verb and no point — so 17 verbs and 16 points, and the
 # two arrays are EXACTLY full when the disc is built. ⚠ That is the tightest fit in the tree, and a
 # capacity one slot short of it pays a doubling and a memcpy: MEASURED, this shape opened at (16, 16)
-# is 816 B in 20 sd_alloc calls against 568 B in 19 — still well under the 4,400 B the 256-slot
+# is 688 B in 4 sd_alloc calls against 440 B in 3 — still well under the 4,400 B the 256-slot
 # default cost, and still 248 B and one copy more than deriving the count costs. ⚠ Raise the 16 (and
-# the `411775 / 16` step with it) without moving these arguments and BOTH arrays double: MEASURED at
-# k < 17, 1,112 B. programs/path_cap_test.cyr group N reads the capacities AND the counts back off
-# the record, so a changed 16 fails a check instead of quietly buying a doubling.
-# ⭐ MEASURED on the seam, per call: 4,400 B -> 568 B in the SAME 19 allocations (312 B of path —
-# 48 + 136 + 128 — plus the sixteen 16 B SdPoints).
+# the `411775 / 16` step with it) without moving these arguments and BOTH arrays double.
+# programs/path_cap_test.cyr group N reads the capacities AND the counts back off the record, so a
+# changed 16 fails a check instead of quietly buying a doubling.
+# ⭐ MEASURED on the seam, per call: 4,400 B (0.7.2) -> 568 B (0.8.0) -> 440 B in THREE allocations
+# (0.9.0): 48 + 136 of verbs + 256 of INLINE points, where 0.8.0 paid 48 + 136 + 128 plus sixteen
+# 16 B SdPoints in nineteen calls.
 fn sd_stroke_disc(cv, cx, cy, hw): i64 {
     var dp = sd_path_new_cap(17, 16);      # 16 vertices + the close = 17 verbs, 16 points
     if (dp == 0) { return SADISH_ERR_OOM; }
@@ -234,31 +242,31 @@ fn sd_stroke_disc(cv, cx, cy, hw): i64 {
 }
 
 # Stroke one flattened subpath run: a rect per segment + a disc per vertex.
+# ⚠ `run` HOLDS COORDINATES, 16 B A POINT — x at +0, y at +8 (0.9.0; an array of 8 B SdPoint
+# POINTERS through 0.8.0). The run is filled from a path's inline points and from a flatten's
+# output, and copying the two numbers out of a flatten's SdPoint is what keeps a straight verb's
+# anchor from needing a record of its own. See _sd_stroke_run in src/raster.cyr.
 # Returns SADISH_OK, or the first SADISH_ERR_OOM a piece reported — and STOPS there: the remaining
 # pieces are not attempted, because each is another allocation on the hook that has just refused
 # one. What was drawn stays drawn (the header's no-rollback rule).
 fn sd_stroke_run(cv, run, n, closed, hw): i64 {
     var i = 0;
     while (i < n - 1) {
-        var a = load64(run + i * 8);
-        var b = load64(run + (i + 1) * 8);
-        var src = sd_stroke_seg(cv, sd_point_x(a), sd_point_y(a), sd_point_x(b), sd_point_y(b), hw);
+        var src = sd_stroke_seg(cv, load64(run + i * 16), load64(run + i * 16 + 8),
+          load64(run + (i + 1) * 16), load64(run + (i + 1) * 16 + 8), hw);
         if (src != SADISH_OK) { return src; }
         i = i + 1;
     }
     if (closed != 0) {
         if (n > 1) {
-            var a2 = load64(run + (n - 1) * 8);
-            var b2 = load64(run + 0);
-            var crc = sd_stroke_seg(cv, sd_point_x(a2), sd_point_y(a2), sd_point_x(b2),
-              sd_point_y(b2), hw);
+            var crc = sd_stroke_seg(cv, load64(run + (n - 1) * 16), load64(run + (n - 1) * 16 + 8),
+              load64(run + 0), load64(run + 8), hw);
             if (crc != SADISH_OK) { return crc; }
         }
     }
     var k = 0;
     while (k < n) {
-        var v = load64(run + k * 8);
-        var drc = sd_stroke_disc(cv, sd_point_x(v), sd_point_y(v), hw);
+        var drc = sd_stroke_disc(cv, load64(run + k * 16), load64(run + k * 16 + 8), hw);
         if (drc != SADISH_OK) { return drc; }
         k = k + 1;
     }
@@ -275,9 +283,13 @@ fn _sd_round_walk(cv, path, hw): i64 {
     var fbuf = _sd_stroke_fbuf;
     var fctx = _sd_stroke_fctx;
 
+    # ⛔ COORDINATES AND A `has_cur` FLAG (0.9.0) — a path's points are inline now, so the current
+    # point is two numbers and 0 is the ORIGIN rather than "no moveto yet". Same flag, same reason,
+    # as src/raster.cyr's fill walk and src/path.cyr's flatten walk.
     var verbs = load64(path + SD_PATH_VERBS_OFFSET);
-    var points = load64(path + SD_PATH_POINTS_OFFSET);
-    var cur = 0;
+    var curx = 0;
+    var cury = 0;
+    var has_cur = 0;
     var closed = 0;
     var vi = 0;
     var pi = 0;
@@ -290,42 +302,50 @@ fn _sd_round_walk(cv, path, hw): i64 {
             }
             run_n = 0;
             closed = 0;
-            cur = load64(points + pi * 8);
-            store64(_sd_stroke_run + run_n * 8, cur);
+            curx = sd_path_point_x(path, pi);
+            cury = sd_path_point_y(path, pi);
+            has_cur = 1;
+            store64(_sd_stroke_run + run_n * 16, curx);
+            store64(_sd_stroke_run + run_n * 16 + 8, cury);
             run_n = run_n + 1;
             pi = pi + 1;
         }
         if (verb == SD_VERB_LINETO) {
-            if (cur != 0) {             # a drawing verb before any moveto is skipped (raster.cyr)
-                cur = load64(points + pi * 8);
-                run_n = _sd_run_push(run_n, cur, 0);
+            if (has_cur != 0) {         # a drawing verb before any moveto is skipped (raster.cyr)
+                curx = sd_path_point_x(path, pi);
+                cury = sd_path_point_y(path, pi);
+                run_n = _sd_run_push(run_n, curx, cury, 0);
             }
             pi = pi + 1;
         }
         if (verb == SD_VERB_QUADTO) {
-            var qc = load64(points + pi * 8);
-            var qe = load64(points + (pi + 1) * 8);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            if (cur != 0) {             # a curve before any moveto is skipped (see raster.cyr)
-                sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
+            if (has_cur != 0) {         # a curve before any moveto is skipped (see raster.cyr)
+                var qex = sd_path_point_x(path, pi + 1);
+                var qey = sd_path_point_y(path, pi + 1);
+                _sd_flatten_quad_xy(fctx, curx, cury, sd_path_point_x(path, pi),
+                  sd_path_point_y(path, pi), qex, qey, 0, tol, SD_FLATTEN_MAX_DEPTH);
                 run_n = _sd_run_append(run_n, fctx, 0);
-                cur = qe;
+                curx = qex;
+                cury = qey;
             }
             pi = pi + 2;
         }
         if (verb == SD_VERB_CUBICTO) {
-            var k1 = load64(points + pi * 8);
-            var k2 = load64(points + (pi + 1) * 8);
-            var ke = load64(points + (pi + 2) * 8);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            if (cur != 0) {             # a curve before any moveto is skipped (see raster.cyr)
-                sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
+            if (has_cur != 0) {         # a curve before any moveto is skipped (see raster.cyr)
+                var kex = sd_path_point_x(path, pi + 2);
+                var key = sd_path_point_y(path, pi + 2);
+                _sd_flatten_cubic_xy(fctx, curx, cury, sd_path_point_x(path, pi),
+                  sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
+                  sd_path_point_y(path, pi + 1), kex, key, 0, tol, SD_FLATTEN_MAX_DEPTH);
                 run_n = _sd_run_append(run_n, fctx, 0);
-                cur = ke;
+                curx = kex;
+                cury = key;
             }
             pi = pi + 3;
         }
@@ -443,8 +463,18 @@ var SD_STROKE_BATCH_MIN = 800;
 # mapped. MEASURED, random walks of 100..25,600 segments at width 3 (BUTT/MITER, a styled stroke
 # makes 7-20 edges a segment): the batch settles at 262,144 edges and the process has asked the
 # global heap for 25,682,744 B in total, once — against 1,303,352 B over the same sweep with
-# SD_STROKE_BATCH_CAP = 8192 (of which 442,368 B is the run, which 0.6.0 truncated instead). ⇒ The
-# knob is the ceiling for a consumer that needs one; it bounds the first allocation too.
+# SD_STROKE_BATCH_CAP = 8192 (of which 835,584 B is the run and its parallel flags, which 0.6.0
+# truncated instead). ⇒ The knob is the ceiling for a consumer that needs one; it bounds the first
+# allocation too.
+# ⚠ THE RUN'S SHARE WAS 442,368 B THROUGH 0.8.0 and is RE-MEASURED here for 0.9.0's 16 B inline
+# point: it is the doubling LADDER the longest walk forces (8,192 -> 16,384 -> 32,768 slots at
+# 16 B, plus the flags' 16,384 + 32,768 B), not the walk, so it reproduces from any generator that
+# reaches 25,601 points — verified against 0.8.0's own src, which returns the 442,368 above to the
+# byte. The initial 8,192-slot block is NOT in that figure; it is in _sd_scratch_init's one-time
+# cost (131,072 B, 65,536 through 0.8.0). ⭐ The sweep's TOTAL barely moved even so: the same walks'
+# PATHS cost 408,800 B less on the seam (51,100 points x the 8 B pointer that is gone), so the run's
+# +393,216 B of global heap is very nearly paid for by the caller's own arena — MEASURED +49,952 B
+# net across the nine walks.
 var _sd_sb_edges = 0;   # _sd_sb_cap * 32 — (ax, ay, bx, by) per edge, a -> b in winding order
 var _sd_sb_cap = 0;     # edges the array holds
 var _sd_sb_n = 0;       # edges in the batch
@@ -578,16 +608,19 @@ fn _sd_run_fits(n, flags): i64 {
     return 1;
 }
 
+# ⚠ 16 B A SLOT (0.9.0; 8 B a pointer through 0.8.0), so a growth of the same capacity asks for
+# twice the bytes — and the COPY is still the whole old CAPACITY, as _sd_inner_grow's header
+# explains for the flags.
 fn _sd_run_grow(n): i64 {
     if (_sd_run_trunc != 0) { return 0; }
     var nc = _sd_stroke_run_cap;
     while (nc < n) { nc = nc * 2; }
-    var blk = _sd_grow_alloc(nc * 8);
+    var blk = _sd_grow_alloc(nc * 16);
     if (blk == 0) {
         _sd_run_trunc = 1;
         return 0;
     }
-    memcpy(blk, _sd_stroke_run, _sd_stroke_run_cap * 8);
+    memcpy(blk, _sd_stroke_run, _sd_stroke_run_cap * 16);
     _sd_stroke_run = blk;
     _sd_stroke_run_cap = nc;
     return 1;
@@ -621,13 +654,18 @@ fn _sd_inner_grow(n): i64 {
 # is dropped (see _sd_run_fits). Returns the new count. (0.7.0: was sd_stroke_append(run, run_n,
 # fctx), bounded by SD_FLATTEN_CAP; the run pointer is no longer a parameter because growth
 # replaces the block.)
+# ⚠ THE CTX'S POINTS ARE STILL SdPoints AND THE RUN IS NOT (0.9.0): each emitted point's two
+# coordinates are COPIED into the run's 16 B slot, so nothing in the run points at anything. That is
+# what lets a flatten's per-curve buffer be rewound under a run that is still being stroked.
 fn _sd_run_append(run_n, fctx, flags): i64 {
     var pts = load64(fctx + 0);
     var n = load64(fctx + 8);
     var i = 0;
     while (i < n) {
         if (_sd_run_fits(run_n + 1, flags) != 0) {
-            store64(_sd_stroke_run + run_n * 8, load64(pts + i * 8));
+            var p = load64(pts + i * 8);
+            store64(_sd_stroke_run + run_n * 16, sd_point_x(p));
+            store64(_sd_stroke_run + run_n * 16 + 8, sd_point_y(p));
             run_n = run_n + 1;
         }
         i = i + 1;
@@ -635,10 +673,11 @@ fn _sd_run_append(run_n, fctx, flags): i64 {
     return run_n;
 }
 
-# Append point `pt` to the run (a LINETO); with `flags` != 0 its curve flag is cleared too.
-fn _sd_run_push(run_n, pt, flags): i64 {
+# Append the point (x, y) to the run (a LINETO); with `flags` != 0 its curve flag is cleared too.
+fn _sd_run_push(run_n, x, y, flags): i64 {
     if (_sd_run_fits(run_n + 1, flags) == 0) { return run_n; }
-    store64(_sd_stroke_run + run_n * 8, pt);
+    store64(_sd_stroke_run + run_n * 16, x);
+    store64(_sd_stroke_run + run_n * 16 + 8, y);
     if (flags != 0) { store8(_sd_sb_inner + run_n, 0); }
     return run_n + 1;
 }
@@ -1040,13 +1079,12 @@ fn _sd_sb_endcap(vx, vy, ox, oy, fwd, cap, hw): i64 {
 }
 
 # Length (16.16) of segment j of an m-vertex subpath (j + 1 wraps to 0).
+# ⚠ `run` is 16 B a point, x then y (0.9.0) — see sd_stroke_run.
 fn _sd_sb_seglen(run, m, j): i64 {
     var bj = j + 1;
     if (bj == m) { bj = 0; }
-    var a = load64(run + j * 8);
-    var b = load64(run + bj * 8);
-    var dx = sd_point_x(b) - sd_point_x(a);
-    var dy = sd_point_y(b) - sd_point_y(a);
+    var dx = load64(run + bj * 16) - load64(run + j * 16);
+    var dy = load64(run + bj * 16 + 8) - load64(run + j * 16 + 8);
     return sd_isqrt(dx * dx + dy * dy);
 }
 
@@ -1057,25 +1095,22 @@ fn _sd_sb_seglen(run, m, j): i64 {
 fn _sd_sb_unit(run, inner, m, closed, i, hw, cap, join, ml): i64 {
     var bi = i + 1;
     if (bi == m) { bi = 0; }
-    var a = load64(run + i * 8);
-    var b = load64(run + bi * 8);
-    var ax = sd_point_x(a);
-    var ay = sd_point_y(a);
-    var bx = sd_point_x(b);
-    var by = sd_point_y(b);
+    var ax = load64(run + i * 16);
+    var ay = load64(run + i * 16 + 8);
+    var bx = load64(run + bi * 16);
+    var by = load64(run + bi * 16 + 8);
     var ox, oy = _sd_seg_normal(ax, ay, bx, by, hw);
     if (i == 0) {
         if (closed == 0) { _sd_sb_endcap(ax, ay, ox, oy, 0, cap, hw); }
     } else {
-        var pv = load64(run + (i - 1) * 8);
-        _sd_sb_join(sd_point_x(pv), sd_point_y(pv), ax, ay, bx, by, hw, join, ml, load8(inner + i));
+        _sd_sb_join(load64(run + (i - 1) * 16), load64(run + (i - 1) * 16 + 8), ax, ay, bx, by,
+          hw, join, ml, load8(inner + i));
     }
     _sd_sb_rect(ax, ay, bx, by, ox, oy);
     if (bi == 0) {
         # closed: the vertex-0 join, between this closing segment and segment 0 — a moveto point,
-        # so never inside a curve
-        var nx = load64(run + 8);
-        _sd_sb_join(ax, ay, bx, by, sd_point_x(nx), sd_point_y(nx), hw, join, ml, 0);
+        # so never inside a curve. ⚠ run[1] is at +16 now, not +8 (0.9.0).
+        _sd_sb_join(ax, ay, bx, by, load64(run + 16), load64(run + 16 + 8), hw, join, ml, 0);
     } else {
         if (closed == 0) {
             if (bi == m - 1) { _sd_sb_endcap(bx, by, ox, oy, 1, cap, hw); }
@@ -1094,16 +1129,17 @@ fn _sd_sb_dedup(run, inner, n, closed): i64 {
     var m = 0;
     var k = 0;
     while (k < n) {
-        var p = load64(run + k * 8);
+        var px = load64(run + k * 16);
+        var py = load64(run + k * 16 + 8);
         var keep = 1;
         if (m > 0) {
-            var last = load64(run + (m - 1) * 8);
-            if (sd_point_x(p) == sd_point_x(last)) {
-                if (sd_point_y(p) == sd_point_y(last)) { keep = 0; }
+            if (px == load64(run + (m - 1) * 16)) {
+                if (py == load64(run + (m - 1) * 16 + 8)) { keep = 0; }
             }
         }
         if (keep != 0) {
-            store64(run + m * 8, p);
+            store64(run + m * 16, px);
+            store64(run + m * 16 + 8, py);
             store8(inner + m, load8(inner + k));
             m = m + 1;
         } else {
@@ -1113,10 +1149,8 @@ fn _sd_sb_dedup(run, inner, n, closed): i64 {
     }
     if (closed != 0) {
         if (m > 1) {
-            var z0 = load64(run + 0);
-            var zl = load64(run + (m - 1) * 8);
-            if (sd_point_x(z0) == sd_point_x(zl)) {
-                if (sd_point_y(z0) == sd_point_y(zl)) { m = m - 1; }
+            if (load64(run + 0) == load64(run + (m - 1) * 16)) {
+                if (load64(run + 8) == load64(run + (m - 1) * 16 + 8)) { m = m - 1; }
             }
         }
     }
@@ -1129,9 +1163,8 @@ fn _sd_sb_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
 
     if (m == 1) {
         if (_sd_sb_room(SD_STROKE_UNIT_EDGES) == 0) { _sd_sb_flush(cv); }
-        var v = load64(run + 0);
-        var vx = sd_point_x(v);
-        var vy = sd_point_y(v);
+        var vx = load64(run + 0);
+        var vy = load64(run + 8);
         if (cap == SD_CAP_ROUND) { _sd_sb_disc(vx, vy, hw); }
         if (cap == SD_CAP_SQUARE) { _sd_sb_rect(vx - hw, vy, vx + hw, vy, 0, hw); }
         return 0;
@@ -1192,12 +1225,16 @@ fn _sd_sb_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
     return 0;
 }
 
-# (Re)open a subpath at `cur` when a drawing verb follows a CLOSE: the run restarts at the moveto
-# point, as the fill restarts its edges there.
-fn _sd_sb_restart(run, run_n, cur): i64 {
+# (Re)open a subpath at (cx, cy) when a drawing verb follows a CLOSE: the run restarts at the
+# moveto point, as the fill restarts its edges there.
+# ⚠ `has` REPLACES THE OLD `cur != 0` TEST (0.9.0): the current point is a coordinate pair now and
+# (0, 0) is the origin, so the caller passes its own flag — a subpath restarting at the origin used
+# to be dropped by a pointer test and no longer can be.
+fn _sd_sb_restart(run, run_n, cx, cy, has): i64 {
     if (run_n == 0) {
-        if (cur != 0) {
-            store64(run + 0, cur);
+        if (has != 0) {
+            store64(run + 0, cx);
+            store64(run + 8, cy);
             return 1;
         }
     }
@@ -1254,65 +1291,79 @@ fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
     var flat_was = _sd_flat_trunc;
     _sd_flat_trunc = 0;
 
+    # ⛔ COORDINATES AND `has_cur` (0.9.0) — src/raster.cyr's fill walk, applied to the run: the
+    # current point is a pair of numbers, so 0 is the origin and the "no moveto yet" test is a flag.
     var verbs = load64(path + SD_PATH_VERBS_OFFSET);
-    var points = load64(path + SD_PATH_POINTS_OFFSET);
-    var cur = 0;
-    var start = 0;
+    var curx = 0;
+    var cury = 0;
+    var has_cur = 0;
+    var startx = 0;
+    var starty = 0;
     var vi = 0;
     var pi = 0;
     while (vi < n_verbs) {
         var verb = load64(verbs + vi * 8);
         if (verb == SD_VERB_MOVETO) {
             if (run_n > 0) { _sd_sb_dispatch(cv, run_n, 0, hw, cap, join, ml, dashed); }
-            cur = load64(points + pi * 8);
-            start = cur;
-            store64(_sd_stroke_run + 0, cur);
+            curx = sd_path_point_x(path, pi);
+            cury = sd_path_point_y(path, pi);
+            has_cur = 1;
+            startx = curx;
+            starty = cury;
+            store64(_sd_stroke_run + 0, curx);
+            store64(_sd_stroke_run + 8, cury);
             run_n = 1;
             pi = pi + 1;
         }
         if (verb == SD_VERB_LINETO) {
-            if (cur != 0) {             # a drawing verb before any moveto is skipped
-                run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
-                cur = load64(points + pi * 8);
-                run_n = _sd_run_push(run_n, cur, 1);
+            if (has_cur != 0) {         # a drawing verb before any moveto is skipped
+                run_n = _sd_sb_restart(_sd_stroke_run, run_n, curx, cury, has_cur);
+                curx = sd_path_point_x(path, pi);
+                cury = sd_path_point_y(path, pi);
+                run_n = _sd_run_push(run_n, curx, cury, 1);
             }
             pi = pi + 1;
         }
         if (verb == SD_VERB_QUADTO) {
-            if (cur == 0) { pi = pi + 2; vi = vi + 1; continue; }
-            run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
-            var qc = load64(points + pi * 8);
-            var qe = load64(points + (pi + 1) * 8);
+            if (has_cur == 0) { pi = pi + 2; vi = vi + 1; continue; }
+            run_n = _sd_sb_restart(_sd_stroke_run, run_n, curx, cury, has_cur);
+            var qex = sd_path_point_x(path, pi + 1);
+            var qey = sd_path_point_y(path, pi + 1);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
+            _sd_flatten_quad_xy(fctx, curx, cury, sd_path_point_x(path, pi),
+              sd_path_point_y(path, pi), qex, qey, 0, tol, SD_FLATTEN_MAX_DEPTH);
             var qn0 = run_n;
             run_n = _sd_run_append(run_n, fctx, 1);
             _sd_sb_mark_curve(qn0, run_n);
-            cur = qe;
+            curx = qex;
+            cury = qey;
             pi = pi + 2;
         }
         if (verb == SD_VERB_CUBICTO) {
-            if (cur == 0) { pi = pi + 3; vi = vi + 1; continue; }
-            run_n = _sd_sb_restart(_sd_stroke_run, run_n, cur);
-            var k1 = load64(points + pi * 8);
-            var k2 = load64(points + (pi + 1) * 8);
-            var ke = load64(points + (pi + 2) * 8);
+            if (has_cur == 0) { pi = pi + 3; vi = vi + 1; continue; }
+            run_n = _sd_sb_restart(_sd_stroke_run, run_n, curx, cury, has_cur);
+            var kex = sd_path_point_x(path, pi + 2);
+            var key = sd_path_point_y(path, pi + 2);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
+            _sd_flatten_cubic_xy(fctx, curx, cury, sd_path_point_x(path, pi),
+              sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
+              sd_path_point_y(path, pi + 1), kex, key, 0, tol, SD_FLATTEN_MAX_DEPTH);
             var cn0 = run_n;
             run_n = _sd_run_append(run_n, fctx, 1);
             _sd_sb_mark_curve(cn0, run_n);
-            cur = ke;
+            curx = kex;
+            cury = key;
             pi = pi + 3;
         }
         if (verb == SD_VERB_CLOSE) {
             if (run_n > 0) { _sd_sb_dispatch(cv, run_n, 1, hw, cap, join, ml, dashed); }
             run_n = 0;
-            cur = start;
+            curx = startx;
+            cury = starty;
         }
         vi = vi + 1;
     }

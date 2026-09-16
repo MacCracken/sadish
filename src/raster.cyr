@@ -170,11 +170,15 @@ fn sd_canvas_clear(cv): i64 {
 #
 # Flatten MID-POINTS (sd_pt_mid -> sd_point_new) are deliberately NOT here: they are
 # proportional to the curve work, not fixed-capacity, so they stay on the seam and the hook
-# decides where they live (MEASURED ON 0.7.1, 8x8 canvas, warm scratch: the CHANGELOG's one-quad
-# fill — moveto (0,0), quadto ctrl (8,0) → (8,8), lineto back, closed — costs 48 B of them = 3
-# EMITTED mid-points x 16 B in 3 allocations, and the same 48 B on the next identical call; a
-# single quad only ever costs 16 x (2^d - 1) B because both de Casteljau halves carry the parent's
-# second difference / 4 and so split to the same depth).
+# decides where they live (RE-MEASURED ON 0.9.0, 8x8 canvas, warm scratch: the CHANGELOG's one-quad
+# fill — moveto (0,0), quadto ctrl (8,0) → (8,8), lineto back, closed — costs 64 B of them in 4
+# allocations = 3 EMITTED mid-points + THE CURVE'S OWN END POINT x 16 B, and the same 64 B on the
+# next identical call; a single quad only ever costs 16 x (2^d - 1) B of MID-POINTS because both de
+# Casteljau halves carry the parent's second difference / 4 and so split to the same depth).
+# ⚠ IT WAS 48 B IN 3 THROUGH 0.8.0, when the end point was the PATH'S OWN SdPoint and was handed
+# through rather than built: a path's points are inline coordinates from 0.9.0, so there is no
+# record to hand and the fill's flatten materialises one. +16 B and one call per CURVE VERB, and
+# per anchor on sd_path_flatten — the release notes carry the whole figure.
 # ⚠ THAT COEFFICIENT WAS 48, NOT 16, THROUGH 0.7.0, and the figure above was 144 B: the recursion
 # allocated every subdivision node's three mid-points on the seam and threw two of them away. 0.7.1
 # takes the throwaways onto a fixed per-depth scratch (src/path.cyr), so only EMITTED points are
@@ -189,7 +193,14 @@ var _sd_fill_cross = 0;        # _sd_fill_cross_cap * 16 — (x, dir) crossings 
 var _sd_fill_cross_cap = 0;    # >= every edge list that is walked: the fill's AND the stroke batch's
 var _sd_fill_accrow = 0;       # w * 8 — per-row 16.16 accumulator, sized to the widest canvas seen
 var _sd_fill_accrow_cap = 0;   # pixels the current accrow block can hold
-var _sd_stroke_run = 0;        # _sd_stroke_run_cap * 8 — the stroker's polyline run — GROWS (0.7.0)
+# ⭐ 16 B A POINT, x at +0 and y at +8, INLINE (0.9.0; _sd_stroke_run_cap * 8 SdPoint POINTERS
+# through 0.8.0). A path's points are coordinates now, so a run built from them has nothing to point
+# AT — and a run of coordinates is what keeps a straight verb's anchor from costing an allocation on
+# the consumer's seam at every stroke. The flatten output it also copies from is still SdPoints;
+# _sd_run_append reads the two words out of each. ⚠ MEASURED one-time cost: 131,072 B against
+# 65,536 B — this block doubled, ONCE, on the global heap (never sd_alloc), and it is the whole
+# price of the seam saving.
+var _sd_stroke_run = 0;        # _sd_stroke_run_cap * 16 — the stroker's polyline run — GROWS (0.7.0)
 var _sd_stroke_run_cap = 0;    # points the current run block holds
 var _sd_stroke_fbuf = 0;       # SD_FLATTEN_CAP * 8 — the stroker's OWN flatten output (FIXED)
 var _sd_stroke_fctx = 0;       # the stroker's OWN flatten ctx (24 B)
@@ -239,13 +250,41 @@ var _sd_stroke_fctx = 0;       # the stroker's OWN flatten ctx (24 B)
 # ⚠ It is also what lets programs/grow_edges_test.cyr drive the out-of-memory path a real failure
 # takes — no honest test reaches alloc's own limit, which is 67 M edges.
 # ================================================================
-# 8 MiB: 262,144 edges (32 B each), 524,288 crossings (16 B) or 1,048,576 run points (8 B) in one
+# 8 MiB: 262,144 edges (32 B each), 524,288 crossings (16 B) or 524,288 run points (16 B) in one
 # request — far past any legitimate path this stack draws, and short of the hostile repro above.
-var SD_GROW_LIMIT_DEFAULT = 8388608;
-var _sd_grow_limit = 8388608;
+# ⛔⛔ THE DEFAULT DOUBLED IN 0.9.0 SO THAT THE POINT BUFFERS REACH EXACTLY AS FAR AS THEY DID.
+# The ceiling is in BYTES, and 0.9.0 turned a run point from an 8 B pointer into a 16 B inline
+# (x, y) — so at 0.8.0's 8 MiB the stroker's run and the dash piece buffer would have topped out at
+# 524,288 points where 0.8.0 reached 1,048,576, and a path of over 524,288 points in ONE subpath
+# that 0.8.0 stroked whole would have truncated (MEASURED with sd_grow_limit_set(262144) and a
+# 20,000-point styled stroke: 0.8.0 rc=SADISH_OK and 526,870 coverage units, the 8 MiB 0.9.0
+# rc=SADISH_ERR_OOM and 434,050). ⇒ The default is 16 MiB, and the length a consumer can stroke is
+# what it was. PINNED by programs/grow_edges_test.cyr groups R and R2.
+# ⭐ AND IT COSTS NO REAL MEMORY, MEASURED ON BOTH TREES: at 8,192 / 16,384 / 32,768-point subpaths,
+# where the run's capacity is exactly its occupancy, a stroked point costs FORTY BYTES of path + run
+# on EITHER release — 0.8.0 pays 8 to the run and 32 to the path (an 8 B verb, an 8 B pointer, a
+# 16 B SdPoint), 0.9.0 pays 16 to the run and 24 to the path (the 8 B verb and the 16 B inline
+# slot). The ceiling's SHARE of an unchanged total moved, so restoring the length restores the
+# footprint: at their truncation points both releases hold 1,048,576 points x 40 B = 41,943,040 B of
+# path + run. 0.9.0 buys 0.8.0's longest subpath for 0.8.0's own bytes, to the byte.
+# ⚠ WHAT THE DOUBLING ALSO DOES, said plainly: the ceiling bounds EVERY growable store, so the
+# fill's edge list and crossings can now reach twice what they could — 524,288 edges, not 262,144.
+# That is a looser hostile-path bound than 0.8.0's, and it is the price of keeping stroke behaviour
+# byte-stable across the ABI change. A consumer that wants 0.8.0's memory bound rather than its
+# length calls sd_grow_limit_set(8388608) and gets exactly the old figure back.
+# Swept 2026-09-16: no repo in the ecosystem (rekha, dhancha, agnos, setu, crab, puka) calls
+# sd_grow_limit_set at all, so nothing ships against either length today.
+var SD_GROW_LIMIT_DEFAULT = 16777216;
+var _sd_grow_limit = 16777216;
 
 # @public — set the growth ceiling in bytes (0 = unbounded); returns the PREVIOUS value, so a caller
 # can scope it. SD_GROW_LIMIT_DEFAULT restores the default.
+# ⚠ BYTES, NOT ENTRIES, and what a byte buys changed in 0.9.0 for two of the five stores it bounds.
+# n bytes is n/32 edges (the fill's list and the styled batch alike), n/16 crossings, n/16 RUN
+# POINTS and n/16 dash points — the last two were n/8 through 0.8.0, when a point was a pointer.
+# ⇒ 0.9.0 doubled SD_GROW_LIMIT_DEFAULT so the DEFAULT length is unchanged; a caller that tuned its
+# own value past 0.9.0 doubles it for the same maximum path length. See the
+# ⛔⛔ block above SD_GROW_LIMIT_DEFAULT for what happens if it does not.
 fn sd_grow_limit_set(n): i64 {
     var prev = _sd_grow_limit;
     if (n < 0) { return prev; }
@@ -267,11 +306,15 @@ fn _sd_grow_alloc(n): i64 {
 }
 
 # Allocate the fixed-capacity scratch once (idempotent). Called at the top of sd_fill_impl and
-# sd_canvas_stroke_path; a second call is one load + compare. MEASURED one-time cost: 589,896 B
-# (fill 458,800 + stroke 131,096), plus accrow on first use (w*8: 64 B at 8 px, 6,080 B at 760).
+# sd_canvas_stroke_path; a second call is one load + compare. MEASURED one-time cost: 655,432 B
+# (fill 458,800 + stroke 196,632), plus accrow on first use (w*8: 64 B at 8 px, 6,080 B at 760).
+# ⚠ It was 589,896 B through 0.8.0: the stroker's run went from 8 B pointers to 16 B INLINE points
+# (0.9.0), +65,536 B on the global heap, ONCE. That is the whole cost of a stroke that allocates no
+# SdPoint per anchor on the consumer's seam any more.
 # ⇒ After it, a straight-line fill costs the heap 0 B (MEASURED, 8x8 and 760x300); a stroke of the
-# closed 8x8 rect 3,232 B, all of it paths + points on the seam (was 34,432 B through 0.7.2 and
-# 2,789,016 B on 0.5.4 — 0.8.0 opens the round stroker's piece paths at their exact capacity).
+# closed 8x8 rect 2,720 B, all of it paths on the seam (3,232 B through 0.8.0, 34,432 B through
+# 0.7.2 and 2,789,016 B on 0.5.4 — 0.8.0 opened the round stroker's piece paths at their exact
+# capacity and 0.9.0 took the SdPoints out of them).
 #
 # Returns 1 when the scratch is ready, 0 when a block was refused.
 # ⛔ ALL OR NOTHING, AND `_sd_fill_ectx != 0` IS THE FLAG. Through 0.7.0 the eight blocks were
@@ -286,13 +329,15 @@ fn _sd_grow_alloc(n): i64 {
 # request the real allocator really refuses (programs/oom_test.cyr group J, the same device
 # grow_edges_test uses on the growth ceiling).
 # ⛔ WHAT THAT GATES, EXACTLY, because the eight 0-tests below are NOT eight gates. ALLOC_MAX
-# refuses BY SIZE, and the capacity-sized five are CAP*32, CAP*16 and three of CAP*8: group J's
-# 300,000,000 puts the SMALLEST of them over the 2 GiB line, so all five are refused together and
-# nothing is mapped (MEASURED: exactly 3 * 24 B granted, five refused, nothing published). A
-# capacity that isolated ONE — anything from 67,108,865 to 268,435,456 refuses only the CAP*32 edge
-# list — would GRANT the other four, about 4.0 GB of mappings a consumer's machine would have to
-# hand over for a test that never touches a byte of them, so it is not taken. The three 24 B ctx
-# blocks are not drivable at any capacity: lib/alloc.cyr refuses 24 B only if mmap itself fails.
+# refuses BY SIZE, and the capacity-sized five are CAP*32, TWO of CAP*16 and TWO of CAP*8 (the run
+# joined the CAP*16 half in 0.9.0 — 16 B an inline point, not 8 B a pointer): group J's 300,000,000
+# puts the SMALLEST of them over the 2 GiB line, so all five are refused together and nothing is
+# mapped (MEASURED: exactly 3 * 24 B granted, five refused, nothing published). A capacity that
+# isolated ONE — anything from 67,108,865 to 134,217,728 refuses only the CAP*32 edge list — would
+# GRANT the other four, about 6 GiB of mappings at the top of that window (5 GiB through 0.8.0) that
+# a consumer's machine would have to hand over for a test that never touches a byte of them, so it
+# is not taken. The three 24 B ctx blocks are not drivable at any capacity: lib/alloc.cyr refuses
+# 24 B only if mmap itself fails.
 # ⇒ Deleting any ONE of the eight tests leaves the others setting `ok = 0`, so no suite can kill it:
 # they are a CONTRACT on this function, not a gate, in the same sense as the 0 that
 # _sd_fill_cross_for returns. What IS gated: that a refusal publishes nothing (check 124) and that a
@@ -310,7 +355,7 @@ fn _sd_scratch_init(): i64 {
     var fbuf = alloc(SD_FLATTEN_CAP * 8);
     var fctx = alloc(24);
     var cross = alloc(SD_FLATTEN_CAP * 16);
-    var srun = alloc(SD_FLATTEN_CAP * 8);
+    var srun = alloc(SD_FLATTEN_CAP * 16);      # 16 B a run point since 0.9.0, not 8
     var sfbuf = alloc(SD_FLATTEN_CAP * 8);
     var sfctx = alloc(24);
     var ok = 1;
@@ -446,20 +491,28 @@ fn sd_edge_add(ectx, ax, ay, bx, by): i64 {
     return 0;
 }
 
-# Connect `cur` through the points a flatten ctx just emitted, as edges;
-# returns the last point (the new current point).
-fn sd_fill_edges_from(ectx, fctx, cur): i64 {
+# Connect (cx, cy) through the points a flatten ctx just emitted, as edges;
+# returns the last point as the pair (x, y) — the new current point, or the argument back when the
+# ctx emitted nothing.
+# ⚠ COORDINATES IN AND OUT (0.9.0): it took and returned an SdPoint POINTER, which the fill's verb
+# walk no longer has for a path anchor. The ctx's own points are still SdPoints — the flatten
+# output's shape did not change — and are read the same way.
+fn sd_fill_edges_from(ectx, fctx, cx, cy): (i64, i64) {
     var pts = load64(fctx + 0);
     var n = load64(fctx + 8);
-    var prev = cur;
+    var prevx = cx;
+    var prevy = cy;
     var i = 0;
     while (i < n) {
         var p = load64(pts + i * 8);
-        sd_edge_add(ectx, sd_point_x(prev), sd_point_y(prev), sd_point_x(p), sd_point_y(p));
-        prev = p;
+        var px = sd_point_x(p);
+        var py = sd_point_y(p);
+        sd_edge_add(ectx, prevx, prevy, px, py);
+        prevx = px;
+        prevy = py;
         i = i + 1;
     }
-    return prev;
+    return (prevx, prevy);
 }
 
 # Cast a +x ray from (sx, sy) and accumulate edge crossings to its right.
@@ -601,13 +654,15 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     # the round stroker discarded sd_canvas_fill_union's result, so a starved stroke returned
     # SADISH_OK over a partial picture. Since 0.7.2 each stroke entry scopes the verdict the same way
     # and returns SADISH_ERR_OOM itself (src/stroke.cyr's refusal block).
-    # ⛔ A DRAWING VERB BEFORE ANY MOVETO IS SKIPPED, not drawn from (0, 0). `cur` is an SdPoint
-    # POINTER, 0 until the first moveto, and every drawing verb dereferences it — so a path whose first
-    # verb is a lineto/quadto/cubicto used to fault the process (MEASURED on 0.7.0 and 0.6.0 alike:
-    # SIGSEGV, rc 139). SVG calls such a path an error and renders nothing of it; sadish now skips the
-    # verbs (their points are still consumed, so the verb/point streams stay in step) until a moveto
-    # arrives. ⚠ 0.7.1 made this easy to reach: a refused sd_path_moveto now returns SADISH_ERR_OOM
-    # with the path untouched, so a caller that logs and carries on builds exactly this path.
+    # ⛔ A DRAWING VERB BEFORE ANY MOVETO IS SKIPPED, not drawn from (0, 0). Through 0.8.0 `cur` was
+    # an SdPoint POINTER, 0 until the first moveto, and every drawing verb dereferenced it — so a
+    # path whose first verb is a lineto/quadto/cubicto used to fault the process (MEASURED on 0.7.0
+    # and 0.6.0 alike: SIGSEGV, rc 139). SVG calls such a path an error and renders nothing of it;
+    # sadish skips the verbs (their points are still consumed, so the verb/point streams stay in
+    # step) until a moveto arrives. ⚠ 0.7.1 made this easy to reach: a refused sd_path_moveto
+    # returns SADISH_ERR_OOM with the path untouched, so a caller that logs and carries on builds
+    # exactly this path. ⚠ AND SINCE 0.9.0 THE TEST IS A FLAG, `has_cur`, because the current point
+    # is now a COORDINATE PAIR and 0 is the origin — see the walk below.
     # ⛔⛔ ONE FLATTEN OPERATION FOR THE WHOLE FILL (0.7.2) — the budget bounds this CALL, not one
     # curve of it. 0.7.1 gave sd_path_flatten a per-operation budget in points
     # (SD_FLATTEN_BUDGET_DEFAULT = 65,536, src/path.cyr) and left the fill flattening ONE CURVE VERB
@@ -644,10 +699,20 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     var flat_was = _sd_flat_trunc;      # the caller's standing verdict, restored below
     _sd_flat_trunc = 0;                 # scoped: from here it means "THIS fill lost points"
     var fop = 0;                        # 1 once this fill has opened its flatten operation
+    # ⚠ The verb stream is read raw (one i64 a verb, unchanged since 0.4.0); the POINTS go through
+    # sd_path_point_x / _y, the read src/path.cyr publishes — this walk is the in-tree example of
+    # it, and the reason the points array is not loaded here at all any more.
     var verbs = load64(path + SD_PATH_VERBS_OFFSET);
-    var points = load64(path + SD_PATH_POINTS_OFFSET);
-    var cur = 0;
-    var sub_start = 0;
+    # ⛔ `has_cur` IS THE SENTINEL NOW (0.9.0), NOT `cur != 0`. A path's points are inline
+    # coordinates, so the current point is a pair of numbers and (0, 0) is the ORIGIN — a real
+    # place to draw from. Through 0.8.0 `cur` was an SdPoint pointer and 0 could only mean "no
+    # moveto yet"; keeping that test on a coordinate would skip every verb of a path that starts at
+    # the origin. src/path.cyr's flatten walk and both of stroke.cyr's carry the same flag.
+    var curx = 0;
+    var cury = 0;
+    var has_cur = 0;
+    var subx = 0;
+    var suby = 0;
     var sub_open = 0;
     var vi = 0;
     var pi = 0;
@@ -655,63 +720,71 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
         var verb = load64(verbs + vi * 8);
         if (verb == SD_VERB_MOVETO) {
             if (sub_open != 0) {
-                sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
+                sd_edge_add(ectx, curx, cury, subx, suby);
             }
-            cur = load64(points + pi * 8);
-            sub_start = cur;
+            curx = sd_path_point_x(path, pi);
+            cury = sd_path_point_y(path, pi);
+            has_cur = 1;
+            subx = curx;
+            suby = cury;
             sub_open = 0;
             pi = pi + 1;
         }
         if (verb == SD_VERB_LINETO) {
-            var lp = load64(points + pi * 8);
-            if (cur != 0) {
-                sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(lp), sd_point_y(lp));
-                cur = lp;
+            if (has_cur != 0) {
+                var lx = sd_path_point_x(path, pi);
+                var ly = sd_path_point_y(path, pi);
+                sd_edge_add(ectx, curx, cury, lx, ly);
+                curx = lx;
+                cury = ly;
                 sub_open = 1;
             }
             pi = pi + 1;
         }
         if (verb == SD_VERB_QUADTO) {
-            var qc = load64(points + pi * 8);
-            var qe = load64(points + (pi + 1) * 8);
-            if (cur == 0) { qe = 0; }       # no moveto yet: skip the curve, keep the streams in step
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            if (qe != 0) {
+            if (has_cur != 0) {     # no moveto yet: skip the curve, keep the streams in step
                 if (fop == 0) {
                     sd_flatten_op_begin();
                     fop = 1;
                 }
-                sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
-                cur = sd_fill_edges_from(ectx, fctx, cur);
+                _sd_flatten_quad_xy(fctx, curx, cury, sd_path_point_x(path, pi),
+                  sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
+                  sd_path_point_y(path, pi + 1), 0, tol, SD_FLATTEN_MAX_DEPTH);
+                var qlx, qly = sd_fill_edges_from(ectx, fctx, curx, cury);
+                curx = qlx;
+                cury = qly;
                 sub_open = 1;
             }
             pi = pi + 2;
         }
         if (verb == SD_VERB_CUBICTO) {
-            var k1 = load64(points + pi * 8);
-            var k2 = load64(points + (pi + 1) * 8);
-            var ke = load64(points + (pi + 2) * 8);
-            if (cur == 0) { ke = 0; }       # no moveto yet: skip the curve, keep the streams in step
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            if (ke != 0) {
+            if (has_cur != 0) {     # no moveto yet: skip the curve, keep the streams in step
                 if (fop == 0) {
                     sd_flatten_op_begin();
                     fop = 1;
                 }
-                sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
-                cur = sd_fill_edges_from(ectx, fctx, cur);
+                _sd_flatten_cubic_xy(fctx, curx, cury, sd_path_point_x(path, pi),
+                  sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
+                  sd_path_point_y(path, pi + 1), sd_path_point_x(path, pi + 2),
+                  sd_path_point_y(path, pi + 2), 0, tol, SD_FLATTEN_MAX_DEPTH);
+                var klx, kly = sd_fill_edges_from(ectx, fctx, curx, cury);
+                curx = klx;
+                cury = kly;
                 sub_open = 1;
             }
             pi = pi + 3;
         }
         if (verb == SD_VERB_CLOSE) {
-            if (cur != 0) {
-                sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
-                cur = sub_start;
+            if (has_cur != 0) {
+                sd_edge_add(ectx, curx, cury, subx, suby);
+                curx = subx;
+                cury = suby;
                 sub_open = 0;
             }
         }
@@ -722,7 +795,7 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
     # DO exist — an empty edge list, a refused accumulator, the AREA dispatch — are all below).
     if (fop != 0) { sd_flatten_op_end(); }
     if (sub_open != 0) {
-        sd_edge_add(ectx, sd_point_x(cur), sd_point_y(cur), sd_point_x(sub_start), sd_point_y(sub_start));
+        sd_edge_add(ectx, curx, cury, subx, suby);
     }
 
     var flat_lost = _sd_flat_trunc;     # did THIS fill's flatten lose points?
@@ -1165,9 +1238,10 @@ fn sd_canvas_clip_pop(cv): i64 {
 
 # ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
-# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700; 0.7.1 -> 701; 0.7.2 -> 702; 0.8.0 -> 800.
+# 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700; 0.7.1 -> 701;
+# 0.7.2 -> 702; 0.8.0 -> 800; 0.9.0 -> 900.
 # ================================================================
 # @public
 fn sadish_version(): i64 {
-    return 800;
+    return 900;
 }

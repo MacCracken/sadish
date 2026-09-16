@@ -57,8 +57,9 @@
 # ⛔ FROM THE GLOBAL `alloc`, NEVER `sd_alloc` — the same rule, for the same reason, as raster.cyr's
 # _sd_scratch_init: a consumer hook is typically an arena that gets reset, and a scratch drawn from
 # it dangles on the next frame. ⚠ And NOT in _sd_scratch_init: a process that never asks for AREA
-# pays nothing for it, and the default fill's first-call figures (590,152 B at 32 px, asserted in
-# programs/alloc_test.cyr) stay exact.
+# pays nothing for it, and the default fill's first-call figures (655,688 B at 32 px, asserted in
+# programs/alloc_test.cyr; 590,152 B through 0.8.0, before the stroker's run went inline) stay
+# exact.
 # The edge list needs no scratch of its own: it is sorted IN PLACE in _sd_fill_edges, which is
 # per-call working storage nothing reads after sd_fill_impl returns.
 var _sd_area_acc = 0;          # (w + 1) * 8 — one row of signed 16.16 cell accumulators

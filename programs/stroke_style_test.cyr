@@ -238,6 +238,12 @@ fn band_faults(cv, pl, break1, hw, rmax): i64 {
 }
 
 # ---- the 0.5.5 stroker, VERBATIM (raster.cyr 0.5.5, names prefixed ref_) ---------------------
+# ⚠ PORTED, NOT REWRITTEN, IN 0.9.0. The algorithm, the piece order and the arithmetic are 0.5.5's
+# to the line; what changed is how it READS a path (sd_path_point_x / _y, because points are inline
+# coordinates now), how it stores a run point (16 B inline, the shape _sd_stroke_run has) and that
+# it flattens through the coordinate entry _sd_flatten_quad_xy / _cubic_xy rather than handing the
+# path's own SdPoints in. Those three are exactly the reads 0.9.0 moved; the oracle is still the
+# 0.5.5 stroker and the corpus below is still asserted pixel-for-pixel against it.
 fn ref_stroke_seg(cv, ax, ay, bx, by, hw): i64 {
     var dx = bx - ax;
     var dy = by - ay;
@@ -279,7 +285,9 @@ fn ref_stroke_append(run, run_n, fctx): i64 {
     var i = 0;
     while (i < n) {
         if (run_n < SD_FLATTEN_CAP) {
-            store64(run + run_n * 8, load64(pts + i * 8));
+            var q = load64(pts + i * 8);
+            store64(run + run_n * 16, sd_point_x(q));
+            store64(run + run_n * 16 + 8, sd_point_y(q));
             run_n = run_n + 1;
         }
         i = i + 1;
@@ -290,22 +298,19 @@ fn ref_stroke_append(run, run_n, fctx): i64 {
 fn ref_stroke_run(cv, run, n, closed, hw): i64 {
     var i = 0;
     while (i < n - 1) {
-        var a = load64(run + i * 8);
-        var b = load64(run + (i + 1) * 8);
-        ref_stroke_seg(cv, sd_point_x(a), sd_point_y(a), sd_point_x(b), sd_point_y(b), hw);
+        ref_stroke_seg(cv, load64(run + i * 16), load64(run + i * 16 + 8),
+          load64(run + (i + 1) * 16), load64(run + (i + 1) * 16 + 8), hw);
         i = i + 1;
     }
     if (closed != 0) {
         if (n > 1) {
-            var a2 = load64(run + (n - 1) * 8);
-            var b2 = load64(run + 0);
-            ref_stroke_seg(cv, sd_point_x(a2), sd_point_y(a2), sd_point_x(b2), sd_point_y(b2), hw);
+            ref_stroke_seg(cv, load64(run + (n - 1) * 16), load64(run + (n - 1) * 16 + 8),
+              load64(run + 0), load64(run + 8), hw);
         }
     }
     var k = 0;
     while (k < n) {
-        var v = load64(run + k * 8);
-        ref_stroke_disc(cv, sd_point_x(v), sd_point_y(v), hw);
+        ref_stroke_disc(cv, load64(run + k * 16), load64(run + k * 16 + 8), hw);
         k = k + 1;
     }
     return 0;
@@ -327,8 +332,8 @@ fn ref_canvas_stroke_path(cv, path, width): i64 {
     var fctx = _sd_stroke_fctx;
 
     var verbs = load64(path + SD_PATH_VERBS_OFFSET);
-    var points = load64(path + SD_PATH_POINTS_OFFSET);
-    var cur = 0;
+    var curx = 0;
+    var cury = 0;
     var closed = 0;
     var vi = 0;
     var pi = 0;
@@ -338,40 +343,48 @@ fn ref_canvas_stroke_path(cv, path, width): i64 {
             if (run_n > 0) { ref_stroke_run(cv, run, run_n, closed, hw); }
             run_n = 0;
             closed = 0;
-            cur = load64(points + pi * 8);
-            store64(run + run_n * 8, cur);
+            curx = sd_path_point_x(path, pi);
+            cury = sd_path_point_y(path, pi);
+            store64(run + run_n * 16, curx);
+            store64(run + run_n * 16 + 8, cury);
             run_n = run_n + 1;
             pi = pi + 1;
         }
         if (verb == SD_VERB_LINETO) {
-            cur = load64(points + pi * 8);
+            curx = sd_path_point_x(path, pi);
+            cury = sd_path_point_y(path, pi);
             if (run_n < SD_FLATTEN_CAP) {
-                store64(run + run_n * 8, cur);
+                store64(run + run_n * 16, curx);
+                store64(run + run_n * 16 + 8, cury);
                 run_n = run_n + 1;
             }
             pi = pi + 1;
         }
         if (verb == SD_VERB_QUADTO) {
-            var qc = load64(points + pi * 8);
-            var qe = load64(points + (pi + 1) * 8);
+            var qex = sd_path_point_x(path, pi + 1);
+            var qey = sd_path_point_y(path, pi + 1);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_quad(fctx, cur, qc, qe, tol, SD_FLATTEN_MAX_DEPTH);
+            _sd_flatten_quad_xy(fctx, curx, cury, sd_path_point_x(path, pi),
+              sd_path_point_y(path, pi), qex, qey, 0, tol, SD_FLATTEN_MAX_DEPTH);
             run_n = ref_stroke_append(run, run_n, fctx);
-            cur = qe;
+            curx = qex;
+            cury = qey;
             pi = pi + 2;
         }
         if (verb == SD_VERB_CUBICTO) {
-            var k1 = load64(points + pi * 8);
-            var k2 = load64(points + (pi + 1) * 8);
-            var ke = load64(points + (pi + 2) * 8);
+            var kex = sd_path_point_x(path, pi + 2);
+            var key = sd_path_point_y(path, pi + 2);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
             store64(fctx + 16, SD_FLATTEN_CAP);
-            sd_flatten_cubic(fctx, cur, k1, k2, ke, tol, SD_FLATTEN_MAX_DEPTH);
+            _sd_flatten_cubic_xy(fctx, curx, cury, sd_path_point_x(path, pi),
+              sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
+              sd_path_point_y(path, pi + 1), kex, key, 0, tol, SD_FLATTEN_MAX_DEPTH);
             run_n = ref_stroke_append(run, run_n, fctx);
-            cur = ke;
+            curx = kex;
+            cury = key;
             pi = pi + 3;
         }
         if (verb == SD_VERB_CLOSE) {
@@ -673,10 +686,13 @@ fn main(): i64 {
     sd_canvas_stroke_path_ex(acv, acurve, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
     var curve_cost = arena_used(g_arena) - a0;
     check(alloc_used() - g0, 0);                                       # 7 — a curve: still 0 on the heap
-    # MEASURED 112 B: the cubic's 7 EMITTED flatten mid-points x 16 B (7 subdivisions), on the
+    # MEASURED 128 B: the cubic's 7 EMITTED flatten mid-points AND its endpoint, x 16 B, on the
     # seam, per call. Was 672 B through 0.7.0, when each of those 7 nodes allocated all SIX of its
-    # de Casteljau mids and threw five away.
-    check(curve_cost, 112);                                            # 8
+    # de Casteljau mids and threw five away, and 112 B through 0.8.0, when the curve's endpoint was
+    # the PATH's own SdPoint and needed no record of its own. 0.9.0 stores a path's points inline,
+    # so an emitted endpoint is materialised like any other output point: +16 B per curve VERB, set
+    # against 16 B and one sd_alloc per POINT that building the path no longer pays.
+    check(curve_cost, 128);                                            # 8
     a0 = arena_used(g_arena);
     sd_canvas_stroke_path_ex(acv, acurve, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
     check(arena_used(g_arena) - a0, curve_cost);                       # 9 — identical on the next call
@@ -684,22 +700,24 @@ fn main(): i64 {
     g0 = alloc_used();
     sd_canvas_stroke_path_ex(acv, arect, W4, SD_CAP_ROUND, SD_JOIN_BEVEL, ML4);
     check(alloc_used() - g0, 0);                                       # 11 — no hook: still 0 B
-    # ROUND/ROUND through _ex is the round stroker, allocations included (3,232 B, its paths).
-    # ⭐ 34,432 B through 0.7.2, 3,232 B here — 10.65x less, in the SAME 104 sd_alloc calls. 0.8.0
-    # opened sd_stroke_seg's rect at sd_path_new_cap(5, 4) and sd_stroke_disc's 16-gon at
-    # sd_path_new_cap(17, 16) instead of SD_PATH_CAP = 256 + 256 (item 2 of
-    # docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md). The closed square
-    # is 4 segment rects at 240 B and 4 vertex discs at 568 B: 4 * 240 + 4 * 568 = 3,232. ⛔ The
-    # ALLOCATION COUNT is what says neither array grew — 7 a rect and 19 a disc, exactly as before,
-    # since a doubling would add one more (programs/path_cap_test.cyr group N reads the capacities
-    # off the record and asserts the counts too).
+    # ROUND/ROUND through _ex is the round stroker, allocations included (2,720 B, its paths).
+    # ⭐ 34,432 B through 0.7.2, 3,232 B through 0.8.0, 2,720 B here — and the ALLOCATION COUNT
+    # fell with it for the first time, 104 -> 24. 0.8.0 opened sd_stroke_seg's rect at
+    # sd_path_new_cap(5, 4) and sd_stroke_disc's 16-gon at sd_path_new_cap(17, 16) instead of
+    # SD_PATH_CAP = 256 + 256 (item 2 of
+    # docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md); 0.9.0 stores the
+    # points INLINE, so a piece path is THREE allocations whatever it holds. The closed square is 4
+    # segment rects at 240 B (48 + 8*8 verbs + 8*16 points) and 4 vertex discs at 440 B (48 + 17*8
+    # + 16*16): 4 * 240 + 4 * 440 = 2,720. ⛔ The count is still what says neither array grew — 3 a
+    # rect and 3 a disc, since a doubling would add one more (programs/path_cap_test.cyr group N
+    # reads the capacities off the record and asserts the counts too).
     g0 = alloc_used();
     sd_canvas_stroke_path(acv, arect, W2);
     var round_cost = alloc_used() - g0;
     g0 = alloc_used();
     sd_canvas_stroke_path_ex(acv, arect, W2, SD_CAP_ROUND, SD_JOIN_ROUND, ML4);
     check(alloc_used() - g0, round_cost);                              # 12
-    check(round_cost, 3232);                                           # 13 — was 34,432 through 0.7.2
+    check(round_cost, 2720);                                           # 13 — 34,432 -> 3,232 -> here
 
     # ── B) ARGUMENT CONTRACT ────
     var line = seg(2 * SD_ONE, 4 * SD_ONE, 6 * SD_ONE, 4 * SD_ONE);

@@ -108,15 +108,19 @@ var _sd_dash_on = 0;        # 1 inside an on-dash — always 1 - (_sd_dash_di & 
 # ⛔ Process-lifetime, from the GLOBAL alloc, allocated by the first DASHED stroke — not by
 # _sd_scratch_init or _sd_sb_init, so a process that never dashes pays nothing and every figure
 # programs/alloc_test.cyr pins stays exact. Same reason as raster.cyr's scratch: a consumer's hook
-# is an arena that gets reset. MEASURED one-time cost 73,792 B (8,192 * 8 pointers + 8,192 flag
-# bytes + 64 B of cut-point records); after it a dashed straight-line stroke costs the heap 0 B,
-# and curves only their flatten mid-points, exactly as a solid one does.
+# is an arena that gets reset. MEASURED one-time cost 139,264 B (8,192 * 16 B of INLINE points +
+# 8,192 flag bytes); after it a dashed straight-line stroke costs the heap 0 B, and curves only
+# their flatten mid-points, exactly as a solid one does. ⚠ It was 73,792 B through 0.8.0 (8,192 * 8
+# pointers + the flags + 64 B of cut-point records): the point block doubled and the records went
+# away with it (0.9.0).
 # ⭐ It GROWS by doubling (like the run and the batch), because the wrap concatenation can hold the
 # head piece AND the last dash AND the head's points again: up to about 2 * (run + 2) slots.
-# MEASURED, one dash of 9,013 points: 147,456 B to reach 16,384 slots, once; a repeat 0 B. A failed
+# MEASURED, one dash of 9,013 points: 278,528 B to reach 16,384 slots, once (16,384 * 16 B of
+# points + 16,384 flag bytes — only the POINT block's element doubled in 0.9.0, the flags' did not,
+# so this is not 0.8.0's 147,456 B doubled; programs/dash_test.cyr check #127 pins it); a repeat 0 B. A failed
 # growth drops the point and sets _sd_dash_trunc — the same degradation _sd_run_trunc is, and the
 # same one the batch takes: a prefix of the path, recorded, never a write past the array.
-var _sd_dash_run = 0;       # _sd_dash_cap * 8 — SdPoint ptrs, the piece(s) being built
+var _sd_dash_run = 0;       # _sd_dash_cap * 16 — INLINE (x, y), the piece(s) being built
 var _sd_dash_flags = 0;     # _sd_dash_cap bytes — the curve flags parallel to it
 var _sd_dash_cap = 0;       # slots the two blocks hold
 var _sd_dash_dn = 0;        # slots written
@@ -124,57 +128,57 @@ var _sd_dash_pstart = 0;    # where the piece being built starts
 var _sd_dash_head = 0;      # slots in the kept head piece of a closed subpath (0 = none)
 var _sd_dash_wrap = 0;      # 1 while that head is still open
 var _sd_dash_trunc = 0;     # 1 if THIS stroke dropped a piece point (a growth failed)
-# ⭐ FOUR SdPoint RECORDS, AND FOUR IS THE COUNT, NOT A ROUND NUMBER. A dash boundary that falls
-# inside a segment is a point no SdPath owns, and sd_point_new would put it on the consumer's hook,
-# per call — so cut points live here instead. The current piece uses the SHARED pair, its start
-# (+0) and its end (+16), and every piece reuses them because a piece is stroked before the next
-# one starts. ⛔ EXCEPT THE KEPT HEAD OF A CLOSED SUBPATH, which stays live while the whole rest of
-# the subpath dashes past it — so BOTH of its ends are moved off the shared pair when it is kept,
-# to +32 (its end) and +48 (its start). A head start left on the shared record was stroked through
-# whatever the LAST dash of the subpath started at: a segment between two unrelated points, drawn
-# whenever the walk came back inside a gap (programs/dash_test.cyr group S2, checks 166-171).
-# A piece's interior points are the run's own SdPoints, passed by pointer.
-var _sd_dash_rec = 0;
+# ⛔⛔ THE FOUR SdPoint RECORDS ARE GONE (0.9.0), AND WITH THEM A WHOLE CLASS OF BUG. A dash
+# boundary that falls inside a segment is a point no SdPath owns; through 0.8.0 the piece buffer
+# held POINTERS, so a cut point needed a record somewhere — sd_point_new would have put one on the
+# consumer's hook per cut, per call, so four process-lifetime records were SHARED and REUSED
+# instead: a piece's start (+0) and end (+16), plus two more (+32, +48) that the kept head of a
+# closed subpath had to be MOVED onto, because the shared pair was overwritten by the next dash
+# while the head was still live. A head start left on the shared record was stroked through
+# whatever the LAST dash started at — a segment between two unrelated points, drawn whenever the
+# walk came back inside a gap (programs/dash_test.cyr group S2, checks 166-171).
+# ⇒ The buffer holds COORDINATES now, so every piece point — cut or vertex — is a COPY the moment
+# it is put, nothing aliases anything, and the kept head cannot be written through by a later dash.
+# The four records, the aliasing rule, the `s0 == _sd_dash_rec` identity test and the 64 B block
+# are all deleted rather than kept working; group S2 still gates the pixels they were about.
 
 # Allocate the piece buffer, its curve flags and the four cut-point records once (idempotent).
 # Returns 1 when they are ready, 0 when a block was refused.
 # ⛔ ALL OR NOTHING, AND `_sd_dash_run != 0` IS THE FLAG — _sd_scratch_init's and _sd_sb_init's rule
-# (0.7.2). Through 0.7.1 the three blocks went straight into the globals unchecked, so a refusal of
-# the flags or of the 64 B records left _sd_dash_run published and every later dashed stroke wrote
-# its flags, or its cut points, through address 0 — for the life of the process, since this
+# (0.7.2). Through 0.7.1 the blocks went straight into the globals unchecked, so a refusal of the
+# flags (or, through 0.8.0, of the 64 B cut-point records) left _sd_dash_run published and every
+# later dashed stroke wrote its flags through address 0 — for the life of the process, since this
 # function never runs a second time. ⚠ GLOBAL alloc, never sd_alloc (raster.cyr's scratch rule): no
 # consumer hook can refuse these, and the capacity is the only honest way to drive the path
 # (programs/stroke_oom_test.cyr raises SD_FLATTEN_CAP past ALLOC_MAX / 8).
-# ⚠ THE THREE 0-TESTS HERE ARE A CONTRACT, NOT THREE GATES — and the arithmetic is this function's
+# ⚠ THE TWO 0-TESTS HERE ARE A CONTRACT, NOT TWO GATES — and the arithmetic is this function's
 # own, NOT the one stroke.cyr's _sd_sb_init makes (that one is a gate, because its `inner` and its
 # `edges` are sized by two DIFFERENT knobs and either can be the larger; read the ⛔ block there).
-# All three blocks below come from the one `cap`: run = cap * 8, flags = cap, rec = 64. lib/alloc.cyr
-# refuses BY SIZE, so for any cap >= 8 `run` — the block sd_canvas_stroke_path_dash guards on — is
-# the largest, and no capacity refuses `flags` or `rec` while granting it. MEASURED at the tightest
-# cap that separates them, 268,435,457: alloc(cap * 8) = 2,147,483,656 B is refused (over
-# ALLOC_MAX = 2 GiB) while alloc(cap) and alloc(64) are both granted — so 0.7.1's unchecked stores
-# still leave `_sd_dash_run` at 0, the entry point still answers SADISH_ERR_OOM, and the next call
-# still re-initialises. Group G3 of programs/stroke_oom_test.cyr drives the same shape at
-# SD_FLATTEN_CAP = 3,000,000,000, where all three sizes but `rec` are refused together.
-# ⇒ The three tests are kept, and they are load-bearing for a reason no TEST can reach: a bump
+# Both blocks below come from the one `cap`: run = cap * 16 (0.9.0; cap * 8 of pointers before),
+# flags = cap. lib/alloc.cyr refuses BY SIZE, so `run` — the block sd_canvas_stroke_path_dash
+# guards on — is always the larger, and no capacity refuses `flags` while granting it. MEASURED at
+# the tightest cap that separates them, which the 16 B slot HALVED to 134,217,729:
+# alloc(cap * 16) = 2,147,483,664 B is refused (over ALLOC_MAX = 2 GiB) while alloc(cap) is
+# granted — so 0.7.1's unchecked stores still leave `_sd_dash_run` at 0, the entry point still
+# answers SADISH_ERR_OOM, and the next call still re-initialises. Group G3 of
+# programs/stroke_oom_test.cyr drives the same shape at SD_FLATTEN_CAP = 3,000,000,000, where both
+# sizes are refused together.
+# ⇒ The two tests are kept, and they are load-bearing for a reason no TEST can reach: a bump
 # allocator also refuses when the heap cannot be extended, and `run` granted with `flags` refused
 # then publishes a 0 that _sd_dash_put's store8 writes through. "Contract, not a gate" here means
 # only that no honest suite can drive it on THIS allocator — not that the tests are decoration.
 fn _sd_dash_init(): i64 {
     if (_sd_dash_run != 0) { return 1; }
     var cap = SD_FLATTEN_CAP;
-    var run = alloc(cap * 8);
+    var run = alloc(cap * 16);          # 16 B a point, inline (0.9.0): cap * 8 of pointers before
     var flags = alloc(cap);
-    var rec = alloc(4 * SD_POINT_SIZE);
     var ok = 1;
     if (run == 0) { ok = 0; }
     if (flags == 0) { ok = 0; }
-    if (rec == 0) { ok = 0; }
     if (ok == 0) { return 0; }
     _sd_dash_cap = cap;
     _sd_dash_run = run;
     _sd_dash_flags = flags;
-    _sd_dash_rec = rec;
     return 1;
 }
 
@@ -187,11 +191,11 @@ fn _sd_dash_grow(need): i64 {
     if (_sd_dash_trunc != 0) { return 0; }
     var nc = _sd_dash_cap;
     while (nc < need) { nc = nc * 2; }
-    var nr = _sd_grow_alloc(nc * 8);
+    var nr = _sd_grow_alloc(nc * 16);
     if (nr == 0) { return 0; }
     var nf = _sd_grow_alloc(nc);
     if (nf == 0) { return 0; }
-    memcpy(nr, _sd_dash_run, _sd_dash_cap * 8);
+    memcpy(nr, _sd_dash_run, _sd_dash_cap * 16);
     memcpy(nf, _sd_dash_flags, _sd_dash_cap);
     _sd_dash_run = nr;
     _sd_dash_flags = nf;
@@ -199,11 +203,12 @@ fn _sd_dash_grow(need): i64 {
     return 1;
 }
 
-# Append SdPoint `pt` with curve flag `flag` to the piece being built.
+# Append the point (x, y) with curve flag `flag` to the piece being built — a COPY of the two
+# coordinates, owned by the buffer (0.9.0; an SdPoint POINTER through 0.8.0).
 # ⚠ A point the growth cannot take is DROPPED, as it always was — and since 0.7.2 it also raises
 # the styled walk's refusal flag, so sd_canvas_stroke_path_dash returns SADISH_ERR_OOM instead of
 # SADISH_OK over a dash that stops early. _sd_dash_trunc keeps its own meaning and its own gates.
-fn _sd_dash_put(pt, flag): i64 {
+fn _sd_dash_put(x, y, flag): i64 {
     if (_sd_dash_dn >= _sd_dash_cap) {
         if (_sd_dash_grow(_sd_dash_dn + 1) == 0) {
             _sd_dash_trunc = 1;
@@ -211,19 +216,11 @@ fn _sd_dash_put(pt, flag): i64 {
             return 0;
         }
     }
-    store64(_sd_dash_run + _sd_dash_dn * 8, pt);
+    store64(_sd_dash_run + _sd_dash_dn * 16, x);
+    store64(_sd_dash_run + _sd_dash_dn * 16 + 8, y);
     store8(_sd_dash_flags + _sd_dash_dn, flag);
     _sd_dash_dn = _sd_dash_dn + 1;
     return 0;
-}
-
-# Cut-point record `slot` (0 = a piece's start, 1 = its end, 2 = a kept head's end, 3 = a kept
-# head's start) set to (x, y).
-fn _sd_dash_rec_at(slot, x, y): i64 {
-    var p = _sd_dash_rec + slot * SD_POINT_SIZE;
-    store64(p + SD_POINT_X_OFFSET, x);
-    store64(p + SD_POINT_Y_OFFSET, y);
-    return p;
 }
 
 # The length (16.16) of pattern entry `i` of the doubled view: an odd n wraps modulo n, which is
@@ -277,7 +274,7 @@ fn _sd_dash_phase_init(): i64 {
 fn _sd_dash_emit(cv, hw, cap, join, ml): i64 {
     var cnt = _sd_dash_dn - _sd_dash_pstart;
     if (cnt > 0) {
-        _sd_sb_subpath(cv, _sd_dash_run + _sd_dash_pstart * 8, _sd_dash_flags + _sd_dash_pstart,
+        _sd_sb_subpath(cv, _sd_dash_run + _sd_dash_pstart * 16, _sd_dash_flags + _sd_dash_pstart,
           cnt, 0, hw, cap, join, ml);
     }
     _sd_dash_dn = _sd_dash_pstart;
@@ -287,21 +284,14 @@ fn _sd_dash_emit(cv, hw, cap, join, ml): i64 {
 # The current pattern entry runs out at (x, y): end the on-dash there (its end cap) or begin one.
 fn _sd_dash_turn(cv, x, y, hw, cap, join, ml): i64 {
     if (_sd_dash_on != 0) {
-        _sd_dash_put(_sd_dash_rec_at(1, x, y), 0);
+        _sd_dash_put(x, y, 0);
         if (_sd_dash_wrap != 0) {
-            # The first dash of a closed subpath: KEEP it for the wrap (see the header) and move
-            # BOTH its ends off the SHARED records, which every dash after it reuses. Its end is
-            # always the cut just made; its start is a shared record only when the phase began in a
-            # zero-length OFF entry (so p[0] was not put and the initial drain started the dash
-            # there instead) — then head[0] is +0, which the next dash's start would overwrite.
-            if (_sd_dash_dn > 0) {
-                store64(_sd_dash_run + (_sd_dash_dn - 1) * 8, _sd_dash_rec_at(2, x, y));
-                var s0 = load64(_sd_dash_run + 0);
-                if (s0 == _sd_dash_rec) {
-                    store64(_sd_dash_run + 0,
-                      _sd_dash_rec_at(3, sd_point_x(s0), sd_point_y(s0)));
-                }
-            }
+            # The first dash of a closed subpath: KEEP it for the wrap (see the header). ⭐ Nothing
+            # has to be moved off a shared record any more (0.9.0): every point in the buffer is a
+            # COPY, so the head's own start and end cannot be overwritten by the dashes that follow
+            # it. Through 0.8.0 both ends were re-homed onto two extra SdPoint records here, and a
+            # head start left on the shared one was stroked through whatever the LAST dash started
+            # at (programs/dash_test.cyr group S2 is the gate, and still passes unedited).
             _sd_dash_head = _sd_dash_dn;
             _sd_dash_pstart = _sd_dash_dn;
             _sd_dash_wrap = 0;
@@ -311,7 +301,7 @@ fn _sd_dash_turn(cv, x, y, hw, cap, join, ml): i64 {
         _sd_dash_on = 0;
     } else {
         _sd_dash_pstart = _sd_dash_dn;
-        _sd_dash_put(_sd_dash_rec_at(0, x, y), 0);
+        _sd_dash_put(x, y, 0);
         _sd_dash_on = 1;
     }
     _sd_dash_step();
@@ -341,7 +331,8 @@ fn _sd_dash_zeros(cv, x, y, hw, cap, join, ml): i64 {
 # One subpath of the flattened run, cut into dashes — _sd_styled_walk's dashed branch, called
 # exactly where it calls _sd_sb_subpath for a solid stroke, with the same arguments.
 #
-# `run` holds n SdPoint ptrs and `inner` their curve flags. The run is DE-DUPLICATED first (the
+# `run` holds n INLINE points — 16 B each, x then y (0.9.0; SdPoint ptrs through 0.8.0) — and
+# `inner` their curve flags. The run is DE-DUPLICATED first (the
 # stroker's own _sd_sb_dedup, in place), which is what makes every segment's length non-zero —
 # without it a zero-length segment would divide by zero at a cut. Each on-dash is copied into the
 # piece buffer and handed back to _sd_sb_subpath as an open subpath.
@@ -359,9 +350,8 @@ fn _sd_dash_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
     _sd_dash_head = 0;
     _sd_dash_wrap = 0;
 
-    var p0 = load64(run + 0);
-    var p0x = sd_point_x(p0);
-    var p0y = sd_point_y(p0);
+    var p0x = load64(run + 0);
+    var p0y = load64(run + 8);
     if (m == 1) {
         # No length to walk: the lone point is inked only when the phase is ON where it sits, and
         # then by the very branch a lone moveto takes (disc / square / nothing).
@@ -370,7 +360,7 @@ fn _sd_dash_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
     }
 
     if (closed != 0) { _sd_dash_wrap = 1; }
-    if (_sd_dash_on != 0) { _sd_dash_put(p0, 0); }
+    if (_sd_dash_on != 0) { _sd_dash_put(p0x, p0y, 0); }
     _sd_dash_zeros(cv, p0x, p0y, hw, cap, join, ml);
     # Nothing begins at distance 0, so there is no head to wrap into.
     if (_sd_dash_on == 0) { _sd_dash_wrap = 0; }
@@ -381,12 +371,12 @@ fn _sd_dash_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
     while (j < segs) {
         var bi = j + 1;
         if (bi == m) { bi = 0; }
-        var a = load64(run + j * 8);
-        var b = load64(run + bi * 8);
-        var ax = sd_point_x(a);
-        var ay = sd_point_y(a);
-        var dx = sd_point_x(b) - ax;
-        var dy = sd_point_y(b) - ay;
+        var ax = load64(run + j * 16);
+        var ay = load64(run + j * 16 + 8);
+        var bx = load64(run + bi * 16);
+        var by = load64(run + bi * 16 + 8);
+        var dx = bx - ax;
+        var dy = by - ay;
         var seg = sd_isqrt(dx * dx + dy * dy);      # >= 1: the run is de-duplicated
         var pos = 0;
         var going = 1;
@@ -405,14 +395,14 @@ fn _sd_dash_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
         if (_sd_dash_on != 0) {
             var bflag = 0;
             if (bi != 0) { bflag = load8(inner + bi); }
-            _sd_dash_put(b, bflag);
+            _sd_dash_put(bx, by, bflag);
         }
         # ⛔ NOT at a closed subpath's arrival back at p[0]. A boundary exactly there is the wrap
         # point, and firing it would end the last dash with a CAP at p[0] and leave the head to be
         # stroked apart — two caps where the header promises a join. Falling through leaves the
         # dash open (the concatenation below joins it to the head) or the gap closed (the head is
         # stroked on its own, which is what a gap ending exactly at p[0] means).
-        if (bi != 0) { _sd_dash_zeros(cv, sd_point_x(b), sd_point_y(b), hw, cap, join, ml); }
+        if (bi != 0) { _sd_dash_zeros(cv, bx, by, hw, cap, join, ml); }
         j = j + 1;
     }
 
@@ -427,7 +417,8 @@ fn _sd_dash_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
             # everything else, and each argument is read before the call that may move it.)
             var k = 1;
             while (k < _sd_dash_head) {
-                _sd_dash_put(load64(_sd_dash_run + k * 8), load8(_sd_dash_flags + k));
+                _sd_dash_put(load64(_sd_dash_run + k * 16), load64(_sd_dash_run + k * 16 + 8),
+                  load8(_sd_dash_flags + k));
                 k = k + 1;
             }
             # ⛔ A ONE-POINT PIECE HERE IS NOT A DOT, AND IS NOT DRAWN. It can only be a dash that

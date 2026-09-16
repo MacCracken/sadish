@@ -5,6 +5,91 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-09-16 — SdPath stores its points inline
+
+One change, shipped alone because it is an ABI break: `SdPath`'s points array holds the coordinates
+INLINE — x at +0, y at +8, **16 B a slot**, at the same `SD_PATH_POINTS_OFFSET` in the same 48 B record
+— instead of 8 B pointers to separately allocated 16 B `SdPoint`s. rekha filed the measurement; this is
+it implemented.
+
+### Changed — a point costs 16 B and no allocation
+
+⭐ **The proposal's target, hit to the byte.** 95 ASCII-shaped paths (1,768 verbs, 2,498 points) built
+through the public builders at exact capacity, on the allocation seam:
+
+| | bytes | `sd_alloc` calls |
+|---|---:|---:|
+| 0.8.0 | 78,656 | 2,783 |
+| 0.9.0 | **58,672** | **285** |
+
+A path is **three allocations** — record, verb array, point array — whatever it holds; 0.8.0 made three
+plus one per point. Downstream, MEASURED: the closed 8x8 rect stroke **3,232 B → 2,720 B** in 104 → 24
+calls, and the 54-glyph round-stroked label **1,557,176 B → 1,318,728 B** in 50,593 → 12,806.
+⛔ **Rendering does not move.** agnos's `refagree` prints **BYTE-IDENTICAL on all 200 paths**, and two ink
+oracles (365 and 416 measurements across fills, both strokers, dashes, clips and paint on both AA
+engines) diff to zero against 0.8.0.
+
+### Added — the accessors that end the coupling
+
+```
+sd_path_point_x(path, i)    sd_path_point_y(path, i)    sd_path_verb_at(path, i)
+```
+
+⚠ No bounds check — bound the loop on `sd_path_point_count`. ⭐ These exist because the ABI break was
+only reachable at all through open-coded offsets in consumer code: rekha's 14 reads exist because there
+was no accessor. `sd_path_verb_at` has no internal caller and ships anyway, so a consumer walking a path
+carries no offsets in either stream.
+
+### Changed — constants that moved with the slot
+
+- `SD_PATH_PCAP` = 128 is new: `sd_path_new`'s default POINT capacity, halved as the slot doubled, so
+  `sd_path_new`'s first allocation is the same **4,144 B in 3 calls** it has been since 0.4.0.
+  `SD_PATH_CAP` = 256 now sizes only the verb array.
+- `SD_PATH_CAP_MAX` 2^28 → **2^27**, re-derived for the 16 B slot (2^27 × 16 = 2 GiB = `ALLOC_MAX`).
+  ⚠ One constant bounds both arrays and takes the tighter slot, so a VERB capacity in (2^27, 2^28] is
+  now refused where 0.8.0 served it.
+- `SD_GROW_LIMIT_DEFAULT` 8 MiB → **16 MiB**. The ceiling is in BYTES and a run point went 8 B → 16 B,
+  so at 8 MiB the stroker's run and the dash buffer would have held 524,288 points where 0.8.0 held
+  1,048,576 — and a single subpath longer than that, which 0.8.0 stroked whole, would have truncated
+  (MEASURED at a lowered ceiling: 0.8.0 `SADISH_OK` / 526,870 ink, an 8 MiB 0.9.0 `SADISH_ERR_OOM` /
+  434,050). Doubling the default keeps the strokable length exactly what it was.
+  ⭐ And it costs no real memory: MEASURED on both trees, a stroked point costs **40 B** of path + run
+  on either release (0.8.0 pays 8 to the run and 32 to the path; 0.9.0 pays 16 and 24), so both
+  truncate holding 1,048,576 × 40 B = 41,943,040 B.
+  ⚠ **What the doubling also does**, said plainly: the ceiling bounds every growable store, so the
+  fill's edge list can reach 524,288 edges where 0.8.0 stopped at 262,144 — a looser hostile-path bound,
+  and the price of keeping stroke length stable across the ABI change. A consumer that wants 0.8.0's
+  MEMORY bound rather than its length calls `sd_grow_limit_set(8388608)`. Pinned by `grow_edges_test`
+  groups R and R2.
+
+### Not in scope, deliberately
+
+`SdPoint`, `geom.cyr` and `SdPolyline` are unchanged. The polyline still holds `SdPoint` pointers and
+still carries the 0.8.0 verdict word. **A second ABI break in one release is how consumers stop trusting
+a library**, and a curve's flattening still needs `SdPoint`s internally — which is why the one-quad
+fill's seam cost went 48 B in 3 calls to 64 B in 4: the curve's own end point used to be a record the
+path already owned.
+
+### ⚠ Consumers — rekha must port, dhancha need not
+
+- **dhancha: 18/18 pass.** It never reads `SdPath` internals.
+- **rekha: 19 of 23 pass.** The four that fail — `cff_test`, `glyf_edge_test`, `hostile_test`,
+  `path_start_test` — walk the points array and dereference `SdPoint`s; each is a SIGSEGV at the first
+  read, not a silent wrong answer. `bench_hotpath` faults the same way. rekha's LIBRARY is unaffected:
+  `src/` names no `SD_PATH_*` and calls no `sd_point_*`, and its smoke program builds and runs clean.
+- ⭐ Filed for them with the port, site by site:
+  `rekha/docs/development/issues/2026-09-16-sadish-0.9.0-inlines-path-points-five-programs-must-port.md`.
+  The replacements are one accessor call each, and the index replaces the byte offset — `pts + 2 * 8`
+  becomes `sd_path_point_x(pc, 2)`, so the `* 8` disappears rather than becoming `* 16`.
+
+### Verified
+
+All **31** suites pass, including the new `inline_points_test` (171 checks). `fmt --check` clean, `lint`
+0 warnings, `vet` clean, `distlib` in sync with no duplicate top-level names. `sadish_version()` → **900**.
+⭐ The reviews found ten issues, four of them ≥ medium — among them that a QUADTO fill-seam argument swap
+was gated by `area_test` alone, and that `_sd_sb_restart`'s y coordinate had no check that would catch
+`cx` written into it. Both are now killed by `inline_points_test` group L.
+
 ## [0.8.0] - 2026-09-16 — the repair backlog closes
 
 The last three asks any filing still had. ⛔ **All four issue filings are now archived**, and

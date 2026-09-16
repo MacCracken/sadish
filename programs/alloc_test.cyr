@@ -178,7 +178,10 @@ fn main(): i64 {
     # alloc, so a warm-up outside a hook cannot tell the two apart: before this group, all nine
     # scratch sites (raster.cyr _sd_scratch_init + _sd_fill_accrow_for) flipped alloc -> sd_alloc
     # passed this suite 90/90. ⇒ The gate is the exact ZERO on the arena, paired with the exact
-    # one-time cost on the global heap: MEASURED 589,896 B scratch + 32*8 accrow = 590,152 B.
+    # one-time cost on the global heap: MEASURED 655,432 B scratch + 32*8 accrow = 655,688 B.
+    # ⚠ The scratch was 589,896 B through 0.8.0. 0.9.0's inline (x, y) points made the stroker's run
+    # 16 B a slot instead of an 8 B pointer (src/raster.cyr's _sd_stroke_run): +65,536 B here, once,
+    # and no SdPoint per anchor on the hook at every stroke.
     g_arena = arena_new_growable(4194304);
     check(g_arena != 0, 1);                                            # 4
     check(sd_alloc_set(&hook_alloc), 0);                               # 5 — previous hook was none
@@ -186,7 +189,7 @@ fn main(): i64 {
     var a0 = arena_used(g_arena);
     check(sd_canvas_fill_path(warm, p0, SD_FILL_NONZERO), SADISH_OK);   # 6
     var warm_cost = alloc_used() - g0;
-    check(warm_cost, 589896 + 32 * 8);                                 # 7 — the scratch, on the global heap
+    check(warm_cost, 655432 + 32 * 8);                                 # 7 — the scratch, on the global heap
     check(arena_used(g_arena) - a0, 0);                                # 8 — and not one byte of it on the hook
     # A WIDER canvas under the same hook re-grows the per-row accumulator (_sd_fill_accrow_for):
     # exactly w*8 on the global heap, still 0 on the arena — the fixed set is already warm, so
@@ -217,11 +220,14 @@ fn main(): i64 {
     }
     var hw1 = arena_used(g_arena) - ab;
     # ⭐ THE HEADLINE. Twenty frames of fill + union + stroke + clip + blit: not one byte on the
-    # global heap. MEASURED 2026-09-16: the twenty rounds put 269,760 B on the arena (13,488 B per
-    # round; the same round cost the global heap 3,456,048 B on 0.5.4). ⚠ Was 893,760 B / 44,688 B
-    # per round through 0.7.2 — 0.8.0 opened the round stroker's piece paths at their exact capacity
-    # (src/stroke.cyr), which takes 31,200 B a round off the arena: the stroke of the 4-vertex rect
-    # below went from 34,432 B to 3,232 B. The arena is 4 MiB so it never chains a chunk — a chunk
+    # global heap. MEASURED: the twenty rounds put 256,640 B on the arena (12,832 B per round; the
+    # same round cost the global heap 3,456,048 B on 0.5.4). ⚠ It was 893,760 B / 44,688 B per round
+    # through 0.7.2 and 269,760 B / 13,488 B through 0.8.0; 0.9.0's inline (x, y) points take another
+    # 656 B a round off it — the stroke below fell 3,232 -> 2,720 B with the piece paths' SdPoints,
+    # and the round's own paths pay no per-point record. ⚠ The DEFAULT path capacity is what keeps
+    # this figure falling rather than rising: SD_PATH_PCAP halved to 128 with the slot, so
+    # sd_path_new still opens at 4,144 B (src/path.cyr). The arena is 4 MiB so it never chains a
+    # chunk — a chunk
     # would come from the global allocator and fail this, which is the correct answer for an arena
     # sized too small.
     check(alloc_used() - gb, 0);                                       # 35
@@ -253,9 +259,11 @@ fn main(): i64 {
     gc = alloc_used();
     sd_canvas_fill_path(cv, blob, SD_FILL_NONZERO);
     var quad_cost2 = alloc_used() - gc;
-    # The quads' flatten mid-points are proportional to the work and stay on the seam:
-    # MEASURED ON 0.7.1, 160 B for this blob (10 EMITTED mid-points x 16 B), identical on the
-    # second call, and far below the 328,544 B the same fill cost on 0.5.4 (16x16).
+    # The quads' flatten points are proportional to the work and stay on the seam: MEASURED 192 B
+    # for this blob (12 records x 16 B — 10 emitted mid-points plus, since 0.9.0, each of the two
+    # curve ENDPOINTS, which the path no longer holds as records to hand through), identical on the
+    # second call, and far below the 328,544 B the same fill cost on 0.5.4 (16x16). ⚠ 160 B through
+    # 0.8.0.
     # ⚠ This read 480 B (30 mid-points) through 0.7.0, when the recursion also allocated the
     # subdivision nodes' throwaway mid-points; 0.7.1 takes those onto a fixed per-depth scratch.
     # The checks below bound the cost rather than pin it, so the figure is documentation.
@@ -268,10 +276,12 @@ fn main(): i64 {
     gc = alloc_used();
     sd_canvas_stroke_path(cv, rect, SD_ONE);
     var stroke_cost2 = alloc_used() - gc;
-    # A stroke still builds a path per segment + per vertex disc (on the seam): MEASURED 3,232 B
-    # for a closed 4-vertex rect (was 34,432 B through 0.7.2 and 2,789,528 B on 0.5.4, 16x16),
-    # identical on the second call. ⚠ 0.8.0 opened those paths at sd_path_new_cap(5, 4) and
-    # (17, 16) instead of SD_PATH_CAP; the ALLOCATION COUNT did not move (104), only the bytes.
+    # A stroke still builds a path per segment + per vertex disc (on the seam): MEASURED 2,720 B
+    # for a closed 4-vertex rect (3,232 B through 0.8.0, 34,432 B through 0.7.2 and 2,789,528 B on
+    # 0.5.4, 16x16), identical on the second call. ⚠ 0.8.0 opened those paths at
+    # sd_path_new_cap(5, 4) and (17, 16) instead of SD_PATH_CAP and the ALLOCATION COUNT did not
+    # move (104); 0.9.0's inline points take the count to 24 — three requests a piece path, and
+    # nothing per point.
     # The exact figure is pinned by programs/stroke_style_test.cyr #13; #48 below is a bound.
     check(stroke_cost > 0, 1);                                         # 46
     check(stroke_cost, stroke_cost2);                                  # 47

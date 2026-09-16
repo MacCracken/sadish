@@ -10,9 +10,16 @@ doubles alone: **MEASURED 78,656 B on this proposal's own ASCII set, its target 
 `sd_path_new_cap(5, 4)` and `sd_stroke_disc` at `sd_path_new_cap(17, 16)`, so the proposal at last
 has an IN-TREE ADOPTER — **MEASURED, the closed 8x8 rect stroke 34,432 B → 3,232 B in the SAME 104
 `sd_alloc` calls** (`programs/path_cap_test.cyr` group N, 82 of the suite's 252 checks;
-`programs/stroke_style_test.cyr` #13) — item 2. ⛔ **This filing STILL does not archive:** item 3,
+`programs/stroke_style_test.cyr` #13) — item 2.
+0.9.0 takes the item this file called *"worth measuring alongside"* and left as residue — **inline
+`(x, y)` storage instead of `SdPoint` pointers** — and hits its number: **MEASURED 58,672 B on this
+same ASCII set, the figure the section below computed in 0.7.1, in 285 `sd_alloc` calls against
+2,783** (`programs/path_cap_test.cyr` #160 / #253, `programs/inline_points_test.cyr`). See "Worth
+measuring alongside" below, rewritten as the record of what shipped.
+⛔ **This filing STILL does not archive:** item 3,
 *"rekha updates that test when it adopts the new call"*, is a promise made on rekha's behalf and
-nothing in this repo can witness it. Was 🟡 STILL OPEN — the CAPABILITY complete as of 0.7.2 and the
+nothing in this repo can witness it — and 0.9.0 makes the ask LARGER rather than smaller, because
+rekha now has to port 5 test programs' point-array reads as well (the filing sadish is sending). Was 🟡 STILL OPEN — the CAPABILITY complete as of 0.7.2 and the
 ADOPTION asks not; 🟡 OPEN — SHIPPED in 0.7.1 with a deviation from this proposal's first bullet
 before that; and 🟡 OPEN — a capability request before that. It read "🟢 **CLOSED — SHIPPED**" until
 the 2026-09-15 re-audit against HEAD `f722e8c`.
@@ -61,13 +68,113 @@ intermediate arrays on the arena per path (rekha 0.3.11 audit).
 - Checked allocations (see the companion issue
   `issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md`).
 
-## Worth measuring alongside (not requested here)
+## Worth measuring alongside (not requested here) — ⭐ SHIPPED, sadish 0.9.0
 
-`SdPath` stores POINTERS to 16 B `SdPoint`s, so every point costs 24 B and one `sd_alloc` call — 39,968
-of the 78,656 exact-capacity bytes above are `SdPoint` objects, and rekha's audit measured per-point
-`sd_point_new` as the dominant remaining emit cost (a 21-point line path at ~704 ns). Inline (x, y)
-storage in the points array would take the ASCII set to 58,672 B and remove one allocation per point.
-That is an ABI change to `SdPath` and a sadish design decision; the numbers are here so it can be made.
+⚠ **The paragraph this section used to be is kept verbatim below; everything after it is what the
+measurement turned into.** It read:
+
+> `SdPath` stores POINTERS to 16 B `SdPoint`s, so every point costs 24 B and one `sd_alloc` call — 39,968
+> of the 78,656 exact-capacity bytes above are `SdPoint` objects, and rekha's audit measured per-point
+> `sd_point_new` as the dominant remaining emit cost (a 21-point line path at ~704 ns). Inline (x, y)
+> storage in the points array would take the ASCII set to 58,672 B and remove one allocation per point.
+> That is an ABI change to `SdPath` and a sadish design decision; the numbers are here so it can be made.
+
+The decision was made and 0.9.0 is that change, shipped alone. `SdPath`'s points array holds the
+COORDINATES, 16 B a slot (x at +0, y at +8), at the same `SD_PATH_POINTS_OFFSET` = +16 in the same
+48 B record. Read them with **`sd_path_point_x(path, i)` / `sd_path_point_y(path, i)`** — new, and
+the published way; `sd_path_verb_at(path, i)` joins them for the verb stream, which did not change
+shape.
+
+### MEASURED on this tree — this proposal's own set, all four ways
+
+| | bytes | `sd_alloc` calls | per glyph |
+|---|---:|---:|---:|
+| `sd_path_new` + pushes, 0.8.0 | 433,648 | 2,783 | 4,564 B |
+| `sd_path_new` + pushes, 0.9.0 | **393,680** | **285** | 4,144 B |
+| `sd_path_new_cap`, two capacities, 0.8.0 | 78,656 | 2,783 | 828 B |
+| `sd_path_new_cap`, two capacities, 0.9.0 | **58,672** | **285** | **618 B** |
+
+⇒ **58,672 B, this section's own figure, to the byte** = 95·48 + 8·1,768 + 16·2,498, and the
+19,984 B it saves against 0.8.0 is exactly the pointer array it no longer needs (8 B × 2,498).
+⇒ **285 calls = 3 × 95.** A path costs three `sd_alloc` requests — record, verb array, point array —
+whatever its point count, where 0.8.0 paid one more per point. That is the section's "remove one
+allocation per point", counted. Gated by `programs/path_cap_test.cyr` group L (#158-#165) and
+group O (#253-#258).
+
+### MEASURED — the per-point emit cost this section cites
+
+The ~704 ns is rekha's figure on rekha's tree and cannot be reproduced from here; what CAN be is the
+same SHAPE, timed on this machine, before and after. `sd_path_new` + `moveto` + 20 `lineto`s (21
+points), built and dropped, median of 9 rounds of 20,000 builds, `CLOCK_MONOTONIC_RAW` via
+`lib/bench.cyr`'s `now_ns()`, loop overhead measured separately at 3 ns:
+
+| | 0.8.0 | 0.9.0 | |
+|---|---:|---:|---:|
+| 21 points via `sd_path_new` | 1,041 ns | **841 ns** | 1.24× |
+| 21 points via `sd_path_new_cap(21, 21)` | 830 ns | **563 ns** | 1.47× |
+| 200 points via `sd_path_new_cap(200, 200)` | 7,500 ns | **4,882 ns** | 1.54× |
+
+⇒ 27 ns a point at exact capacity, against 40. ⚠ Wall clock on one idle machine, not a benchmark
+harness: the figures repeat to ±2 % across runs and the ratio is the claim, not the absolute.
+
+### What this cost, said plainly
+
+- **`sd_path_new`'s default point capacity halved, 256 slots → `SD_PATH_PCAP` = 128**, so its first
+  allocation is the same 48 + 2,048 + 2,048 = **4,144 B in 3 calls** it has been since 0.4.0. At 256
+  inline slots it would have been 6,192 B — and dhancha's 512 KiB text arena CHAINS ANOTHER CHUNK on
+  a 60-glyph run at that size (MEASURED, its own `text_arena_test`). The price is one doubling for a
+  path of 129-256 points, where 0.8.0 needed none.
+- **`SD_PATH_CAP_MAX` halved, 2^28 → 2^27**, re-derived for the 16 B slot: 2^27 × 16 = 2 GiB =
+  `lib/alloc.cyr`'s `ALLOC_MAX`. One constant bounds both arrays and takes the tighter one, so a
+  VERB capacity in (2^27, 2^28] is now refused that 0.8.0 served.
+- **`sd_path_flatten` allocates an `SdPoint` per emitted point**, where it used to hand the path's
+  own record through for a straight verb's anchor and a curve's endpoint: +16 B and one call per
+  ANCHOR and per CURVE VERB. The polyline still holds `SdPoint` pointers — a second ABI break in one
+  release is how consumers lose trust — so this is what keeping it costs. MEASURED: a 21-point line
+  path flattens in 24 calls against 3, while BUILDING it fell from 24 to 3; and the CHANGELOG's own
+  one-quad fill (`moveto` (0,0), `quadto` ctrl (8,0) → (8,8), `lineto` back, closed, warm scratch)
+  costs **64 B in 4 seam allocations against 0.8.0's 48 B in 3** — the 3 emitted mid-points as
+  before, plus the curve's own end point, which used to be the path's record handed through.
+- **Every walk's "no moveto yet" test became a flag.** `cur != 0` was free while the current point
+  was a pointer; (0, 0) is a real point, so a path at the ORIGIN would otherwise draw nothing.
+  `programs/inline_points_test.cyr` groups E and I are that gate, and mutation testing is what
+  showed group E's `> 0` checks were too weak to see it.
+- ⛔ **The growth ceiling buys HALF the run and dash points under the same bytes.**
+  `sd_grow_limit_set` is denominated in BYTES (8 MiB by default); the stroker's run and the dash
+  piece buffer are 16 B a slot now, so they top out at **524,288 points, where 0.8.0 reached
+  1,048,576** — MEASURED on both trees. Past it a stroke sets `_sd_run_trunc`, drops the tail and
+  returns `SADISH_ERR_OOM`, so a single subpath longer than that truncates where 0.8.0 stroked it
+  whole (MEASURED with the ceiling lowered to 262,144 B and a 20,000-point styled stroke: 0.8.0
+  `SADISH_OK` and 526,870 coverage units, 0.9.0 `SADISH_ERR_OOM` and 434,050). The fill's edge and
+  crossing ceilings did NOT move — their elements did not change size — so the hostile-path defence
+  is exactly where 0.7.0 put it. ⇒ The remedy is one call, `sd_grow_limit_set(16777216)`: the 0.8.0
+  point ceiling at twice the bytes. The default is not raised, because the knob's contract is
+  bounded MEMORY and doubling it would double the EDGE ceiling too. Swept 2026-09-16: no repo in the
+  ecosystem calls `sd_grow_limit_set` at all. Pinned by `programs/grow_edges_test.cyr` group R
+  (#217-#230) so neither the slot nor the default can move again silently — and R2 pins the remedy
+  itself, because a documented one-call fix that stops working is worse than no fix.
+  ⭐ **And the remedy costs no real memory.** MEASURED on both trees at 8,192 / 16,384 /
+  32,768-point subpaths, where the run's capacity is exactly its occupancy, a stroked point costs
+  **40 B of path + run on either release** — 0.8.0 spends 8 of them on the run and 32 on the path
+  (8 B verb + 8 B pointer + 16 B `SdPoint`), 0.9.0 spends 16 and 24 (8 B verb + 16 B inline slot).
+  What moved is the ceiling's SHARE of an unchanged total. So at their truncation points: 0.8.0
+  holds 1,048,576 × 40 = **41,943,040 B**, 0.9.0 holds 524,288 × 40 = **20,971,520 B**, and 0.9.0
+  under `sd_grow_limit_set(16777216)` holds 1,048,576 × 40 = **41,943,040 B** — 0.8.0's longest
+  subpath in 0.8.0's own footprint, to the byte. ⇒ The default refuses at half the total memory it
+  used to, and the knob restores the old length without asking for a byte more than 0.8.0 spent.
+  ⚠ This is the one behaviour change in a release billed as one change, and it is the maintainer's
+  to accept or reverse: mutation MF7 (`SD_GROW_LIMIT_DEFAULT` → 16777216) is the lever, and group
+  R's #218/#222/#224 are the checks it moves.
+- **The stroker's run costs 393,216 B more of global heap over a long sweep**, and the caller gets
+  most of it back: re-running the 100..25,600-segment sweep behind `src/stroke.cyr`'s batch note,
+  the run and its flags went 442,368 B → 835,584 B while the same walks' PATHS fell 408,800 B on the
+  seam — MEASURED **+49,952 B net** across the nine walks.
+
+### What is deliberately NOT done
+
+`SdPoint`, `sd_point_new`, `sd_matrix_apply` and `SdPolyline` are untouched — the polyline is a
+different record with its own 0.8.0 verdict word, and one ABI break per release is the whole
+sequencing argument. The curve recursion still materialises the points it emits.
 
 ---
 
@@ -183,15 +290,15 @@ builders now RESERVE capacity, then allocate their `SdPoint`s, then push — so 
 `SADISH_ERR_OOM` with the path exactly as it was, never a verb without its points. See
 `issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md`.
 
-### Not done (still open, deliberately)
+### Not done (still open, deliberately) — ⭐ CLOSED IN 0.9.0
 
-Inline `(x, y)` storage instead of `SdPoint` pointers — the "worth measuring alongside" section
-above. It is an ABI change and was out of scope for 0.7.1. Its number stands: 39,968 of the 78,656
-exact-capacity bytes are `SdPoint` objects. Re-verified 2026-09-15: `SdPath` still stores pointers
-(the `SdPath` layout comment, `src/path.cyr:50` at 0.7.1, `:51` at 0.7.2) and `sd_path_push_point`
-still takes one (`src/path.cyr:172` at 0.7.1, `:221` at 0.7.2); check #132 pins the 39,968. This
-proposal labels it "not requested here", so it is declared residue rather than a broken promise —
-but on this file's own numbers it is the largest item left (58,672 B vs 78,656 B).
+⚠ **0.7.1's words are kept; 0.9.0 is what answered them.** They read: *"Inline `(x, y)` storage
+instead of `SdPoint` pointers — the "worth measuring alongside" section above. It is an ABI change
+and was out of scope for 0.7.1. Its number stands: 39,968 of the 78,656 exact-capacity bytes are
+`SdPoint` objects … on this file's own numbers it is the largest item left (58,672 B vs 78,656 B)."*
+That is exactly what shipped, at exactly that number — see "Worth measuring alongside" above.
+`sd_path_push_point` now takes two coordinates rather than an `SdPoint`, and the layout comment says
+so.
 
 ---
 
@@ -503,13 +610,15 @@ only to the constructor. The rest of N8 exists to keep the corrected header's nu
 rather than asserted in prose — a comment cannot be mutation-tested, so the boundary it describes
 is written down as checks instead.
 
-### Not done (deliberately)
+### Not done (deliberately) — ⭐ DONE IN 0.9.0, and here is what those three figures became
 
-Inline `(x, y)` storage instead of `SdPoint` pointers is untouched and remains the largest item on
-this file's numbers. It is still about half of what these two sites cost, as it was of the glyph set
-(51 %): of `sd_stroke_disc`'s 568 B, **256 B (45 %) are the sixteen `SdPoint` objects**; of
-`sd_stroke_seg`'s 240 B, 64 B (27 %); of the closed rect stroke's 3,232 B, **1,280 B (40 %)**. That
-change is an `SdPath` ABI break reaching into rekha and is sequenced for 0.9.0.
+0.8.0 wrote: *"Inline `(x, y)` storage … is still about half of what these two sites cost, as it was
+of the glyph set (51 %): of `sd_stroke_disc`'s 568 B, **256 B (45 %) are the sixteen `SdPoint`
+objects**; of `sd_stroke_seg`'s 240 B, 64 B (27 %); of the closed rect stroke's 3,232 B, **1,280 B
+(40 %)**."* MEASURED after the change: the disc is **440 B in 3 calls** (was 568 in 19), the seg
+**240 B in 3** (was 240 in 7 — the same bytes, re-spent from four records into eight inline slots),
+and the closed 8x8 rect stroke **2,720 B in 24 calls** (was 3,232 in 104). The 54-glyph label is
+**1,318,728 B in 12,806 calls**, from 1,557,176 in 50,593.
 
 ---
 

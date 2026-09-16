@@ -512,7 +512,8 @@ fn main(): i64 {
     SD_FLATTEN_CAP = save_cap;
     gk = alloc_used();
     check(sd_canvas_fill_path(cv, full, SD_FILL_NONZERO), SADISH_OK);  # 126 ⭐ the retry succeeds
-    check(alloc_used() - gk, 589896);                                  # 127 — a whole fresh scratch
+    check(alloc_used() - gk, 655432);                                  # 127 — a whole fresh scratch
+    # ⚠ 589,896 B through 0.8.0; the stroker's run went 8 B -> 16 B a slot in 0.9.0 (inline points).
     # ⭐ THE PUBLISH BLOCK, PINNED. Eleven globals go out together or not at all; a refusal can only
     # be observed here as a set, so what is left to hold is that a SUCCESS leaves none of them 0 and
     # every capacity at SD_FLATTEN_CAP. An edit that published one block short fails one of these.

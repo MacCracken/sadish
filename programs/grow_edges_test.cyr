@@ -491,7 +491,13 @@ fn main(): i64 {
     arena_reset(g_arena);
     _sd_grow_limit = SD_GROW_LIMIT_DEFAULT;   # back to the shipped ceiling
     # B7. sd_path_flatten on a hook that runs out: the result keeps 8,192 points and says so.
-    var fa = arena_new(65536 + 24 + 24);
+    # ⚠ THE ARENA IS SIZED DIFFERENTLY SINCE 0.9.0, AND THE REFUSAL IT DRIVES IS THE SAME ONE. A
+    # path's points are inline coordinates now, so sd_path_flatten materialises an SdPoint for every
+    # point it EMITS (and, past the cap, for every one it then drops) — 9,001 x 16 B here — where
+    # through 0.8.0 the anchors of a straight-verb path were the path's own records and cost the
+    # hook nothing. The arena holds the 65,536 B output array, the ctx, all 9,001 SdPoints and the
+    # 24 B header, and NOT the 131,072 B doubling: that is what is refused, exactly as before.
+    var fa = arena_new(65536 + 24 + 9001 * 16 + 24);
     var fpath = vpoly(0, 9000, 64);
     var prev_hook = sd_alloc_set(&hook_alloc);
     var keep_arena = g_arena;
@@ -502,7 +508,7 @@ fn main(): i64 {
     check(fpl != 0, 1);                                               # 42
     check(sd_polyline_count(fpl), 8192);                              # 43
     check(_sd_flat_trunc, 1);                                         # 44
-    check(arena_used(fa), 65536 + 24 + 24);                           # 45 — the doubling was refused
+    check(arena_used(fa), 65536 + 24 + 9001 * 16 + 24);               # 45 — the doubling was refused
     check(sd_point_y(load64(sd_polyline_points(fpl) + 8191 * 8)), ONE + 16384 + 8191 * 64);   # 46
 
     # ── C) GROWTH: exact figures from cold capacities, 0 B on the hook, 0 B warm ────
@@ -549,8 +555,11 @@ fn main(): i64 {
     # only the edges grow: 16,384 * 32. ⚠ The 8,192-slot block the crossings outgrew in C1 is the one
     # _sd_scratch_init put the stroker's run right behind: pattern the run and read it back, so a
     # flush still walking the old block shows up as a write into it rather than as nothing at all.
-    var pk = 2;
-    while (pk < 8192) {
+    # ⚠ WORDS, NOT SLOTS, AND 16,384 OF THEM SINCE 0.9.0: the run block is _sd_stroke_run_cap * 16
+    # B (inline (x, y)), so patterning it whole takes 8,192 * 2 words. The first four words are the
+    # two run points a 2-point subpath really writes, which is what the old `pk = 2` skipped.
+    var pk = 4;
+    while (pk < 16384) {
         store64(_sd_stroke_run + pk * 8, 165 * pk + 7);
         pk = pk + 1;
     }
@@ -565,17 +574,18 @@ fn main(): i64 {
     sd_canvas_stroke_path_ex(c2, bars, ONE, BM, MI, 4 * ONE);
     check(alloc_used() - g0, 0);                                      # 60
     var pbad = 0;
-    pk = 2;
-    while (pk < 8192) {
+    pk = 4;
+    while (pk < 16384) {
         if (load64(_sd_stroke_run + pk * 8) != 165 * pk + 7) { pbad = pbad + 1; }
         pk = pk + 1;
     }
     check(pbad, 0);                                                   # 61 — nothing written past the crossings
-    # C3. The round stroker's run past 8,192 points: 16,384 * 8. (Its pieces' paths go on the arena.)
+    # C3. The round stroker's run past 8,192 points: 16,384 * 16 (0.9.0: inline (x, y) a slot, so a
+    # growth of the same capacity is twice the bytes it was). (Its pieces' paths go on the arena.)
     arena_reset(g_arena);
     g0 = alloc_used();
     sd_canvas_stroke_path(c3, vfull, 3 * ONE);
-    check(alloc_used() - g0, 131072);                                 # 62
+    check(alloc_used() - g0, 262144);                                 # 62
     check(_sd_stroke_run_cap, 16384);                                 # 63
     check(_sd_run_trunc, 0);                                          # 64
     arena_reset(g_arena);
@@ -607,17 +617,19 @@ fn main(): i64 {
     sd_canvas_fill_path(c6, drow, SD_FILL_NONZERO);
     check(alloc_used() - g0, 0);                                      # 75
     # C7. sd_path_flatten's result is the CALLER's: on the hook, 65,536 + 131,072 + 262,144 B of
-    # arrays for 20,001 points, + ctx 24 + polyline header 24 (16 through 0.7.2, before the header
-    # carried its own truncated/degraded verdict); the global heap pays nothing.
+    # arrays for 20,001 points, + 20,001 x 16 B of SdPoints (0.9.0: every emitted point is
+    # materialised, because the path holds coordinates and not records), + ctx 24 + polyline header
+    # 24 (16 through 0.7.2, before the header carried its own truncated/degraded verdict); the
+    # global heap pays nothing.
     a0 = arena_used(g_arena);
     g0 = alloc_used();
     sd_path_flatten(v20k, ONE >> 2);
-    check(arena_used(g_arena) - a0, 65536 + 131072 + 262144 + 24 + 24);   # 76
+    check(arena_used(g_arena) - a0, 65536 + 131072 + 262144 + 20001 * 16 + 24 + 24);   # 76
     check(alloc_used() - g0, 0);                                      # 77
     check(_sd_flat_trunc, 0);                                         # 78
     a0 = arena_used(g_arena);
     sd_path_flatten(vpre, ONE >> 2);
-    check(arena_used(g_arena) - a0, 65536 + 24 + 24);                 # 79 — at or under 8,192: as 0.6.0
+    check(arena_used(g_arena) - a0, 65536 + 8192 * 16 + 24 + 24);     # 79 — at or under 8,192: as 0.6.0
     check(sd_alloc_set(0), &hook_alloc);                              # 80
     arena_reset(g_arena);
 
@@ -937,7 +949,10 @@ fn main(): i64 {
     var jpath = dups_cusp(32765);
     g0 = alloc_used();
     sd_canvas_stroke_path_ex(jc, jpath, 4 * ONE, BM, MI, 4 * ONE);
-    check(alloc_used() - g0, 524288 + 65536 + jmid_cost);             # 158 — run + flags + the cubic's mid-points
+    # ⚠ The run's doubling to 65,536 slots is 1,048,576 B since 0.9.0 (16 B a slot, inline (x, y));
+    # it was 524,288 B of pointers. The flags are one byte a slot either way, and jmid_cost is
+    # MEASURED off the reference stroke two lines up rather than written down.
+    check(alloc_used() - g0, 1048576 + 65536 + jmid_cost);            # 158 — run + flags + mid-points
     check(_sd_stroke_run_cap, 65536);                                 # 159
     check(_sd_sb_inner_cap, 65536);                                   # 160
     check(_sd_run_trunc, 0);                                          # 161
@@ -1148,7 +1163,7 @@ fn main(): i64 {
     # issues/archived/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md).
     # ⚠ RE-MEASURED ON 0.7.1: the 0.7.0 figures were 150,602,312 / 83,493,448 /
     # 50,135,040 B, and the flatten repair took a third off every one of them.
-    check(SD_GROW_LIMIT_DEFAULT, 8388608);                            # 204
+    check(SD_GROW_LIMIT_DEFAULT, 16777216);                           # 204
     check(g_limit0, SD_GROW_LIMIT_DEFAULT);                           # 205 — SHIPPED default, as
     #                                                                   the process started, not the
     #                                                                   constant compared with itself
@@ -1177,7 +1192,92 @@ fn main(): i64 {
     # cov_diff 0). Truncation is a CONTRACT breach, not a visible one; the flag is the only honest
     # witness, which is exactly why the AREA dispatch reads the flag and not the coverage.
     sd_grow_limit_set(SD_GROW_LIMIT_DEFAULT);
-    check(sd_grow_limit_get(), 8388608);                              # 216 — restored for the rest
+    check(sd_grow_limit_get(), 16777216);                             # 216 — restored for the rest
+
+    # ---- R. WHAT A BYTE OF THE CEILING BUYS, PINNED (0.9.0) ----------------------------------
+    # ⛔⛔ THE CEILING IS IN BYTES AND THE RUN'S SLOT DOUBLED IN 0.9.0 (an 8 B pointer became a 16 B
+    # inline (x, y)), so 0.8.0's 8 MiB default would have reached HALF the points it used to —
+    # 524,288 against 1,048,576 — and a single subpath longer than that, which 0.8.0 stroked whole,
+    # would have truncated (SADISH_ERR_OOM, _sd_run_trunc set, the tail dropped). MEASURED on both
+    # trees with one probe built from each. ⇒ SD_GROW_LIMIT_DEFAULT was DOUBLED to 16 MiB so the
+    # length is what it was, and this group pins that: neither the slot nor the default can move
+    # again without a suite saying which.
+    # ⭐ It costs no real memory. MEASURED on both trees at 8,192 / 16,384 / 32,768-point subpaths,
+    # a stroked point costs FORTY BYTES of path + run on either release (0.8.0: 8 to the run, 32 to
+    # the path; 0.9.0: 16 and 24), so both truncate holding 1,048,576 x 40 B = 41,943,040 B.
+    # ⚠ WHAT THE DOUBLING ALSO DID: the ceiling bounds every growable store, so the fill's edge list
+    # can now reach 524,288 edges where 0.8.0 stopped at 262,144 — a looser hostile-path bound, and
+    # the price of keeping stroke length byte-stable across the ABI change. #224 pins it at the new
+    # figure so the trade is visible in a running check and not only in a comment.
+    # ⚠ LAST GROUP ON PURPOSE. It drives both buffers to their ceiling and leaves them there —
+    # 16 MiB each, plus the abandoned ladder below them — and leaves _sd_run_trunc set.
+    check(sd_grow_limit_get(), SD_GROW_LIMIT_DEFAULT);                # 217 — at the shipped ceiling
+    _sd_run_trunc = 0;
+    var rgo = 1;
+    var rspin = 0;
+    while (rspin < 40) {
+        if (rgo != 0) {
+            if (_sd_run_grow(_sd_stroke_run_cap * 2) == 0) { rgo = 0; }
+        }
+        rspin = rspin + 1;
+    }
+    check(_sd_stroke_run_cap, 1048576);                               # 218 — ⛔ THE RUN'S CEILING,
+    #                                        which is 0.8.0's to the POINT: the slot doubled and so
+    #                                        did the default, so the length did not move.
+    check(_sd_stroke_run_cap * 16, SD_GROW_LIMIT_DEFAULT);            # 219 — and the arithmetic
+    #                                        that sets it: slot x points = the ceiling, to the byte.
+    check(_sd_run_trunc, 1);                                          # 220 — the refusal is flagged
+    check(_sd_dash_init(), 1);                                        # 221
+    _sd_dash_trunc = 0;
+    rgo = 1;
+    rspin = 0;
+    while (rspin < 40) {
+        if (rgo != 0) {
+            if (_sd_dash_grow(_sd_dash_cap * 2) == 0) { rgo = 0; }
+        }
+        rspin = rspin + 1;
+    }
+    check(_sd_dash_cap, 1048576);                                     # 222 — the dash piece buffer
+    check(_sd_dash_cap * 16, SD_GROW_LIMIT_DEFAULT);                  # 223 —   keeps the same length
+    # ⚠ AND THE FILL'S TWO STORES REACH TWICE AS FAR, because the ceiling that bounds them doubled
+    # while their elements did not change size: 524,288 edges, not 0.8.0's 262,144. That is the
+    # trade this release took to keep stroke length stable — bounded still, but at twice 0.8.0's
+    # figure. A consumer that wants 0.8.0's MEMORY bound rather than its length calls
+    # sd_grow_limit_set(8388608).
+    check(SD_GROW_LIMIT_DEFAULT / 32, 524288);                        # 224 — edges, doubled
+    # ⚠ NOT asserted here: that _sd_fill_edges_cap is itself within that bound. Group L above lifts
+    # the ceiling to 0 on purpose and grows the list past it, so the live capacity at this point is
+    # group L's leftover, not a contract. The edge ceiling's own gate is #210-#212.
+    # R2. THE REMEDY THE RELEASE NOTES NAME, PINNED — because a documented one-call fix that stops
+    # working is worse than no fix. src/raster.cyr, the proposal and the 0.9.0 release notes all
+    # tell a consumer that needs 0.8.0's LENGTH to call sd_grow_limit_set(16777216). This is that
+    # call, and it must land the run and the dash on exactly 1,048,576 points — 0.8.0's ceiling to
+    # the point — and no further.
+    var rprev = sd_grow_limit_set(16777216);
+    check(rprev, SD_GROW_LIMIT_DEFAULT);                              # 225 — and it returns the old
+    _sd_run_trunc = 0;
+    _sd_dash_trunc = 0;
+    rgo = 1;
+    rspin = 0;
+    while (rspin < 40) {
+        if (rgo != 0) {
+            if (_sd_run_grow(_sd_stroke_run_cap * 2) == 0) { rgo = 0; }
+        }
+        rspin = rspin + 1;
+    }
+    check(_sd_stroke_run_cap, 1048576);                               # 226 — ⭐ 0.8.0's LENGTH back
+    check(_sd_stroke_run_cap * 16, 16777216);                         # 227 — at twice the bytes
+    check(_sd_run_trunc, 1);                                          # 228 — and it stops there
+    rgo = 1;
+    rspin = 0;
+    while (rspin < 40) {
+        if (rgo != 0) {
+            if (_sd_dash_grow(_sd_dash_cap * 2) == 0) { rgo = 0; }
+        }
+        rspin = rspin + 1;
+    }
+    check(_sd_dash_cap, 1048576);                                     # 229 — the dash buffer too
+    check(sd_grow_limit_set(rprev), 16777216);                        # 230 — put the ceiling back
 
     if (g_fails == 0) {
         var ok = "grow_edges_test: PASS (edge list, crossings, run, batch, flatten grow; OOM degrades to 0.6.0)\n";

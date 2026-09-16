@@ -369,9 +369,11 @@ fn main(): i64 {
     # A warm STYLED stroke of a straight path costs the global heap nothing but the canvas — every
     # later figure is a seam figure. ⚠ Not the ROUND stroker and not a CURVE: the piece paths and
     # the flatten mid-points are sd_alloc calls, and with no hook armed sd_alloc IS the global heap
-    # (MEASURED here: 13,144 B for the round stroker on this closed curve — canvas included, and
-    # 126,176 B through 0.7.2, before 0.8.0 opened the piece paths at their exact capacity — and
-    # 192 B of mid-points for a dashed one).
+    # (MEASURED here: 11,256 B for the round stroker on this closed curve — canvas included; 10,184
+    # without it — against 13,144 B through 0.8.0 and 126,176 B through 0.7.2, and 224 B of flatten
+    # records for a dashed one, which was 192 B. ⚠ Both figures moved with 0.9.0's inline points and
+    # in opposite directions: a piece path lost its per-point SdPoints, and each CURVE VERB gained an
+    # endpoint record the path no longer holds.)
     var gh = alloc_used();
     var a1 = so_canvas(SD_AA_SUBSCANLINE);
     check(draw_case(11, a1), SADISH_OK);                               # 10
@@ -380,12 +382,14 @@ fn main(): i64 {
     # budget of 0 — the "0 B once warm" promise, read through the hook.
     check(so_count(11, SD_AA_SUBSCANLINE), 0);                         # 12
     check(so_count(14, SD_AA_SUBSCANLINE), 0);                         # 13 — a dashed line likewise
-    # The round stroker pays 7 sd_allocs a segment rect and 19 a disc: the 2-point line is one rect
-    # and two discs. ⛔ 0.8.0 MOVED THE BYTES AND NOT THIS COUNT — sd_path_new_cap makes the same
-    # three requests sd_path_new did (record, verbs, points), for smaller blocks — so every K in
-    # every sweep below is where it was. This check is what says so: a capacity one slot short of
-    # its site's real need would double an array and read 47 here (MEASURED, as a mutation).
-    check(so_count(0, SD_AA_SUBSCANLINE), 7 + 19 + 19);                # 14
+    # The round stroker pays 3 sd_allocs a segment rect and 3 a disc: the 2-point line is one rect
+    # and two discs. ⛔ 0.8.0 MOVED THE BYTES AND NOT THIS COUNT; 0.9.0 MOVES THE COUNT, and that is
+    # the release in one number — 45 -> 9. A piece path is the constructor's three requests (record,
+    # verbs, points) and NOTHING ELSE: its points are inline coordinates, so the 4 SdPoints a rect
+    # and the 16 a disc used to put on the seam are gone. Every K in every sweep below follows,
+    # because they are keyed to so_count and not written down. A capacity one slot short of its
+    # site's real need still doubles an array and reads 11 here (MEASURED, as a mutation).
+    check(so_count(0, SD_AA_SUBSCANLINE), 3 + 3 + 3);                  # 14
     check(so_count(2, SD_AA_SUBSCANLINE) > 0, 1);                      # 15 — the curve's mid-points
 
     # ── B) THE ROUND STROKER: EVERY K, BOTH ENGINES ────────────────────
@@ -637,8 +641,9 @@ fn main(): i64 {
     # against the whole stroke: the ink grows piece by piece and never arrives.
     # ⚠ THE LINE, not the curve: a curved path's mid-points are allocated BEFORE its first piece
     # path, so a small budget there buys a coarser polyline rather than a prefix of the pieces
-    # (h3 below is that case). On the 2-point line the budget buys pieces, one at a time: 7 for the
-    # segment rect, then 19 a disc.
+    # (h3 below is that case). On the 2-point line the budget buys pieces, one at a time: 3 for the
+    # segment rect, then 3 a disc (0.9.0; 7 and 19 through 0.8.0, when each piece path also bought
+    # an SdPoint per corner or vertex).
     var full = cov_sum(so_ref(0, SD_AA_SUBSCANLINE));
     var h0 = so_canvas(SD_AA_SUBSCANLINE);
     so_budget(0);
@@ -646,13 +651,13 @@ fn main(): i64 {
     so_restore();
     check(cov_sum(h0), 0);                                             # 97 — the first path refused
     var h1 = so_canvas(SD_AA_SUBSCANLINE);
-    so_budget(7);
+    so_budget(3);
     check(sd_canvas_stroke_path(h1, g_line, SO_WIDTH), SADISH_ERR_OOM);    # 98
     so_restore();
     check(cov_sum(h1) > 0, 1);                                         # 99 ⭐ one rect's worth of ink
     check(cov_sum(h1) < full, 1);                                      # 100 — and no more
     var h2 = so_canvas(SD_AA_SUBSCANLINE);
-    so_budget(7 + 19);
+    so_budget(3 + 3);
     check(sd_canvas_stroke_path(h2, g_line, SO_WIDTH), SADISH_ERR_OOM);    # 101
     so_restore();
     check(cov_sum(h2) > cov_sum(h1), 1);                               # 102 — the rect and one cap
@@ -783,7 +788,11 @@ fn main(): i64 {
     check(_sd_sb_inner != 0, 1);                                       # 144
     check(_sd_sb_trig != 0, 1);                                        # 145
     check(_sd_dash_flags != 0, 1);                                     # 146
-    check(_sd_dash_rec != 0, 1);                                       # 147
+    # ⚠ WAS `_sd_dash_rec != 0` THROUGH 0.8.0. The dash buffer's four shared cut-point SdPoint
+    # records are gone in 0.9.0 — the piece buffer holds inline (x, y), so a cut point is a COPY and
+    # needs no record — and _sd_dash_init publishes two blocks, not three. The capacity is the third
+    # thing that publish sets, so it holds the same "the set went out whole" line this check did.
+    check(_sd_dash_cap, 8192);                                         # 147
     check(_sd_fill_cross_cap >= _sd_sb_cap, 1);                        # 148 — the borrowing invariant
     check(SD_FLATTEN_CAP, 8192);                                       # 149 — the knob is back
     check(sd_grow_limit_get(), SD_GROW_LIMIT_DEFAULT);                 # 150 — untouched throughout
