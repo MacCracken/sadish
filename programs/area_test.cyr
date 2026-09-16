@@ -1186,11 +1186,11 @@ fn main(): i64 {
     check(lit_outside(cze, 15, 1), 0);                                # 139
     check(canary_bad(), 0);                                           # 140
 
-    # ── N) EDGE-LIST OVERFLOW: AREA RUNS ON BOTH SIDES OF THE OLD CAP (0.6.1) ──
+    # ── N) EDGE-LIST OVERFLOW: AREA RUNS ON BOTH SIDES OF THE OLD CAP (0.7.0) ──
     # Through 0.6.0 sd_edge_add dropped edges silently at SD_FLATTEN_CAP, leaving a contour open; the
     # area engine would then streak to the right edge (MEASURED before the guard: 28 of 40 rows lit at
     # x = 79 on an 80-px canvas), so an AREA fill that reached the cap ran the default loop. Since
-    # 0.6.1 the list grows and only a FAILED growth truncates it (programs/grow_edges_test.cyr pins
+    # 0.7.0 the list grows and only a FAILED growth truncates it (programs/grow_edges_test.cyr pins
     # that fallback). zig_path(cap - 4) is cap - 1 edges; the triangle appended below adds two more,
     # which 0.6.0 turned into one kept edge and one lost.
     var cap = SD_FLATTEN_CAP;

@@ -107,7 +107,7 @@ fn _sd_area_swap(ea, eb): i64 {
 }
 
 # Sort the edge records by ymin, in place (Shell sort, Knuth 3h+1 gaps: no scratch, O(n^1.5) worst
-# case — not O(n^2) — on the lists a long flattened path produces, which since 0.6.1 are unbounded).
+# case — not O(n^2) — on the lists a long flattened path produces, which since 0.7.0 are unbounded).
 fn _sd_area_sort(edges, n): i64 {
     var gap = 1;
     while (gap < n / 3) { gap = gap * 3 + 1; }

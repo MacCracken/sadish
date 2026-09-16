@@ -1,19 +1,38 @@
 # Path construction stores through a refused `sd_alloc` — a hook that returns 0 faults inside sadish
 
-**Status:** 🟢 **CLOSED — FIXED in sadish 0.7.1**, in two halves that landed together: `src/path.cyr`
+**Status:** 🟡 **OPEN — every site in the table below is FIXED (0.7.1); the filing's own goal is not
+reached.** `sd_canvas_stroke_path` still SIGSEGVs under exactly the hook the 0.5.5 seam invites,
+through two unchecked `sd_path_new()` calls sadish makes itself, and the seam contract this filing
+asks to rewrite still reads the old way. See **Still open** at the foot. ⛔ This line read
+"🟢 **CLOSED — FIXED in sadish 0.7.1**" until the 2026-09-15 re-audit against HEAD `f722e8c`.
+
+**Fixed in 0.7.1**, in two halves that landed together: `src/path.cyr`
 and `src/geom.cyr` (the path/point/flatten sites) and `src/raster.cyr`, `src/present.cyr`,
 `src/error.cyr` (clip node, clip mask, PPM/presenter, error record). Every site in the table below
 now checks its result and propagates — constructors return 0, path builders return `SADISH_ERR_OOM`
-with the path unchanged, and the clip pushes leave the previous region intact and poppable. Gated by
+with the path unchanged, and the clip pushes leave the previous region intact and poppable. A
+next-line scan of all **32** `sd_alloc(` result sites in `src/*.cyr` at 0.7.1 found ZERO unchecked
+(re-run 2026-09-15). Gated by
 `programs/oom_test.cyr` and `programs/flatten_bound_test.cyr`, which sweep a hook that refuses the
 K-th allocation across every site in turn; thirteen mutations reinstating the 0.7.0 behaviour are
-`SIGSEGV` rc 139 against those suites.
+`SIGSEGV` rc 139 against **`oom_test`** — ⚠ that figure belongs to the raster/present/error half
+alone, as the closing section says. RE-MEASURED 2026-09-15: exactly thirteen against `oom_test`, and
+**seven MORE** SIGSEGV kills against `flatten_bound_test` (`sd_point_new`, the flatten out, the
+flatten ctx, the polyline header, `sd_matrix_new`, `sd_matrix_invert`, `_sd_flat_widen`). The
+top-line number under-counted its own gate.
 ⭐ **And the fill now REPORTS a starved flatten** rather than painting a wrong picture under
 `SADISH_OK`: `sd_fill_impl` scopes the flatten's truncation verdict to the call and returns
 `SADISH_ERR_OOM` when that fill lost points (MEASURED: a 4-cubic circle whose true ink is 312,280
 coverage units paints 81,029 under a hook granting 5 allocations — 0.7.0 SIGSEGV'd there).
 ⚠ **Still the caller's job for STROKES**: the styled path has its own flush and the round stroker
 discards `sd_canvas_fill_union`'s result, so `sd_flatten_truncated()` remains their only witness.
+⛔ **That understates it, and the re-audit measured the difference.** It describes a REPORTING gap and
+implies the stroke completes. It does not: a starved ROUND stroke **SIGSEGVs, rc 139**, through
+`src/stroke.cyr:133` / `:145` (see **Still open**). There is no witness because there is no return.
+The reporting gap is real for the STYLED stroke, which does complete — MEASURED, starved at 0, 1, 2
+and 3 grants it returns `SADISH_OK` with 0 / 3,118 / 6,418 / 7,612 ink against a 7,756 baseline.
+⚠ And the witness is sticky: nothing in a stroke clears `_sd_flat_trunc`, so it reads 1 on later
+healthy strokes too. It cannot be trusted per call.
 ⚠ **One fault this filing did not name was found while closing it**, and is fixed here too: a path
 whose FIRST verb is a drawing verb (no moveto) dereferenced a 0 `SdPoint` in every walk — fill,
 both strokers, dash and `sd_path_flatten` — SIGSEGV on 0.7.0 and 0.6.0 alike. 0.7.1's clean
@@ -67,6 +86,15 @@ Found by a next-line scan of `src/*.cyr` (each worth confirming by eye):
 | `error.cyr:32` | error record | no |
 | `present.cyr:69, 73, 114, 115, 129, 135` | PPM / presenter | no |
 
+⚠ **Every `file:line` above and in the Affects line is AS FILED, against 0.6.0** — all 16 point at
+unrelated lines at 0.7.1. Re-derived 2026-09-15: `sd_path_new` verbs/points `src/path.cyr:75`, `:77`
+(via `_sd_path_alloc`); `sd_point_new` `src/geom.cyr:73`; `sd_path_flatten` out / ctx / polyline
+`src/path.cyr:724`, `:730`, `:793`; matrix `src/geom.cyr:106` **and `:221`** — the tree has TWO matrix
+allocations (`sd_matrix_new` and `sd_matrix_invert`), this table names one, and 0.7.1 checked both;
+clip node / shape mask `src/raster.cyr:1018`, `:1057`; error record `src/error.cyr:41`; PPM /
+presenter `src/present.cyr:90`, `:93`, `:146`, `:156`, `:176`, `:181`. Cite the FUNCTION, not the
+line, in the next filing.
+
 ## Suggested fix
 
 Check each site and propagate `SADISH_ERR_OOM` (or 0 for constructors), matching what `sd_path_grow`,
@@ -78,8 +106,11 @@ become end-to-end.
 ## Status — `raster.cyr` / `present.cyr` / `error.cyr` sites CLOSED in 0.7.1
 
 ⚠ **This section covers only half the filing.** The `path.cyr` / `geom.cyr` rows above
-(`sd_path_new`, `sd_point_new`, `sd_path_flatten`, the matrix) are a separate 0.7.1 item; the
-top-line **Status** stays open until that one lands too.
+(`sd_path_new`, `sd_point_new`, `sd_path_flatten`, the matrix) are a separate 0.7.1 item, gated by
+`programs/flatten_bound_test.cyr`. ⛔ It **landed in the same release** — this section was written
+before it did, and used to end "the top-line **Status** stays open until that one lands too", which
+contradicted the header two screens above for the whole of 0.7.1. Both halves are in; what keeps the
+top-line Status open is a different site entirely (**Still open**, at the foot).
 
 Closed here, each with a numbered check in the new suite `programs/oom_test.cyr` (157 checks):
 
@@ -121,10 +152,55 @@ checks 57-58 read a PPM truncated from 35 bytes to 0. Separately,
 one site was measured end-to-end on a materialised 0.7.0 tree with a probe that builds against both
 (`sd_canvas_clip_push_path` on a degenerate canvas header: 0.7.0 rc 139, 0.7.1 rc 1).
 
-⛔ Rendering did not move: the 25 pre-0.7.1 suites pass with **assertions unedited**, agnos's
+⛔ Rendering did not move: the 25 pre-0.7.1 suites pass, agnos's
 `refagree` prints **BYTE-IDENTICAL on all 200 paths**, and rekha (23 suites) and dhancha (18) pass
-against this `dist/`.
+against this `dist/`. ⚠ This used to add "with **assertions unedited**", which is over-broad for the
+release it shipped in: `git show f722e8c -- programs/alloc_test.cyr` edits checks **#128** and **#133**
+from `check(arena_used(g_arena) - pa, 1248)` to `208`, and rewrites `grow_edges_test`'s MEASURED heap
+figures. Those are ALLOCATION-BYTE assertions moved by the sibling flatten filing, not coverage — so
+"rendering did not move" survives; "assertions unedited" does not. (The 25/27 arithmetic is right:
+both new suites arrived in `f722e8c`.)
 
 ⚠ Not closed by this half: `sd_present_open`'s own `open("/dev/fb0")` is still never exercised by a
 test (that would write to the live display) — its four allocation guards are reached through
 `_sd_present_probe`, which 0.7.1 split out precisely so a regular file's fd can drive them.
+Re-verified 2026-09-15: no program calls `sd_present_open`; only `_sd_present_probe` /
+`_sd_presenter_build` are driven (`oom_test` checks #69-#90).
+
+---
+
+## Still open (re-audited 2026-09-15 against 0.7.1, HEAD `f722e8c`)
+
+⛔ **The same fault class, one level up, and sadish's own code is the caller.** `src/stroke.cyr:133`
+`var rp = sd_path_new();` (`sd_stroke_seg`) and `src/stroke.cyr:145` `var dp = sd_path_new();`
+(`sd_stroke_disc`) never test the 0 that 0.7.1 taught `sd_path_new` to return, and the next line is
+`sd_path_moveto(rp, …)`. MEASURED on HEAD: a straight 2-point path, warm scratch, every `sd_alloc`
+refused — `sd_canvas_stroke_path` dies **rc 139**. Adding `if (rp == 0) { return 0; }` and
+`if (dp == 0) { return 0; }` in a copy makes the same call return rc 0; patching only `sd_stroke_seg`
+still faults, so **both** sites are live. It also reaches `sd_canvas_stroke_path_ex` with
+`SD_CAP_ROUND` + `SD_JOIN_ROUND`, which delegates at `src/stroke.cyr:1127-1129`.
+
+⚠ Sweep of every public entry under a total-refusal hook on HEAD: fill, styled (butt/miter), dash,
+`sd_canvas_clip_push_rect`, `sd_canvas_clip_push_path`, `sd_path_flatten`, `sd_path_new`,
+`sd_path_moveto` all survive; **`sd_canvas_stroke_path`** and
+**`sd_canvas_stroke_path_ex(ROUND, ROUND)`** SIGSEGV. No suite drives a refusing hook through any
+stroke entry point — grep of `oom_test.cyr` and `flatten_bound_test.cyr` for `stroke` finds only the
+scratch-pointer assertions #135-#138 — which is why this survived the release.
+
+⚠ `src/stroke.cyr:545` `var accrow = _sd_fill_accrow_for(w);` — the styled span walk still stores
+through a possible 0. `src/raster.cyr:400-401` admits it in the tree ("⚠ THE CALLER IN stroke.cyr …
+faults on a refusal exactly as it did through 0.7.0, and that file is out of this change's scope").
+The `_sd_fill_accrow_for` row of the table above names only `sd_fill_impl` as its consumer.
+
+**The Suggested fix's second clause is not done.** `src/alloc.cyr:28-30` still carries the pre-fix
+contract: *"A hook returning 0 is handled precisely as `alloc()` returning 0 already is: the callers
+that check (`sd_surface_new`, `sd_canvas_new`, `sd_path_new`, `sd_path_grow`) return 0 /
+`SADISH_ERR_OOM`; the callers that do not check never did. No new failure path."* That list is now
+every caller in path/geom/raster/present/error, and the closing sentence is false. Its last clause —
+"and rekha's own 0-checks become end-to-end" — cannot be true while a stroke faults, so the Severity
+paragraph's *"the only safe hook is one that never returns 0"* still holds for any consumer that
+strokes.
+
+**What would close it:** two lines in `src/stroke.cyr` and one suite case (a stroke under `oom_test`'s
+`oom_budget(0)`). Then the seam contract in `src/alloc.cyr:28-30` can finally be rewritten as this
+filing asks.

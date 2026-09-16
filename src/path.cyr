@@ -303,7 +303,7 @@ fn sd_polyline_points(pl): i64 { return load64(pl + SD_POLYLINE_POINTS_OFFSET); 
 # (256: every leaf of the recursion emits one point).
 # SD_FLATTEN_CAP is the INITIAL size of every point / edge store the flatten feeds: sd_path_flatten's
 # result, and raster.cyr's fill edge list, crossings and stroker run — all of which GROW past it
-# since 0.6.1 (through 0.6.0 each dropped what did not fit). It is also the FIXED size of the fill's
+# since 0.7.0 (through 0.6.0 each dropped what did not fit). It is also the FIXED size of the fill's
 # and stroker's per-curve flatten buffers, which one curve's 2^depth points never fill.
 var SD_FLATTEN_CAP       = 8192;
 var SD_FLATTEN_MAX_DEPTH = 8;
@@ -695,7 +695,7 @@ fn sd_flatten_cubic(ctx, p0, p1, p2, p3, tol, depth): i64 {
 # apart (0.7.1; through 0.7.0 a refusal here stored through 0). ⭐ The verdict is cleared BEFORE the
 # empty-path return, so "0 and truncated() == 0" really does mean empty; an early return that
 # skipped the clear would have left the previous call's 1 standing.
-# ⭐ Every point is returned (0.6.1; through 0.6.0 the result stopped at SD_FLATTEN_CAP = 8,192).
+# ⭐ Every point is returned (0.7.0; through 0.6.0 the result stopped at SD_FLATTEN_CAP = 8,192).
 # The point array starts at SD_FLATTEN_CAP * 8 B and doubles through sd_alloc — it is the caller's
 # result, on the seam like the polyline — abandoning each smaller block to the allocator: MEASURED
 # 458,752 B of arrays for 20,001 points (65,536 + 131,072 + 262,144), 65,536 B at or under 8,192.

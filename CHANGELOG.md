@@ -108,6 +108,35 @@ renders nothing of it; sadish now does the same instead of dying.
 ⚠ Gated by `programs/integration_test.cyr` group E, where the failure mode is the SUITE faulting rather
 than a wrong number.
 
+### Housekeeping — the issue tree, audited rather than tidied
+
+⭐ **Every closure claim in `docs/development/` was re-verified against the tree before anything moved,
+and four of the five filings did not survive it.** Only
+`2026-09-14-direct-primitives-address-rows-by-width-not-stride.md` is archived (to
+`docs/development/issues/archived/`); ten single-site mutations reverting it to the 0.5.5 width-as-pitch
+form each fail `stride_test` (5 to 14 checks apiece), and today's suite run against a real 0.5.5 tree
+fails **58 of 103** — exactly the figure the filing claimed.
+⛔ **The other four stay ACTIVE with corrected status lines and a "Still open" section**, because a
+filing closes when its OWN asks are met, not when the headline defect stops reproducing:
+- the clip-mask filing: three coverage loads (`sd_canvas_blit_gradient`, and two behind
+  `sd_canvas_blit_paint_premul_at`) can still be pushed to the packed index with all 27 suites green —
+  the exact gap its closing paragraph claims to have swept for;
+- the flatten filing: its "or return an error the fill/stroke can see" is done for the fill and NOT for
+  strokes, and a whole untrusted fill is still unbounded unless the caller scopes it;
+- the refused-allocation filing: `sd_stroke_seg` and `sd_stroke_disc` still ignore `sd_path_new()`
+  returning 0, so a refused allocation inside a stroke faults — the same class the filing is about,
+  one level up, and the reason `sd_canvas_stroke_path` cannot yet be called hook-safe;
+- the `sd_path_new_cap` proposal: `SdPath` has ONE capacity field, so the two arguments collapse to
+  their max and "exactly the given capacity" is not what shipped.
+⚠ **A phantom version is gone from the source.** 24 comments in `src/` and `programs/` dated features
+to **0.6.1, a release that was never cut** — that work shipped as 0.7.0, and the comments had been
+copied verbatim into every `dist/sadish.cyr` since. All 24 now read 0.7.0.
+⚠ **File:line citations rot within one release**: one site had drifted 291 lines, and re-pointing an
+ellipsis-truncated path in `raster.cyr` shifted 13 freshly-written citations by one line before this
+commit landed. The filings now cite FUNCTIONS, with re-derived line numbers kept beside them, and
+`docs/development/issues/README.md` (new) makes that a rule along with the grep that proves every
+documented path still resolves.
+
 ### Verified
 
 All **27** suites pass — 25 pre-0.7.1 with assertions unedited (bar #271 above), plus
@@ -377,7 +406,7 @@ accumulator from the global `alloc` on the first AREA fill (264 B at 32 px); **0
 
 ### Fixed — every surface reader and writer addresses rows by `sd_surface_stride`
 
-Closes `docs/development/issues/2026-09-14-direct-primitives-address-rows-by-width-not-stride.md`.
+Closes `docs/development/issues/archived/2026-09-14-direct-primitives-address-rows-by-width-not-stride.md`.
 `sd_plot`, `sd_line`, `sd_hline`, `sd_vline` (and so `sd_rect` / `sd_fill_rect` / `sd_clear`),
 `sd_blend_hline` / `sd_fill_rect_blend`, `sd_surface_pixel_at`, `sd_canvas_blit_gradient`, the
 presenter's row copy, and `sd_surface_write_ppm` (which the issue missed — it read `w*h` pixels as one
@@ -464,7 +493,7 @@ pane sub-rect, where `stride != width*4`). The suite builds such a header by han
 address by `width * 4` — right for every packed surface sadish makes, one row of shear per row on a
 wrapped one, MEASURED as 4,000 padding pixels overwritten by a `WINDOW` background under text that
 landed straight. Filed as
-`docs/development/issues/2026-09-14-direct-primitives-address-rows-by-width-not-stride.md`.
+`docs/development/issues/archived/2026-09-14-direct-primitives-address-rows-by-width-not-stride.md`.
 
 ### Changed — the fill/stroke scratch is process-lifetime, allocated once
 

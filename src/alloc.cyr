@@ -33,7 +33,7 @@
 #   ⚠ The fill/stroke scratch in raster.cyr is deliberately NOT on this seam — it is allocated
 #     once for the life of the process from the global `alloc` (see `_sd_scratch_init`; the
 #     SD_AA_AREA accumulator in coverage.cyr and the styled-stroke batch in stroke.cyr likewise),
-#     and since 0.6.1 GROWN there too when a path outgrows it. A hook pointing at an arena that
+#     and since 0.7.0 GROWN there too when a path outgrows it. A hook pointing at an arena that
 #     gets reset would otherwise leave the scratch dangling on the second frame.
 #   ⚠ The hook is a process-wide global, like the scratch: sadish has never had a lock anywhere
 #     and is not thread-safe. Set it from the thread that draws.

@@ -7,7 +7,7 @@
 # every packed surface sadish makes itself, one row of shear per row on a WRAPPED one — MEASURED in
 # the 0.5.5 review as 4,000 padding pixels overwritten by a WINDOW background (sd_fill_rect) under
 # text that landed straight. Filed as
-# docs/development/issues/2026-09-14-direct-primitives-address-rows-by-width-not-stride.md.
+# docs/development/issues/archived/2026-09-14-direct-primitives-address-rows-by-width-not-stride.md.
 #
 # THE RIG. A 13x9 SdSurface header built by hand (the shape dhancha's dh_surface_wrap produces, and
 # alloc_test group E builds) over a 21-px-pitch buffer: the window starts 3 px into each row, with 2

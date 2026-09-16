@@ -85,14 +85,14 @@
 # overflows. A miter tip lies at most miter_limit * hw from its vertex, and the walk's
 # (bx - ax) * (sy - ay) needs edge extents under ~46,000 px: SD_MITER_LIMIT_MAX = 1024.0 keeps
 # every tip in range up to hw ~ 45 px, and a join past that ratio turns within 0.11° of a reversal.
-# ⭐ ONE CALL IS ONE BATCH (0.6.1). The batch and the run GROW (doubling from the global alloc, like
+# ⭐ ONE CALL IS ONE BATCH (0.7.0). The batch and the run GROW (doubling from the global alloc, like
 # the fill's edge list), so however long the path, sd_canvas_stroke_path_ex fills every piece of it
 # in one pass. Through 0.6.0 a batch held 8,192 edges (about 800 miter segments) and a longer
 # subpath was flushed mid-way — and pieces from different batches meet by MAX, so where a subpath
 # longer than a batch CROSSES or returns onto itself that loss was not bounded. MEASURED against the
 # 0.6.0 bundle, 60 random self-crossing walks of 700..1,100 segments (64x64, widths 0.3..5.3 px,
 # BUTT/SQUARE x MITER/BEVEL) against the same walks as one batch (0.6.0 rebuilt with a 16,384-edge
-# cap): 0.6.0 split 20, each more than 3 levels off somewhere, worst 118; 0.6.1 is byte-identical to
+# cap): 0.6.0 split 20, each more than 3 levels off somewhere, worst 118; 0.7.0 is byte-identical to
 # the one batch on all 60, and on 60 more of 2,000..5,000 segments (0.6.0: 60 split, worst 131).
 # ⚠ THE FLUSH + RE-EMISSION IS KEPT as the fallback. It runs when SD_STROKE_BATCH_CAP is set (a
 # memory bound) or when a growth fails for want of memory: the next batch re-emits the stretch before
@@ -205,7 +205,7 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
     var tol = SD_ONE >> 2;
 
     # The stroker's OWN scratch set — the run stays live across the fill_union passes below, which
-    # use the fill set (see the scratch block in raster.cyr). ⚠ The run GROWS (0.6.1), so it is
+    # use the fill set (see the scratch block in raster.cyr). ⚠ The run GROWS (0.7.0), so it is
     # read as _sd_stroke_run at each use, never cached across a push.
     _sd_scratch_init();
     _sd_run_trunc = 0;
@@ -274,7 +274,7 @@ fn sd_canvas_stroke_path(cv, path, width): i64 {
 }
 
 # ---- styled stroking: the edge batch -----------------------------
-# Edges one batch may hold before it is flushed. ⭐ 0 — THE DEFAULT (0.6.1) — IS NO LIMIT: the batch
+# Edges one batch may hold before it is flushed. ⭐ 0 — THE DEFAULT (0.7.0) — IS NO LIMIT: the batch
 # grows, so one sd_canvas_stroke_path_ex call is ONE fill however long its path. A positive value
 # forces a flush past that many edges (the flush + re-emission below, which is otherwise the
 # out-of-memory fallback) and so bounds the batch's memory: it is held to
@@ -291,7 +291,7 @@ var SD_STROKE_BATCH_CAP = 0;
 var SD_STROKE_UNIT_EDGES = 40;
 # The smallest limit that holds what may follow a flush without another: 16 re-emitted units back
 # (<= 23 edges each — never a last unit), the unit, and a closed subpath's 16 forward: 775 edges.
-# ⚠ Since 0.6.1 a lower limit costs flushes, not ink: an edge arriving past the limit grows the
+# ⚠ Since 0.7.0 a lower limit costs flushes, not ink: an edge arriving past the limit grows the
 # array rather than being dropped (_sd_sb_edge), so a starved re-emission is emitted in full and
 # only the NEXT unit flushes. MEASURED: a 2,000-sample Lissajous at a limit of 10 strokes the same
 # bytes as at 800 (programs/grow_edges_test.cyr) — at about 17x the fills.
@@ -305,7 +305,7 @@ var SD_STROKE_BATCH_MIN = 800;
 # straight-line styled stroke costs the heap 0 B, and curves only their flatten mid-points. The
 # flush's crossings use the fill's _sd_fill_cross: a per-fill working array, not held across a call,
 # which the flush IS — so it is borrowed, not duplicated.
-# ⭐ The edges and the curve flags GROW by doubling (0.6.1), from the global alloc, like the fill's
+# ⭐ The edges and the curve flags GROW by doubling (0.7.0), from the global alloc, like the fill's
 # list: MEASURED 524,288 B for the first batch past 8,192 edges, plus 262,144 B of crossings unless a
 # fill already grew them (every growth keeps _sd_fill_cross_cap >= _sd_sb_cap); a repeat 0 B.
 # ⚠ AND IT IS MONOTONE, AND NEVER RETURNED (lib/alloc.cyr has no free): one batch per call means the
@@ -440,7 +440,7 @@ fn _sd_inner_grow(n): i64 {
 
 # Append a flatten ctx's points to the stroker's run (_sd_stroke_run), growing it — and, when
 # `flags` != 0, the styled path's parallel curve flags — as needed; a point that still does not fit
-# is dropped (see _sd_run_fits). Returns the new count. (0.6.1: was sd_stroke_append(run, run_n,
+# is dropped (see _sd_run_fits). Returns the new count. (0.7.0: was sd_stroke_append(run, run_n,
 # fctx), bounded by SD_FLATTEN_CAP; the run pointer is no longer a parameter because growth
 # replaces the block.)
 fn _sd_run_append(run_n, fctx, flags): i64 {
@@ -512,7 +512,7 @@ fn _sd_sb_flush(cv): i64 {
     var cov = sd_canvas_coverage(cv);
     var stride = sd_canvas_stride(cv);
     # ⛔ SD_AA_AREA canvas: the exact engine, nonzero, MAX-combined through the clip. Every piece is
-    # a closed polygon, so the list is whole unless _sd_sb_edge dropped an edge — which since 0.6.1
+    # a closed polygon, so the list is whole unless _sd_sb_edge dropped an edge — which since 0.7.0
     # it records (_sd_sb_trunc), and only after a growth failed. A truncated batch takes the walk
     # below (a dropped edge would streak the area engine to the right edge). Through 0.6.0 a batch
     # AT its limit could not be told from a truncated one and always took the walk.
@@ -1024,7 +1024,7 @@ fn _sd_sb_dispatch(cv, run_n, closed, hw, cap, join, ml, dashed): i64 {
 # _sd_sb_dispatch, and fill the batch once at the end. Both public styled entry points are this
 # walk plus their own argument checks; the caller has already run _sd_scratch_init / _sd_sb_init
 # and cleared _sd_run_trunc.
-# ⚠ The run and its curve flags GROW (0.6.1): read _sd_stroke_run at each use, never a copy taken
+# ⚠ The run and its curve flags GROW (0.7.0): read _sd_stroke_run at each use, never a copy taken
 # before a push.
 fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
     var n_verbs = sd_path_verb_count(path);

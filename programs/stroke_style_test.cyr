@@ -1276,7 +1276,7 @@ fn main(): i64 {
     check(cov_sum(dsq), 400 * 4 * 255);                                # 173
     # A limit raised after the first styled stroke: 720 ROUND dots (11,520 edges) stroke the same
     # bytes as at the default, and nothing is written past the edge array. (Through 0.6.0 the raised
-    # limit was held to the 8,192-edge allocation; since 0.6.1 the default is no limit and the array
+    # limit was held to the 8,192-edge allocation; since 0.7.0 the default is no limit and the array
     # grows.) A limit below SD_STROKE_BATCH_MIN is held to it.
     var dots2 = sd_path_new();
     dq = 0;

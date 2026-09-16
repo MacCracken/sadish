@@ -1,5 +1,5 @@
 # programs/grow_edges_test.cyr — RUN test for the growable edge list, crossings, stroke run, stroke
-# batch and flatten result (0.6.1): the lift of SD_FLATTEN_CAP = 8,192.
+# batch and flatten result (0.7.0): the lift of SD_FLATTEN_CAP = 8,192.
 #
 # ⭐ WHAT THIS EXISTS TO PROVE. Through 0.6.0 every one of those stores DROPPED what did not fit: a
 # fill of more than 8,192 edges left contours open (MEASURED on 0.6.0: a 20,000-gon disc of radius
@@ -1143,8 +1143,9 @@ fn main(): i64 {
     # non-flat quads, one fill on 64x64 — grows edges + crossings to 1,048,576 entries and costs
     # 116,589,056 B of global heap; under the default it keeps 262,144 edges, flags the truncation
     # and costs 50,070,088 B (of which 16,711,680 B is the flatten mid-point cost rekha filed
-    # separately — docs/development/issues/2026-09-15-flatten-keeps-subdividing-… — and ~33 MB the
-    # bounded growth). ⚠ RE-MEASURED ON 0.7.1: the 0.7.0 figures were 150,602,312 / 83,493,448 /
+    # separately — and ~33 MB the bounded growth; the filing is
+    # docs/development/issues/2026-09-15-flatten-keeps-subdividing-and-allocating-after-the-output-cap-is-full.md).
+    # ⚠ RE-MEASURED ON 0.7.1: the 0.7.0 figures were 150,602,312 / 83,493,448 /
     # 50,135,040 B, and the flatten repair took a third off every one of them.
     check(SD_GROW_LIMIT_DEFAULT, 8388608);                            # 204
     check(g_limit0, SD_GROW_LIMIT_DEFAULT);                           # 205 — SHIPPED default, as
