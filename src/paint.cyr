@@ -418,15 +418,29 @@ fn sd_gradient_set_matrix(g, m): i64 {
     return SADISH_OK;
 }
 
-# @public
-fn sd_gradient_stop_count(g): i64 { return load64(g + SD_GRADIENT_NSTOPS_OFFSET); }
+# @public — how many stops the paint holds. 0 for a null paint and for a PATTERN (which has none).
+# ⚠ 0.11.1: THIS USED TO FAULT ON A NULL PAINT, while sd_gradient_color_at's header told a caller to
+# use it to tell a null `g` apart from a stop-less one. The advice was unfollowable — the call it
+# named dereferenced the 0 it was meant to detect.
+fn sd_gradient_stop_count(g): i64 {
+    if (g == 0) { return 0; }
+    return load64(g + SD_GRADIENT_NSTOPS_OFFSET);
+}
 
 # @public — add a colour stop. `offset` is 16.16, clamped to [0, SD_ONE]; `color` is 0xAARRGGBB
 # under the legacy alpha rule (alpha byte 0 == opaque). Inserted after every stop whose offset is
-# <= this one (stable). Returns SADISH_OK, SADISH_ERR_BOUNDS for g == 0, or SADISH_ERR_OOM when
-# growing the stop block fails (the gradient is unchanged).
+# <= this one (stable). Returns SADISH_OK, SADISH_ERR_BOUNDS for g == 0, SADISH_ERR_UNSUPPORTED for
+# a PATTERN, or SADISH_ERR_OOM when growing the stop block fails (the gradient is unchanged).
+# ⛔⛔ THE PATTERN REFUSAL IS A CRASH FIX (0.11.1), NOT TIDINESS. sd_pattern_new leaves
+# SD_GRADIENT_STOPS_OFFSET at 0 — a pattern has no stop array, which is why it costs ONE allocation
+# instead of three. This function then did `store64(stops + i * 16, o)` with `stops == 0`: a
+# null-pointer WRITE, reachable from a single public call on a paint this release introduced.
+# ⚠ It is UNSUPPORTED, not BOUNDS: the paint is valid and the argument is valid: stops are simply
+# not a thing a pattern has. Same reasoning as sd_gradient_set_spread refusing SD_SPREAD_NONE on a
+# gradient, and the second use in the tree of a code that had none before 0.11.0.
 fn sd_gradient_add_stop(g, offset, color): i64 {
     if (g == 0) { return SADISH_ERR_BOUNDS; }
+    if (load64(g + SD_GRADIENT_KIND_OFFSET) == SD_PAINT_PATTERN) { return SADISH_ERR_UNSUPPORTED; }
     var o = offset;
     if (o < 0) { o = 0; }
     if (o > SD_ONE) { o = SD_ONE; }

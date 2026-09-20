@@ -330,6 +330,12 @@ fn sd_present_blit(p, s): i64 {
     var srcpx = sd_surface_pixels(s);
     var srcstride = sd_surface_stride(s);   # ⚠ source row pitch in bytes — not sw*4 on a wrapped surface
 
+    # ⛔⛔ A 0-DIMENSION SURFACE WOULD TRAP HERE (0.11.1). Both divisions below take a surface
+    # dimension as the DIVISOR. sd_surface_new refuses w <= 0, but a surface record is a public
+    # layout a consumer builds itself — dhancha's dh_surface_wrap makes wrapped ones — so a 0 is
+    # reachable from outside and an integer division by it kills the process.
+    if (sw <= 0) { return SADISH_ERR_BOUNDS; }
+    if (sh <= 0) { return SADISH_ERR_BOUNDS; }
     var scale = xres / sw;
     var scy = yres / sh;
     if (scy < scale) { scale = scy; }
@@ -339,16 +345,32 @@ fn sd_present_blit(p, s): i64 {
     if (xoff < 0) { xoff = 0; }
     if (yoff < 0) { yoff = 0; }
     var bpp_bytes = bpp / 8;
-    var row_bytes = sw * (scale * bpp_bytes);
+
+    # ⛔⛔ AND A SURFACE BIGGER THAN THE DISPLAY WROTE PAST THE SCRATCH (0.11.1). `blit` is exactly
+    # pitch * yres bytes. When sw > xres the scale computes to 0, is raised to 1, xoff clamps to 0 —
+    # and then the column loop ran sw times at bpp_bytes each, past the end of the row and, row after
+    # row, past the end of the whole buffer. A HEAP OVERFLOW on the presenter's own scratch,
+    # reachable by presenting any surface larger than the framebuffer.
+    # ⚠ THE `rows` CLAMP AT THE BOTTOM DID NOT COVER THIS and reading it as though it did is the
+    # trap: it bounds the WRITE TO THE DEVICE, and by then the overflowing stores have all happened.
+    # ⇒ Crop the SOURCE to what fits, which is what the letterbox already does on the other axis.
+    # Cropping rather than refusing keeps the presenter best-effort, exactly as `rows` always has.
+    var cols = sw;
+    if (xoff + cols * scale > xres) { cols = (xres - xoff) / scale; }
+    if (cols < 0) { cols = 0; }
+    var srows = sh;
+    if (yoff + srows * scale > yres) { srows = (yres - yoff) / scale; }
+    if (srows < 0) { srows = 0; }
+    var row_bytes = cols * (scale * bpp_bytes);
 
     var sy = 0;
-    while (sy < sh) {
+    while (sy < srows) {
         var src_row = srcpx + sy * srcstride;
         var dy0 = yoff + sy * scale;
         var first = blit + dy0 * pitch + xoff * bpp_bytes;
         var dx = first;
         var sx = 0;
-        while (sx < sw) {
+        while (sx < cols) {
             var so = sx * 4;
             if (bpp == 16) {
                 var b = load8(src_row + so);
@@ -381,8 +403,9 @@ fn sd_present_blit(p, s): i64 {
         sy = sy + 1;
     }
 
-    var rows = sh * scale;
+    var rows = srows * scale;
     if (yoff + rows > yres) { rows = yres - yoff; }
+    if (rows < 0) { rows = 0; }
     syscall(SYS_LSEEK, fd, yoff * pitch, 0);                    # lseek SEEK_SET
     syscall(SYS_WRITE, fd, blit + yoff * pitch, rows * pitch);  # write active band
     return SADISH_OK;

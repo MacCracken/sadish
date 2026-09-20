@@ -5,6 +5,104 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.1] - 2026-09-20 — the audit release: four crashes, a heap overflow and a hang
+
+A P-1 sweep of `src/` across ten lenses — signed shifts, overflow, division, memory safety,
+allocation discipline, entry guards, hostile input, performance, duplication and gate coverage —
+raised 44 findings at 25 distinct sites. This is the correctness and hardening half, repaired.
+
+⛔ **Rendering does not move.** A 340-measurement oracle across fills (both rules, both AA engines),
+all three strokers, dashes, clips, gradient paint (3 kinds × 3 spreads), pattern paint (4 spreads +
+a scale matrix + a negative-determinant flip), both premultiplied sinks and flatten geometry diffs
+to **zero** against 0.11.0 — every ink total, weighted checksum, point count, verdict and coordinate
+checksum identical. 35 RUN suites green (34 + the new one); `lint`, `vet`, `fmt`, `distlib --check`
+and the aarch64 + AGNOS cross-builds clean.
+
+### Fixed — `sd_gradient_add_stop` on a pattern was a null-pointer WRITE
+
+⛔⛔ **The crash this release exists for, and it is 0.11.0's.** `sd_pattern_new` leaves the stops
+pointer **0** — that is exactly why a pattern costs one allocation where a gradient costs three.
+`sd_gradient_add_stop` never checked the kind and did `store64(stops + i * 16, o)` straight through
+it. One public call on a paint introduced four days ago, and the process dies.
+⇒ It now answers `SADISH_ERR_UNSUPPORTED` — the paint is valid and the argument is valid; stops are
+simply not a thing a pattern has. MUTATION-PROVED: deleting that one line makes
+`programs/harden_test.cyr` exit **139 (SIGSEGV)**.
+
+### Fixed — `sd_present_blit` overran its scratch, and trapped on a 0-dimension source
+
+⛔ **A heap overflow.** The presenter's scratch is exactly `pitch * yres` bytes. Present a surface
+LARGER than the display and `scale` computes 0, is raised to 1, `xoff` clamps to 0 — and the column
+loop then ran all `sw` source columns across a narrower row, off the end of the row and, row after
+row, off the end of the whole buffer. ⚠ **The `rows` clamp at the bottom does not cover this**, and
+reading it as though it does is the trap: it bounds the WRITE TO THE DEVICE, by which point every
+overflowing store has already happened. The source is now CROPPED to what fits — the same
+best-effort letterboxing `rows` has always done on the other axis.
+⛔ **And a trap.** `xres / sw` and `yres / sh` take a surface dimension as the DIVISOR.
+`sd_surface_new` refuses `w <= 0`, but a surface record is a public layout consumers build
+themselves (dhancha's `dh_surface_wrap`), so a 0 is reachable from outside and the divide kills the
+process. Both dimensions are now checked.
+
+### Fixed — `(w * h) * 4` wrapped, and the record published the lie
+
+⛔ `sd_surface_new` and `sd_canvas_new` computed their allocation size in unchecked i64.
+`w = 2^62 + 1000, h = 1` asks for **4,000 bytes**, `sd_alloc` says yes, and the record then
+publishes a width of 4.6e18 with a wrapped stride over that 4,000-byte block. The first `sd_plot`
+writes wherever the arithmetic lands. ⚠ `lib/alloc.cyr`'s `ALLOC_MAX` cannot catch this — the whole
+point of a wrap is that the request looks small.
+⇒ New `SD_DIM_MAX` = 2^29 and `SD_PIXELS_MAX` = 2^29, checked **before** either multiply, so the
+product cannot leave i64 (2^29 × 2^29 × 4 = 2^60) and cannot leave the allocator.
+
+### Fixed — the fill's per-curve flatten ctx declared 8,192 slots over a 4,096-slot buffer
+
+0.10.0 halved the point stores to `SD_FLATTEN_PCAP` and fixed all four `store64(fctx + 16, …)`
+sites in `stroke.cyr` — and **missed the two in `raster.cyr`**, which kept declaring
+`SD_FLATTEN_CAP`. ⚠ Not reachable today (one curve emits at most 2^`SD_FLATTEN_MAX_DEPTH` = 256
+points and the fill's ctx cannot grow), so this is a latent OOB rather than a live one — it becomes
+real the moment anyone raises the depth cap. Said plainly rather than filed as a crash.
+
+### Fixed — five null-argument asymmetries that faulted where a sibling refused
+
+Each of these dereferenced an argument its own twin checked. Every one was a SIGSEGV:
+`sd_canvas_clear(0)` (every other canvas entry answers `SADISH_ERR_BOUNDS`);
+`sd_surface_pixel_at(0, …)` (its twin `sd_surface_rgba_at` has always answered 0);
+`sd_gradient_stop_count(0)` — ⛔ **and `sd_gradient_color_at`'s own header told callers to use it to
+tell a null paint apart from a stop-less one**, advice that was unfollowable because the call it
+named dereferenced the 0 it was meant to detect; the five path builders; and `sd_path_flatten`, the
+one path-taking entry with no check.
+
+### Fixed — `sd_matrix_rotate` did not terminate on a large angle
+
+⛔ CORDIC's range reduction was `while (t > pi) { t = t - two_pi; }` — **O(|theta| / 2π) iterations
+on a public entry accepting any i64.** `sd_matrix_rotate(2^62)` is ~1.1e13 subtractions: not slow,
+absent. A consumer deriving an angle from untrusted data hands that straight in.
+⭐ The replacement computes the same integer `k` the loop subtracted, in one division, against the
+same **rounded** `two_pi` — reducing against anything more accurate would move every angle.
+MEASURED: **4,005,630 angles** compared old-loop against new-formula — dense across the folds, exact
+period multiples ±3, and large magnitudes — **zero mismatches**. `sd_matrix_rotate(2^62)` now
+returns instantly.
+
+### Changed — `sd_hline` / `sd_vline` hoist their loop invariants
+
+Both re-masked the colour three times and called `sd_alpha_of` a fourth **per pixel** to write the
+same four bytes. Hoisted; `sd_vline` also steps its offset by the stride instead of recomputing
+`y * stride + x * 4`. Byte-identical by construction — same values, computed once.
+
+### Added — `programs/harden_test.cyr` (63 checks)
+
+Every check is a call that crashed the process or corrupted memory before this release. ⚠ The audit
+found that **none of these guards were asserted anywhere**, which is half of why they were easy to
+get wrong — a guard with no gate is a guard the next refactor deletes. Group D drives
+`sd_present_blit` over a regular file, never `/dev/fb0`.
+
+### Not in this release
+
+The sweep's performance findings beyond the two above are **deliberately deferred**, not dismissed:
+the crossings insertion sort (O(nc²) per sub-scanline, in both `raster.cyr` and `stroke.cyr`),
+`sd_canvas_fill_union` sweeping the whole canvas per piece, the fill rescanning its entire edge list
+per sub-scanline, the clip node reloaded per pixel, and the mapped pattern blit's per-pixel long
+division. Each is a real win and each is a rewrite that needs its own before/after measurement
+alongside a byte-identical proof. They are in `docs/development/roadmap.md`.
+
 ## [0.11.0] - 2026-09-20 — pattern paint, an API reference, and the device line gets a gate
 
 Three roadmap items close: the **image/pattern paint** capability gap, the **"no API reference"**

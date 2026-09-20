@@ -59,6 +59,12 @@ var SD_CANVAS_SIZE            = 48;
 fn sd_canvas_new(w, h): i64 {
     if (w <= 0) { return 0; }
     if (h <= 0) { return 0; }
+    # ⛔ w * h wraps exactly as sd_surface_new's did — see SD_DIM_MAX in src/surface.cyr. A canvas
+    # publishes its width as the STRIDE, so a wrapped coverage block is indexed by a number the
+    # record itself hands every reader.
+    if (w > SD_DIM_MAX) { return 0; }
+    if (h > SD_DIM_MAX) { return 0; }
+    if (w * h > SD_PIXELS_MAX) { return 0; }
     var cv = sd_alloc(SD_CANVAS_SIZE);
     if (cv == 0) { return 0; }
     var n = w * h;
@@ -125,6 +131,9 @@ fn sd_canvas_coverage_at(cv, x, y): i64 {
 # canvas sd_canvas_new makes, where stride == width and the two walks are the same 70 bytes in the
 # same order. Gated by programs/clip_pitch_test.cyr.
 fn sd_canvas_clear(cv): i64 {
+    # ⚠ 0.11.1: the one canvas entry that dereferenced without checking, while every sibling —
+    # fill, blit, clip push/pop, set_aa — answers SADISH_ERR_BOUNDS. The asymmetry WAS the bug.
+    if (cv == 0) { return SADISH_ERR_BOUNDS; }
     var w = load64(cv + SD_CANVAS_WIDTH_OFFSET);
     var h = load64(cv + SD_CANVAS_HEIGHT_OFFSET);
     var cov = load64(cv + SD_CANVAS_COVERAGE_OFFSET);
@@ -745,7 +754,7 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
         if (verb == SD_VERB_QUADTO) {
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
+            store64(fctx + 16, SD_FLATTEN_PCAP);
             if (has_cur != 0) {     # no moveto yet: skip the curve, keep the streams in step
                 if (fop == 0) {
                     sd_flatten_op_begin();
@@ -764,7 +773,7 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
         if (verb == SD_VERB_CUBICTO) {
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
+            store64(fctx + 16, SD_FLATTEN_PCAP);
             if (has_cur != 0) {     # no moveto yet: skip the curve, keep the streams in step
                 if (fop == 0) {
                     sd_flatten_op_begin();
@@ -1240,7 +1249,8 @@ fn sd_canvas_clip_pop(cv): i64 {
 # ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
 # 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700; 0.7.1 -> 701;
-# 0.7.2 -> 702; 0.8.0 -> 800; 0.9.0 -> 900; 0.9.1 -> 901; 0.10.0 -> 1000; 0.11.0 -> 1100.
+# 0.7.2 -> 702; 0.8.0 -> 800; 0.9.0 -> 900; 0.9.1 -> 901; 0.10.0 -> 1000; 0.11.0 -> 1100;
+# 0.11.1 -> 1101.
 #
 # ⛔⛔ THIS WAS STALE FOR TWO RELEASES AND NOW HAS A GATE THAT WILL NOT LET IT HAPPEN AGAIN.
 # It returned 900 through 0.9.1 AND 0.10.0 — a consumer probing the library it had linked was told
@@ -1254,5 +1264,5 @@ fn sd_canvas_clip_pop(cv): i64 {
 # ================================================================
 # @public
 fn sadish_version(): i64 {
-    return 1100;
+    return 1101;
 }

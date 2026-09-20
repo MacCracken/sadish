@@ -1,0 +1,195 @@
+# programs/harden_test.cyr — RUN test for 0.11.1's hardening: the refusals that replaced a fault.
+#
+# ⛔ WHAT THIS SUITE OWNS. Every check here is a call that CRASHED THE PROCESS or corrupted memory
+# before 0.11.1. They are gathered in one file because they share a shape, not a module: a public
+# entry that trusted an argument its siblings checked. A guard with no gate is a guard the next
+# refactor deletes, and the audit that found these also found that none of them were asserted
+# anywhere — so the gate is half the fix.
+#
+#   A  sd_gradient_add_stop on a PATTERN — a null-pointer WRITE (a pattern has no stop array)
+#   B  the null-argument asymmetries: sd_gradient_stop_count, sd_canvas_clear, sd_surface_pixel_at,
+#      the five path builders, sd_path_flatten
+#   C  the size-computation wraps: sd_surface_new / sd_canvas_new published a record whose declared
+#      dimensions had nothing to do with the block actually allocated
+#   D  sd_present_blit's two: a 0-dimension source TRAPPED on an integer divide, and a source larger
+#      than the display overran the presenter's scratch
+#
+# ⛔ NOTHING HERE TOUCHES /dev/fb0. Group D drives sd_present_blit over a REGULAR FILE through
+# sd_present_open_path, exactly as programs/present_open_test.cyr does, and never calls
+# sd_present_open. Do not edit it into doing so.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "harden_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+var ONE = 65536;
+
+fn main(): i64 {
+    alloc_init();
+
+    # ── A) sd_gradient_add_stop ON A PATTERN ───────────────────────
+    # ⛔⛔ THE CRASH THIS RELEASE EXISTS FOR. sd_pattern_new leaves the stops pointer 0 — that is
+    # the whole reason a pattern is ONE allocation and a gradient is three. add_stop then did
+    # `store64(stops + i * 16, o)` straight through it.
+    var src = sd_surface_new(2, 2);
+    check(src != 0, 1);                                                # 1
+    sd_plot(src, 0, 0, sd_rgb(255, 0, 0));
+    var pat = sd_pattern_new(src);
+    check(pat != 0, 1);                                                # 2
+    check(sd_paint_is_pattern(pat), 1);                                # 3
+    check(sd_gradient_add_stop(pat, 0, sd_rgb(1, 2, 3)), SADISH_ERR_UNSUPPORTED);   # 4
+    check(sd_gradient_add_stop(pat, ONE, sd_rgb(4, 5, 6)), SADISH_ERR_UNSUPPORTED); # 5
+    # ⚠ AND THE REFUSAL COSTS THE PATTERN NOTHING — no count moved, no dirty flag set, and it still
+    # paints. A guard that leaves the record half-mutated is not a guard.
+    check(sd_gradient_stop_count(pat), 0);                             # 6
+    var cv = sd_canvas_new(4, 4);
+    memset(sd_canvas_coverage(cv), 255, 16);
+    var dst = sd_surface_new(4, 4);
+    sd_clear(dst, sd_rgb(9, 9, 9));
+    check(sd_canvas_blit_paint_at(cv, dst, pat, 0, 0), SADISH_OK);     # 7
+    check(sd_surface_pixel_at(dst, 0, 0), sd_rgb(255, 0, 0));          # 8 — still paints
+    # a real gradient is untouched by the new branch
+    var g = sd_gradient_linear(0, 0, 4 * ONE, 0);
+    check(sd_gradient_add_stop(g, 0, sd_rgb(255, 0, 0)), SADISH_OK);   # 9
+    check(sd_gradient_add_stop(g, ONE, sd_rgb(0, 0, 255)), SADISH_OK); # 10
+    check(sd_gradient_stop_count(g), 2);                               # 11
+
+    # ── B) THE NULL-ARGUMENT ASYMMETRIES ────────────────────────
+    # Each of these dereferenced its argument while a sibling checked. Every line below was a
+    # SIGSEGV before 0.11.1.
+    check(sd_gradient_stop_count(0), 0);                               # 12
+    check(sd_gradient_add_stop(0, 0, 0), SADISH_ERR_BOUNDS);           # 13
+    check(sd_canvas_clear(0), SADISH_ERR_BOUNDS);                      # 14
+    check(sd_surface_pixel_at(0, 0, 0), 0);                            # 15
+    check(sd_surface_rgba_at(0, 0, 0), 0);                             # 16 — its twin, unchanged
+    check(sd_path_moveto(0, ONE, ONE), SADISH_ERR_BOUNDS);             # 17
+    check(sd_path_lineto(0, ONE, ONE), SADISH_ERR_BOUNDS);             # 18
+    check(sd_path_quadto(0, ONE, ONE, ONE, ONE), SADISH_ERR_BOUNDS);   # 19
+    check(sd_path_cubicto(0, ONE, ONE, ONE, ONE, ONE, ONE), SADISH_ERR_BOUNDS); # 20
+    check(sd_path_close(0), SADISH_ERR_BOUNDS);                        # 21
+    check(sd_path_flatten(0, ONE >> 2), 0);                            # 22 — 0, as an empty path is
+    # ⚠ AND A REAL PATH STILL BUILDS. The guards are a branch on 0, not a behaviour change.
+    var p = sd_path_new();
+    check(sd_path_moveto(p, 0, 0), SADISH_OK);                         # 23
+    check(sd_path_lineto(p, 4 * ONE, 0), SADISH_OK);                   # 24
+    check(sd_path_quadto(p, 4 * ONE, 4 * ONE, 0, 4 * ONE), SADISH_OK); # 25
+    check(sd_path_cubicto(p, 0, 2 * ONE, ONE, ONE, 0, 0), SADISH_OK);  # 26
+    check(sd_path_close(p), SADISH_OK);                                # 27
+    check(sd_path_verb_count(p), 5);                                   # 28
+    check(sd_path_point_count(p), 7);                                  # 29
+
+    # ── C) THE SIZE-COMPUTATION WRAPS ─────────────────────────
+    # ⛔ (w * h) * 4 IS i64 ARITHMETIC AND IT WRAPS. w = 2^62 + 1000, h = 1 asked for 4,000 bytes,
+    # sd_alloc SAID YES, and the record published a width of 4.6e18 over it. The first draw wrote
+    # wherever that arithmetic landed. The ceiling below is what makes the product unable to leave
+    # i64 at all, and it is checked BEFORE either multiply.
+    check(sd_surface_new(4611686018427388904, 1), 0);                  # 30 — the wrap, refused
+    check(sd_canvas_new(4611686018427388904, 1), 0);                   # 31
+    check(sd_surface_new(SD_DIM_MAX + 1, 1), 0);                       # 32 — one past the edge cap
+    check(sd_canvas_new(SD_DIM_MAX + 1, 1), 0);                        # 33
+    check(sd_surface_new(SD_DIM_MAX, SD_DIM_MAX), 0);                  # 34 — product cap
+    check(sd_canvas_new(SD_DIM_MAX, SD_DIM_MAX), 0);                   # 35
+    check(sd_surface_new(0, 4), 0);                                    # 36 — the old guards stand
+    check(sd_surface_new(4, 0), 0);                                    # 37
+    check(sd_canvas_new(0 - 4, 4), 0);                                 # 38
+    # ⚠ AND ORDINARY SIZES ARE UNTOUCHED — a ceiling that refused real work would be its own defect.
+    var ok1 = sd_surface_new(640, 480);
+    check(ok1 != 0, 1);                                                # 39
+    check(sd_surface_width(ok1), 640);                                 # 40
+    check(sd_surface_stride(ok1), 640 * 4);                            # 41
+    var ok2 = sd_canvas_new(1920, 1080);
+    check(ok2 != 0, 1);                                                # 42
+    check(sd_canvas_stride(ok2), 1920);                                # 43
+
+    # ── D) sd_present_blit's TWO ───────────────────────────
+    # ⛔ OVER A REGULAR FILE, NEVER THE DISPLAY. sd_present_open_path on a file under build/ gives a
+    # presenter whose ioctls all fail, so the probe's fallbacks make it 640x480x32 — a fixed,
+    # known geometry to test the crop against.
+    var fpath = "build/harden_test.fb";
+    var mk = syscall(2, fpath, 577, 420);      # open O_WRONLY|O_CREAT|O_TRUNC, 0644
+    if (mk >= 0) { syscall(3, mk); }
+    var pres = sd_present_open_path(fpath);
+    check(pres != 0, 1);                                               # 44
+    check(load64(pres + SD_PRES_XRES_OFFSET), 640);                    # 45 — the fallback geometry
+    check(load64(pres + SD_PRES_YRES_OFFSET), 480);                    # 46
+    # D1. A 0-DIMENSION SOURCE. sd_surface_new refuses one, so the record is hand-built — which is
+    # exactly how it is reachable in the wild: a surface record is a public layout a consumer makes
+    # itself (dh_surface_wrap). Before 0.11.1 `xres / sw` TRAPPED the process here.
+    var zs = sd_alloc(SD_SURFACE_SIZE);
+    check(zs != 0, 1);                                                 # 47
+    store64(zs + SD_SURFACE_WIDTH_OFFSET, 0);
+    store64(zs + SD_SURFACE_HEIGHT_OFFSET, 8);
+    store64(zs + SD_SURFACE_PIXELS_OFFSET, sd_alloc(64));
+    store64(zs + SD_SURFACE_STRIDE_OFFSET, 0);
+    check(sd_present_blit(pres, zs), SADISH_ERR_BOUNDS);               # 48 — ⛔ was a TRAP
+    store64(zs + SD_SURFACE_WIDTH_OFFSET, 8);
+    store64(zs + SD_SURFACE_HEIGHT_OFFSET, 0);
+    check(sd_present_blit(pres, zs), SADISH_ERR_BOUNDS);               # 49 — the other axis
+    check(sd_present_blit(pres, 0), SADISH_ERR_BOUNDS);                # 50
+    check(sd_present_blit(0, zs), SADISH_ERR_BOUNDS);                  # 51
+    # D2. A SOURCE BIGGER THAN THE DISPLAY. 800x600 into 640x480: scale computes 0, is raised to 1,
+    # and the column loop used to run all 800 across a 640-wide scratch row — off the end of the
+    # row, then off the end of the 640*480*4 buffer entirely. It must now CROP and return OK.
+    # ⚠ The proof that it cropped is that the process is still alive to run check #53: a heap
+    # overflow of that size does not politely return.
+    var big = sd_surface_new(800, 600);
+    check(big != 0, 1);                                                # 52
+    sd_clear(big, sd_rgb(200, 100, 50));
+    check(sd_present_blit(pres, big), SADISH_OK);                      # 53 — ⛔ was a HEAP OVERFLOW
+    # and an ordinary, smaller source still presents
+    var small = sd_surface_new(320, 240);
+    check(small != 0, 1);                                              # 54
+    sd_clear(small, sd_rgb(10, 20, 30));
+    check(sd_present_blit(pres, small), SADISH_OK);                    # 55
+    # exactly-fitting is neither cropped nor refused
+    var exact = sd_surface_new(640, 480);
+    check(exact != 0, 1);                                              # 56
+    sd_clear(exact, sd_rgb(7, 7, 7));
+    check(sd_present_blit(pres, exact), SADISH_OK);                    # 57
+    check(sd_present_close(pres), SADISH_OK);                          # 58
+
+    # ── E) sd_matrix_rotate's RANGE REDUCTION TERMINATES ───────────
+    # ⛔ THE OLD REDUCTION WAS `while (t > pi) { t = t - two_pi; }` — O(|theta| / 2pi) iterations on
+    # a PUBLIC entry taking any i64. At 2^62 that is ~1.1e13 subtractions: the call never returns.
+    # ⚠ THE ASSERTION IS THAT THIS FILE FINISHES. A suite cannot time itself here; what it can do is
+    # make the call, and a regression makes the whole suite hang rather than fail — which CI's own
+    # timeout reports. That is the honest shape of a termination gate, and it is said out loud so a
+    # reader does not mistake a green run for a measured one.
+    check(sd_matrix_rotate(4611686018427387904) != 0, 1);              # 59 — 2^62 radians
+    check(sd_matrix_rotate(0 - 4611686018427387904) != 0, 1);          # 60 — and negative
+    # ⭐ AND THE ANSWER IS UNCHANGED for ordinary angles: the replacement computes the same k the
+    # loop subtracted, against the same rounded two_pi. Verified over 4,005,630 angles offline;
+    # these three are the in-tree witnesses, from programs/rotate_test.cyr's own constants.
+    check(sd_cos(0), SD_ONE);                                          # 61
+    check(sd_cos(102944) < 64, 1);                                     # 62 — cos(pi/2) ~ 0
+    check(sd_sin(102944) > SD_ONE - 64, 1);                            # 63 — sin(pi/2) ~ 1
+
+    if (g_fails == 0) {
+        var ok = "harden_test: PASS (pattern stops, null guards, size wraps, present crop, rotate)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "harden_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

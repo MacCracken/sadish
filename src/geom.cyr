@@ -279,9 +279,25 @@ fn sd_cordic(theta, want_sin): i64 {
     var two_pi = 411775;
     var pi = 205887;
     var half_pi = 102944;
+    # ⛔⛔ THIS WAS A HANG, NOT A SLOW PATH (0.11.1). The reduction was
+    #     while (t > pi) { t = t - two_pi; }   while (t < 0 - pi) { t = t + two_pi; }
+    # — O(|theta| / 2pi) iterations on a PUBLIC entry that accepts any i64. sd_matrix_rotate(2^62)
+    # is ~1.1e13 subtractions: not slow, ABSENT. A consumer deriving an angle from untrusted data
+    # (a transform in an SVG, a font's italic angle) hands that straight in.
+    # ⭐ THE REPLACEMENT IS THE SAME ARITHMETIC, NOT AN APPROXIMATION OF IT. The old loop ended at
+    # t = theta - k * two_pi for the exact integer k it happened to subtract; this computes that
+    # same k in one division. ⚠ It matters that two_pi stays the ROUNDED 411775 and is not
+    # re-derived: k * 411775 is what the loop accumulated, so reducing against anything more
+    # accurate would move every angle. Byte-identical output is the requirement, not better output.
     var t = theta;
-    while (t > pi) { t = t - two_pi; }
-    while (t < 0 - pi) { t = t + two_pi; }
+    if (t > pi) {
+        var k = (t - pi + two_pi - 1) / two_pi;      # ceil((t - pi) / two_pi), both operands > 0
+        t = t - k * two_pi;
+    }
+    if (t < 0 - pi) {
+        var k2 = (0 - t - pi + two_pi - 1) / two_pi;
+        t = t + k2 * two_pi;
+    }
     # Fold [-pi,pi] into [-pi/2, pi/2]; a fold past +-pi/2 flips both signs.
     var flip = 0;
     if (t > half_pi) { t = t - pi; flip = 1; }

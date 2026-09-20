@@ -72,13 +72,20 @@ fn sd_hline(s, x0, x1, y, color): i64 {
     if (start < 0) { start = 0; }
     if (end >= w) { end = w - 1; }
     var base = y * load64(s + SD_SURFACE_STRIDE_OFFSET);
+    # ⭐ 0.11.1: the four channel values are LOOP-INVARIANT — hoisted. Each iteration used to re-mask
+    # the colour three times and call sd_alpha_of a fourth, per pixel, to write the same four bytes.
+    # ⚠ Byte-identical output by construction: same values, computed once.
+    var cb = color & 255;
+    var cg = (color >> 8) & 255;
+    var cr = (color >> 16) & 255;
+    var ca = sd_alpha_of(color);
     var x = start;
     while (x <= end) {
         var off = base + x * 4;
-        store8(px + off, color & 255);
-        store8(px + off + 1, (color >> 8) & 255);
-        store8(px + off + 2, (color >> 16) & 255);
-        store8(px + off + 3, sd_alpha_of(color));   # v0.5.0: honour alpha (0 == opaque)
+        store8(px + off, cb);
+        store8(px + off + 1, cg);
+        store8(px + off + 2, cr);
+        store8(px + off + 3, ca);
         x = x + 1;
     }
     return 0;
@@ -97,13 +104,19 @@ fn sd_vline(s, x, y0, y1, color): i64 {
     if (start > end) { var tmp = start; start = end; end = tmp; }
     if (start < 0) { start = 0; }
     if (end >= h) { end = h - 1; }
+    # ⭐ 0.11.1: same invariant hoist as sd_hline's — see the note there.
+    var vb = color & 255;
+    var vg = (color >> 8) & 255;
+    var vr = (color >> 16) & 255;
+    var va = sd_alpha_of(color);
     var y = start;
+    var voff = start * stride + x * 4;
     while (y <= end) {
-        var off = y * stride + x * 4;
-        store8(px + off, color & 255);
-        store8(px + off + 1, (color >> 8) & 255);
-        store8(px + off + 2, (color >> 16) & 255);
-        store8(px + off + 3, sd_alpha_of(color));   # v0.5.0: honour alpha (0 == opaque)
+        store8(px + voff, vb);
+        store8(px + voff + 1, vg);
+        store8(px + voff + 2, vr);
+        store8(px + voff + 3, va);
+        voff = voff + stride;
         y = y + 1;
     }
     return 0;

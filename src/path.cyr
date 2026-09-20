@@ -517,6 +517,7 @@ fn _sd_path_reserve(path, nv, np): i64 {
 # 0.7.0 and here alike). Through 0.7.0 the refusal killed the process at the moveto instead, so
 # this shape was not reachable; the clean return code is what makes it worth saying.
 fn sd_path_moveto(path, x, y): i64 {
+    if (path == 0) { return SADISH_ERR_BOUNDS; }
     var r = _sd_path_reserve(path, 1, 1);
     if (r != SADISH_OK) { return r; }
     sd_path_push_verb(path, SD_VERB_MOVETO);
@@ -526,6 +527,7 @@ fn sd_path_moveto(path, x, y): i64 {
 # @public — straight line to (x, y) from the current point.
 # SADISH_OK / SADISH_ERR_OOM (verbs and points unchanged).
 fn sd_path_lineto(path, x, y): i64 {
+    if (path == 0) { return SADISH_ERR_BOUNDS; }
     var r = _sd_path_reserve(path, 1, 1);
     if (r != SADISH_OK) { return r; }
     sd_path_push_verb(path, SD_VERB_LINETO);
@@ -535,6 +537,7 @@ fn sd_path_lineto(path, x, y): i64 {
 # @public — quadratic Bézier: control (cx, cy), end (x, y).
 # SADISH_OK / SADISH_ERR_OOM (verbs and points unchanged).
 fn sd_path_quadto(path, cx, cy, x, y): i64 {
+    if (path == 0) { return SADISH_ERR_BOUNDS; }
     var r = _sd_path_reserve(path, 1, 2);
     if (r != SADISH_OK) { return r; }
     sd_path_push_verb(path, SD_VERB_QUADTO);
@@ -545,6 +548,7 @@ fn sd_path_quadto(path, cx, cy, x, y): i64 {
 # @public — cubic Bézier: controls (c1x,c1y),(c2x,c2y), end (x, y).
 # SADISH_OK / SADISH_ERR_OOM (verbs and points unchanged).
 fn sd_path_cubicto(path, c1x, c1y, c2x, c2y, x, y): i64 {
+    if (path == 0) { return SADISH_ERR_BOUNDS; }
     var r = _sd_path_reserve(path, 1, 3);
     if (r != SADISH_OK) { return r; }
     sd_path_push_verb(path, SD_VERB_CUBICTO);
@@ -555,6 +559,7 @@ fn sd_path_cubicto(path, c1x, c1y, c2x, c2y, x, y): i64 {
 
 # @public — close the current subpath (back to its moveto). No point.
 fn sd_path_close(path): i64 {
+    if (path == 0) { return SADISH_ERR_BOUNDS; }
     return sd_path_push_verb(path, SD_VERB_CLOSE);
 }
 
@@ -1219,6 +1224,9 @@ fn sd_flatten_cubic(ctx, p0, p1, p2, p3, tol, depth): i64 {
 # of them was cut to its chord. MEASURED, 4,096 maximally non-flat quads: 83,623,976 B in
 # 3,133,451 allocations on 0.7.0, 3,076,136 B in 65,287 here (27x the bytes, 48x the calls).
 fn sd_path_flatten(path, tol): i64 {
+    # ⚠ 0.11.1: the one path-taking entry with no null check. It answers 0 for an empty path
+    # already, so a null one answers 0 too — the caller's test is unchanged either way.
+    if (path == 0) { return 0; }
     # ⛔ THE VERDICTS ARE CLEARED BEFORE THE EMPTY-PATH RETURN, AND THE OPERATION OPENS BEFORE IT
     # (0.7.1 repair). Through the first 0.7.1 draft both sat after it, so an empty path returned 0
     # carrying the PREVIOUS call's verdicts — and the header's own way of telling "empty" from

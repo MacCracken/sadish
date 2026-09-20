@@ -1,6 +1,6 @@
 # sadish roadmap
 
-**Where we are:** 0.11.0. 34 RUN suites green; `fmt`, `lint`, `vet` and `distlib --check` clean;
+**Where we are:** 0.11.1. 35 RUN suites green; `fmt`, `lint`, `vet` and `distlib --check` clean;
 `dist/sadish.cyr` in sync; toolchain pinned to **6.6.6**; the host build diagnostic-free and the
 aarch64 + AGNOS cross-builds gated. agnos's `tests/gpu/refagree.cyr` holds the default fill
 byte-identical across 200 random paths — green through every release since 0.6.0, and the standing
@@ -34,6 +34,7 @@ The measurements and contracts live in [`../../CHANGELOG.md`](../../CHANGELOG.md
 | v0.9.1 | the 6.6.6 pin; a format gate that actually gates; portable syscall constants + an aarch64/AGNOS cross-build |
 | v0.10.0 | `SdPolyline` points inline — a flatten is 5 allocations, not 20,004; `sd_path_transform`; `sd_path_bounds` |
 | v0.11.0 | pattern paint + `SD_SPREAD_NONE`; `docs/api.md`; the `/dev/fb0` device line gated |
+| v0.11.1 | the audit release — four crashes, a heap overflow, a size-wrap and a non-terminating rotate |
 
 ---
 
@@ -99,6 +100,29 @@ before 1.0**, because adding a verb after it is an ABI change.
 `src/paint.cyr`, `src/raster.cyr`). No multiply/screen/darken. ⚠ UNKNOWN whether the consumers want
 them: a dhancha/crab question, not a sadish one, and the answer decides whether this belongs in 1.0
 at all.
+
+### Performance — found by the 0.11.1 audit, deliberately deferred
+
+⚠ Each of these is a REAL win and a REWRITE. 0.11.1 took only the two that were also correctness
+bugs (CORDIC's non-terminating reduction, and the per-pixel colour unpack in `sd_hline`/`sd_vline`).
+The rest need their own before/after measurement alongside a byte-identical rendering proof, which
+is why they are here and not in that release. VERIFIED against the tree at 0.11.1:
+
+- **The crossings insertion sort — O(nc²) per sub-scanline, in TWO places.** `src/raster.cyr` and
+  `src/stroke.cyr`'s flush carry the same sort. Cheap for a few crossings, quadratic for a
+  self-intersecting outline, which is exactly what an untrusted glyph can be.
+- **`sd_canvas_fill_union` sweeps the WHOLE canvas per piece.** The round stroker calls it once per
+  segment and per vertex, so a stroke is O(pieces × canvas area) regardless of the piece's size.
+  The largest single win on the list.
+- **The fill rescans its entire edge list for every sub-scanline of every row.** An active edge
+  table is the standard answer; it is also the biggest change.
+- **The clip node and mask base are re-loaded per pixel** in both coverage writers — loop-invariant.
+- **The mapped pattern blit runs a 16-bit long division per pixel** and discards all 16 fraction
+  bits (nearest sampling). A DDA would carry it, exactly as the radial gradient already does.
+
+⚠ Also raised and NOT yet settled: the dash walk iterates `segment_length / pattern_period` with no
+cap, so an attacker-chosen tiny period over a long path is unbounded work that is nonetheless
+"doing what was asked". Decide whether a cap belongs there before 1.0.
 
 ### Infrastructure
 

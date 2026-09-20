@@ -88,11 +88,30 @@ var SD_SURFACE_PIXELS_OFFSET = 16;
 var SD_SURFACE_STRIDE_OFFSET = 24;
 var SD_SURFACE_SIZE          = 32;
 
+# ⛔ THE DIMENSION CEILING (0.11.1) — what keeps a size computation inside i64 and inside the
+# allocator. SD_DIM_MAX is 2^29: the largest edge worth asking for, and small enough that
+# SD_DIM_MAX * SD_DIM_MAX * 4 = 2^60 cannot wrap. SD_PIXELS_MAX = 2^29 caps the PRODUCT, so a
+# surface's pixel block (4 B a pixel) stays under lib/alloc.cyr's 2 GiB ALLOC_MAX and a canvas's
+# coverage (1 B a pixel) does too. ⚠ Both sd_surface_new and sd_canvas_new check these; they are
+# the two places a caller's own number becomes an allocation size.
+var SD_DIM_MAX               = 536870912;
+var SD_PIXELS_MAX            = 536870912;
+
 # @public — allocate a w*h BGRA surface, cleared to transparent black (0).
 # Returns the SdSurface ptr, or 0 on OOM / bad dimensions.
 fn sd_surface_new(w, h): i64 {
     if (w <= 0) { return 0; }
     if (h <= 0) { return 0; }
+    # ⛔⛔ THE PRODUCT WRAPS, AND A WRAP PUBLISHES A LIAR (0.11.1). `(w * h) * 4` is i64 arithmetic
+    # with no check: w = 2^62 + 1000, h = 1 gives nbytes = 4000, sd_alloc SUCCEEDS, and the record
+    # then publishes width 4.6e18 over a 4,000 byte block with a wrapped stride. The first sd_plot
+    # writes wherever the arithmetic lands. lib/alloc.cyr's ALLOC_MAX cannot save this — the whole
+    # point of the wrap is that the request looks small.
+    # ⇒ Bound each dimension so the product cannot leave i64, and bound the product so it cannot
+    # leave ALLOC_MAX. SD_DIM_MAX^2 * 4 = 2^60, decades inside the type.
+    if (w > SD_DIM_MAX) { return 0; }
+    if (h > SD_DIM_MAX) { return 0; }
+    if (w * h > SD_PIXELS_MAX) { return 0; }
     var s = sd_alloc(SD_SURFACE_SIZE);
     if (s == 0) { return 0; }
     var nbytes = (w * h) * 4;
@@ -148,6 +167,10 @@ fn sd_put(px, w, h, x, y, color): i64 {
 # @public — read a pixel back as a packed 0x00RRGGBB color (alpha dropped).
 # Out-of-bounds reads return 0. The readback path for tests + coverage compositing.
 fn sd_surface_pixel_at(s, x, y): i64 {
+    # ⚠ 0.11.1: faulted on a null surface where its twin sd_surface_rgba_at (src/premul.cyr) has
+    # always answered 0. Two readers of the same bytes disagreeing about the same argument is the
+    # kind of asymmetry that only ever shows up in a consumer's crash report.
+    if (s == 0) { return 0; }
     var w = load64(s + SD_SURFACE_WIDTH_OFFSET);
     var h = load64(s + SD_SURFACE_HEIGHT_OFFSET);
     if (x < 0) { return 0; }
