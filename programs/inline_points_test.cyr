@@ -4,7 +4,7 @@
 # sd_alloc per point — and holds the COORDINATES THEMSELVES, 16 B a slot, from 0.9.0. The ABI break
 # and the accessors that close it (sd_path_point_x / sd_path_point_y / sd_path_verb_at) are
 # src/path.cyr's header; the byte figures the change was made for are
-# docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md and
+# docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md and
 # programs/path_cap_test.cyr group L (95 ASCII-shaped paths: 78,656 B -> 58,672 B, 2,783 sd_alloc
 # calls -> 285).
 #

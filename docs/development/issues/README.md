@@ -30,7 +30,7 @@ make a comment fit — `…-flatten-keeps-subdividing-…` resolves to nothing a
 ## What does not belong here
 
 - **A capability request.** That is a proposal — see
-  [`../proposals/2026-09-15-path-capacity-for-known-size-paths.md`](../proposals/2026-09-15-path-capacity-for-known-size-paths.md).
+  [`../proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md`](../proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md).
 - **A number you read rather than measured.** MEASURED means you ran it and can say with what.
 - **Anything that fits in one line of `CHANGELOG.md`.** Fix it and write the line.
 

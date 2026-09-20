@@ -77,7 +77,7 @@ if either the function or the test disagrees. The number cannot drift again.
 ### Added — `docs/api.md`, a real API reference
 
 VERIFIED at 0.10.0: every contract lived in a source header, so a consumer learned the library by
-reading `dist/sadish.cyr` — now 8,000+ lines. `docs/api.md` covers all **122** public functions by
+reading `dist/sadish.cyr` — now 8,000+ lines. `docs/api.md` covers the public surface by
 module, and front-loads the six cross-cutting rules most consumer bugs come from: 16.16 coordinates
 and why `>>` is not the shift you want; the allocation seam and what a refusal costs; **what a hook
 can still refuse after 0.10.0**; the integer error model and its overloaded codes; the
@@ -475,7 +475,7 @@ unchanged.
 
 ### Still open
 
-- `docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md` item 3 — **rekha
+- `docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md` item 3 — **rekha
   adoption**, which this repo cannot verify: `rekha/src/glyf.cyr` still calls `sd_path_new`. rekha's 23
   suites passing against this `dist/` says the change is COMPATIBLE, not that the ask is met.
 - Inline `(x, y)` storage in `SdPath` instead of `SdPoint` pointers — **0.9.0**, sequenced on its own
@@ -535,7 +535,7 @@ alone — documented since 0.7.1, checked only now.
 
 ### Changed — `sd_path_new_cap` sizes the two arrays SEPARATELY
 
-Item 1 of `docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md`. 0.7.1 shipped
+Item 1 of `docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md`. 0.7.1 shipped
 the two-argument call over ONE capacity field, so `n_points` reached the allocator only through `max()`
 and a glyph bought ~2x more verb slots than it uses. `SdPath` now carries two capacities in the SAME
 48 B record: `SD_PATH_CAP_OFFSET` (+32) for verbs and the new `SD_PATH_PCAP_OFFSET` (+40) for points —
@@ -594,7 +594,8 @@ detector with absolute ink constants rather than a geometry check.
   section: a truncated contour is still FILLED OPEN rather than refused (there is no flag on
   `SdPolyline`), and a stroke of a starved path reports through the return code but the filing asked for
   the contour itself to be refused or clearly degraded.
-- `docs/development/proposals/2026-09-15-path-capacity-…` — items 2 and 3: no in-tree adopter
+- `docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md` — items 2 and 3:
+  no in-tree adopter
   (`sd_path_new_cap`'s only callers are two test suites; sadish's own known-size path sites in
   `src/stroke.cyr` still call `sd_path_new`), and inline `(x, y)` storage instead of `SdPoint` pointers,
   which the proposal measures at a further 78,656 → 58,672 B and which is an `SdPath` ABI change.
@@ -646,7 +647,7 @@ for a whole draw must scope it. MEASURED, the 4,096-quad path through one `sd_ca
 
 ### Added — `sd_path_new_cap(n_verbs, n_points)`
 
-Closes `docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md`. An `SdPath` opened
+Closes `docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md`. An `SdPath` opened
 at a caller-known capacity instead of `SD_PATH_CAP` = 256 verbs + 256 points, for consumers that know the
 size before the first moveto (rekha converts a glyph outline per glyph, per label, per frame).
 ⚠ `SdPath` has ONE capacity field for both arrays, so the two arguments collapse to their max, clamped
@@ -887,7 +888,7 @@ Byte-identical on every canvas `sd_canvas_new` makes.
 - `docs/development/issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md`
   — `sd_path_new` / `sd_point_new` / `sd_path_flatten` store through unchecked `sd_alloc` results, so a
   hook that refuses faults inside sadish (SIGSEGV, rc 139).
-- `docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md` — `sd_path_new_cap`.
+- `docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md` — `sd_path_new_cap`.
 
 ### Verified
 

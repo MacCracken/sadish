@@ -2,7 +2,7 @@
 # arguments size the two arrays SEPARATELY, and each array doubles alone) and for 0.8.0's IN-TREE
 # ADOPTION of that call by src/stroke.cyr (group N).
 #
-# Closes the first item of docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md's
+# Closes the first item of docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md's
 # "Still open" section — *"allocate the verb and point arrays at exactly the given capacity"* — and,
 # with group N, the second: *"no in-tree adopter"*.
 #
@@ -220,7 +220,7 @@ fn cov_diff(a, b): i64 {
 # ---- the synthetic ASCII set ------------------------------------------------------------------
 # The same 95 glyph-shaped paths programs/flatten_bound_test.cyr builds: 1,768 verbs and 2,498
 # points in total, the largest 61 verbs — the shape rekha measured LiberationSans's printable ASCII
-# at (docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md). Each is moveto +
+# at (docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md). Each is moveto +
 # a linetos + b quadtos + close around a small circle, the quads bulging outward.
 fn glyph_lines(i): i64 {
     if (i == 0) { return 29; }

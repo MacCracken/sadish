@@ -1,15 +1,20 @@
 # sadish roadmap
 
-**Where we are:** 0.11.0. 34 RUN suites green, `fmt`/`lint`/`vet` clean, `dist/sadish.cyr` in
-sync, toolchain pinned to **6.6.6**, and the host build is diagnostic-free. 0.10.0 took the
-`SdPolyline` ABI break this file filed under "What 1.0 freezes", so the library now stores points
-ONE way; a fill and a styled or dashed stroke allocate NOTHING on the consumer's seam. agnos's `tests/gpu/refagree.cyr` holds the default fill byte-identical
-across 200 random paths — it has stayed green through every release since 0.6.0 and is the standing
+**Where we are:** 0.11.0. 34 RUN suites green; `fmt`, `lint`, `vet` and `distlib --check` clean;
+`dist/sadish.cyr` in sync; toolchain pinned to **6.6.6**; the host build diagnostic-free and the
+aarch64 + AGNOS cross-builds gated. agnos's `tests/gpu/refagree.cyr` holds the default fill
+byte-identical across 200 random paths — green through every release since 0.6.0, and the standing
 proof that a change did not move a pixel.
 
-Each entry below says how its claim was established: **VERIFIED** = read out of the tree while writing
-this, **MEASURED** = a figure from the release that shipped it, **UNKNOWN** = cannot be settled from
-inside this repo.
+⛔ **THIS FILE IS WHAT IS LEFT, NOT WHAT WAS DONE.** Finished work is deleted from here once
+[`../../CHANGELOG.md`](../../CHANGELOG.md) carries its measurements and a source header carries its
+contract — keeping both is how a roadmap becomes an archive nobody reads. The one exception is
+§"Decisions that still bind": rules a closed item left behind, which a later reader would otherwise
+undo in good faith.
+
+Each entry says how its claim was established: **VERIFIED** = read out of the tree while writing
+this · **MEASURED** = a figure from the release that shipped it · **UNKNOWN** = cannot be settled
+from inside this repo.
 
 ## Shipped
 
@@ -30,202 +35,157 @@ The measurements and contracts live in [`../../CHANGELOG.md`](../../CHANGELOG.md
 | v0.10.0 | `SdPolyline` points inline — a flatten is 5 allocations, not 20,004; `sd_path_transform`; `sd_path_bounds` |
 | v0.11.0 | pattern paint + `SD_SPREAD_NONE`; `docs/api.md`; the `/dev/fb0` device line gated |
 
+---
+
 ## The road to 1.0
 
-⚠ **1.0 is a promise not to break the ABI**, and 0.9.0 broke it three weeks into the project's life.
-Everything under "What 1.0 freezes" should be settled BEFORE the number is cut, because after it they
-are permanent.
+⚠ **1.0 is a promise not to break the ABI**, and this project has broken it twice in four days —
+0.9.0 on 2026-09-16, 0.10.0 on 2026-09-20, both inside its first eleven weeks. Both were right to
+take, and both were only cheap because no version promised otherwise. Everything under "What 1.0
+freezes" should be settled BEFORE the number is cut, because after it they are permanent.
+
+### What 1.0 freezes
+
+**The error model.** VERIFIED: `src/error.cyr` defines `SadishErr` — a 16 B record with a code and a
+detail pointer — and **nothing in the library returns one, takes one, or stores one.** Its only
+producer is `sadish_err_new`, its only consumers are the two accessors, and the only place producer
+meets consumer is `programs/oom_test.cyr` group G, which builds two and discards them. The
+`(ptr, err_out)` split `src/error.cyr` names as the record's purpose was never built: **zero**
+functions take an `err_out`. Meanwhile EVERY status-returning entry point in the library answers
+with a bare `SADISH_*` code, and always has.
+⇒ Either the record is the contract or the codes are. Shipping 1.0 with both freezes a half-built
+API permanently. ⚠ The cheap, honest answer is to **retire or demote the record** and document the
+codes as the contract — but that is a decision, not a default. `docs/api.md` §2.4 currently tells
+consumers to write against the codes, which pre-commits nothing.
+
+**The overloaded codes, if the codes win.** VERIFIED, and worth settling in the same breath:
+`SADISH_ERR_OOM` also means "a policy cap was hit", "a caller-supplied clip mask was null" and "a
+0-area canvas"; a constructor's `0` collapses bad-argument, refused-allocation and — for
+`sd_matrix_invert` — **genuinely singular**; `sd_path_flatten`'s `0` is *empty path* or *refused*,
+told apart only by a process-wide flag. `SADISH_ERR_UNSUPPORTED` had **zero** return sites until
+0.11.0. A caller cannot currently tell several of these apart, and 1.0 makes that permanent.
+
+**What a hook can refuse — narrowed by 0.10.0.** VERIFIED: a fill, and a styled or dashed stroke, no
+longer allocate on the `sd_alloc` seam at all, so a consumer's hook **cannot starve them**. Their
+`SADISH_ERR_OOM` returns remain reachable only through the process scratch and the edge list, which
+come from the global allocator and were never a hook's to refuse. ⚠ The ROUND stroker is the
+exception and still allocates per piece.
+⇒ The documented contract ("a refusal is a return code at every public entry point that can reach
+one") is still true and now covers far fewer situations. Decide whether that asymmetry is the
+shipped contract, or whether the round stroker should be brought in line. `src/alloc.cyr` states it
+either way and `programs/stroke_oom_test.cyr` gates both halves.
 
 ### Capability gaps
-
-**~~Image / pattern paint.~~ CLOSED in 0.11.0** — `sd_pattern_new(src)` is a fourth paint kind
-(`SD_PAINT_PATTERN`) beside the three gradients, sharing the record, the spread, the matrix and both
-blit entries. The blast radius was exactly as predicted: a kind plus a sampler, and the coverage
-engine never moved.
-⭐ Cheaper than the entry assumed: a pattern is **one 88 B allocation** (no stops, no ramp) and a
-pattern blit allocates **nothing**, on both the plain and matrix-mapped paths.
-⚠ **The two decisions, as taken.** Filtering is **nearest only**, but through a FIELD —
-`sd_pattern_set_filter` answers `SADISH_ERR_UNSUPPORTED` for anything else, so bilinear lands later
-without an ABI break and a consumer is never silently given a filter it did not ask for. Outside the
-rect reuses the gradient spreads and adds `SD_SPREAD_NONE` ("paint nothing"), which SKIPS a pixel
-rather than writing it transparent — the straight blit forces dst alpha 255, so those are different
-pictures. ⛔ A gradient may not have `SD_SPREAD_NONE`: it is the library's first ever use of
-`SADISH_ERR_UNSUPPORTED`.
-⚠ **Still open, deliberately:** bilinear itself, and the question of whether a pattern should ever
-carry its own tile rect rather than taking the whole source surface.
 
 **Arcs.** VERIFIED: the verb set is `SD_VERB_MOVETO / LINETO / QUADTO / CUBICTO / CLOSE`. SVG's `A`
 and every rounded rectangle are hand-rolled by the caller into cubics today. Blast radius: a verb tag
 plus a flattener; the verb/point stream pairing is already per-verb, and a new verb consumes its own
 point count. ⚠ The alternative is to declare arcs a CONSUMER concern and document the cubic
-approximation as the supported path — cheaper, and defensible for a core this size.
+approximation as the supported path — cheaper, and defensible for a core this size. **Decide which
+before 1.0**, because adding a verb after it is an ABI change.
 
-**~~`sd_path_transform`.~~ CLOSED in 0.10.0** — `sd_path_transform(path, m)` affines every point in
-place and allocates nothing, because 0.9.0's inline slots made it a read, six multiplies and a write.
-MEASURED against the loop it replaces on a 7-point path: the hand-rolled `sd_matrix_apply` rebuild
-costs 14 `sd_alloc` calls and 224 B, this costs 0 and 0. Gated point-by-point against
-`sd_matrix_apply` across five matrices (`programs/transform_test.cyr` group D).
+**Pattern paint's two follow-ons.** 0.11.0 shipped the kind; these were deliberately left.
 
-**~~Path bounds.~~ CLOSED in 0.10.0** — `sd_path_bounds(path, out)` writes four 16.16 words to a
-caller's 32 B buffer. ⚠ RECOMPUTED, not cached, exactly as this entry predicted: the 48 B record has
-no spare word, so caching would be an ABI break of its own and was not taken.
-⚠ It is the CONTROL-POINT hull, so a path with curves reports a box that contains the drawn shape and
-may exceed it — the conservative answer culling and damage tracking want, gated as a real superset
-(`programs/transform_test.cyr` group H). An empty path is `SADISH_ERR_EMPTY_PATH` with `out`
-untouched, so a degenerate box at the origin can never be mistaken for a real one.
+1. **Bilinear filtering.** `sd_pattern_set_filter` already refuses anything but `SD_FILTER_NEAREST`
+   with `SADISH_ERR_UNSUPPORTED`, and the filter is a FIELD — so this lands without an ABI break
+   whenever it is wanted. It earns its cost only under a scaling or rotating matrix; at 1:1 nearest
+   is exact and smoothing is a defect.
+2. **A tile rect.** A pattern takes the WHOLE source surface. A consumer with a glyph atlas or a
+   sprite sheet wants one sub-rect, and today must copy that rect into its own surface first.
+   ⚠ This one IS ABI-shaped — a field on the paint record, or a second constructor — so it wants
+   deciding before 1.0 even if it is not built.
 
-**Blend modes.** VERIFIED: every compositor in the tree is src-over (`src/premul.cyr`, `src/paint.cyr`,
-`src/raster.cyr`). No multiply/screen/darken. ⚠ UNKNOWN whether the consumers want them: that is a
-dhancha/crab question, not a sadish one, and the answer decides whether this belongs in 1.0 at all.
-
-### What 1.0 freezes
-
-**~~The `SdPolyline` / `SdPath` split.~~ CLOSED in 0.10.0**, and it was the right call to take it
-before 1.0 rather than after. `SdPolyline`'s points are inline 16 B slots like `SdPath`'s, and
-`sd_polyline_point_x` / `_y` are the accessors — the pattern copied from 0.9.0 exactly as this entry
-proposed. ⭐ The deferral had a measurable price that is now repaid: while the output held pointers,
-the flatten had to MATERIALISE a record per emitted point, so what 0.9.0 stopped paying per point the
-flatten started paying. A fill of the hostile 4,096-quad path went 1,110,016 B / 69,376 calls → **0 /
-0**. ⚠ `SdPoint` itself stays published as an argument type (`sd_matrix_apply` takes and returns
-one), but no STORE in sadish is an `SdPoint` any more.
-
-**The error model.** VERIFIED: `src/error.cyr` defines `SadishErr` with codes and a detail pointer, and
-almost nothing constructs one — the library returns bare `SADISH_*` codes and 0. Either the record is
-the contract or the codes are; shipping 1.0 with both leaves a half-built API permanently.
-
-**What a hook can refuse — narrowed by 0.10.0, and worth settling before 1.0.** VERIFIED: a fill, and
-a styled or dashed stroke, no longer allocate on the `sd_alloc` seam at all, so a consumer's hook
-cannot starve them. Their `SADISH_ERR_OOM` returns are still reachable — through the process scratch
-and the edge list — but only from the GLOBAL allocator, which a hook never controlled. ⚠ The ROUND
-stroker is the exception and still allocates per piece. ⇒ The documented contract ("a refusal is a
-return code at every public entry point that can reach one") is still true and now covers far fewer
-situations. Before 1.0, decide whether that asymmetry is the shipped contract or whether the round
-stroker should be brought in line; `src/alloc.cyr` states it either way and
-`programs/stroke_oom_test.cyr` gates both halves.
+**Blend modes.** VERIFIED: every compositor in the tree is src-over (`src/premul.cyr`,
+`src/paint.cyr`, `src/raster.cyr`). No multiply/screen/darken. ⚠ UNKNOWN whether the consumers want
+them: a dhancha/crab question, not a sadish one, and the answer decides whether this belongs in 1.0
+at all.
 
 ### Infrastructure
 
-**~~No API reference.~~ CLOSED in 0.11.0** — [`../api.md`](../api.md) covers all 122 public
-functions by module and front-loads the six cross-cutting rules most consumer bugs come from (16.16
-and the logical `>>`; the allocation seam; what a hook can still refuse after 0.10.0; the integer
-error model and its overloaded codes; the 0-means-opaque alpha rule; and that none of it is thread
-safe).
-⚠ `cyrius doc` was NOT the answer and this is worth recording: it emits only the LAST LINE of each
-doc comment, which for this tree's multi-paragraph headers is usually a fragment or a bare URL. The
-reference is written by hand, its worked example is compiled and run, and its constant table is
-machine-checked — but it is a SECOND copy of facts the headers own, so it will rot. ⇒ The headers
-stay normative; where the two disagree the header is right and the reference is the bug.
+**Nothing PROVES sadish runs on AGNOS.** VERIFIED: 0.9.1's cross-target step link-checks `--aarch64`
+and `--agnos` and fails on the compiler's `raw syscall` diagnostic, which is what was missing — but
+it **runs nothing**. CI has neither an aarch64 nor an AGNOS host. Compiling for AGNOS is proven;
+behaving there is UNKNOWN from inside this repo and needs hardware or an emulator that is not ours
+to add.
 
-**~~CI builds the host target only.~~ CLOSED in 0.9.1** — `.github/workflows/ci.yml` now carries a
-"Cross-target link-check (aarch64 + AGNOS)" step that builds `programs/smoke.cyr` for both and fails
-on the compiler's `raw syscall` portability diagnostic. VERIFIED locally across all four targets
-(`x86_64`, `--aarch64`, `--agnos`, `--win`): zero raw-syscall warnings.
-⚠ **What it does NOT do:** run anything. CI has neither an aarch64 nor an AGNOS host, so this is a
-link-check — it proves sadish still *compiles* for AGNOS, which is what was missing, not that it
-behaves there. Executing on AGNOS remains UNKNOWN from inside this repo.
+**`sd_present_blit` is the last ungated call.** 0.11.0 gated the device line —
+`programs/present_geom_test.cyr` opens the real framebuffer and asserts its geometry against an
+independent ioctl. What is left is the one call that genuinely writes pixels to a display. ⚠ A gate
+would need a display sadish is allowed to scribble on — a virtual framebuffer, or a machine whose
+screen nobody minds — which is infrastructure, not a different test.
 
 ### The AGNOS present path — and a correction
 
-The `TODO` in `src/raster.cyr` reads *"a whole-canvas fast path routed through the AGNOS blit#39"*, and
-the README carried it as a *"premultiplied `blit#39` fast path"*. ⛔ **That conflates two different
-kernel calls.** VERIFIED against `agnos/docs/development/agnos-userland-abi.md`:
+The `TODO` in `src/raster.cyr` reads *"a whole-canvas fast path routed through the AGNOS blit#39"*,
+and the README once carried it as a *"premultiplied `blit#39` fast path"*. ⛔ **That conflates two
+different kernel calls.** VERIFIED against `agnos/docs/development/agnos-userland-abi.md`:
 
-- **`blit`#39** — `blit(src, w, h, dstxy)`: *copies* a w×h block of 32bpp pixels from `src` to the
-  framebuffer. It is a COPY, not a blend. ⚠ `src` must be **packed `w*4` per row**, which sadish
-  surfaces are not required to be — `dh_surface_wrap` exists precisely to make wrapped ones, and
-  0.6.0 made every primitive stride-correct. A fast path must therefore either require a packed
-  surface or copy through one. The kernel gates `w * scale ≤ 8192` and rejects `scale > 16`, and the
-  `defer` bit (a4 bit 40) lets a compositor accumulate windows and flip once with `present`#84.
+- **`blit`#39** — `blit(src, w, h, dstxy)`: *copies* a w×h block of 32bpp pixels to the framebuffer.
+  It is a COPY, not a blend. ⚠ `src` must be **packed `w*4` per row**, which sadish surfaces are not
+  required to be — `dh_surface_wrap` exists precisely to make wrapped ones, and 0.6.0 made every
+  primitive stride-correct. A fast path must therefore either require a packed surface or copy
+  through one. The kernel gates `w * scale ≤ 8192`, rejects `scale > 16`, and its `defer` bit
+  (a4 bit 40) lets a compositor accumulate windows and flip once with `present`#84.
 - **`gpu_shader_op`#92 op 0x01** — premultiplied src-over on the shader cores. THIS is the
   premultiplied blend, and sadish has produced valid input for it since 0.7.0 (`src/premul.cyr`).
 
 VERIFIED: the wrapper already exists in the vendored stdlib — `sys_blit(src, w, h, dstxy)` in
 `lib/syscalls_x86_64_agnos.cyr`, `SYS_BLIT = 39`. sadish calls it nowhere.
-⚠ The honest framing: this is a **presenter backend** (`src/present.cyr`, beside the Linux `/dev/fb0`
-path), not a coverage-blit fast path — the `TODO` sits in `raster.cyr` next to `sd_canvas_blit_at`,
-which composites coverage onto a surface and never touches a framebuffer. UNKNOWN from here: whether
-aethersafha wants sadish presenting at all, or only producing premultiplied surfaces for the
-compositor to blit. That answer decides whether this is a 1.0 item or not work at all.
+⚠ The honest framing: this is a **presenter backend** (`src/present.cyr`, beside the Linux
+`/dev/fb0` path), not a coverage-blit fast path — the `TODO` sits in `raster.cyr` next to
+`sd_canvas_blit_at`, which composites coverage onto a surface and never touches a framebuffer.
+⇒ **UNKNOWN, and it gates two other entries:** whether aethersafha wants sadish presenting at all,
+or only producing premultiplied surfaces for the compositor to blit. That answer decides whether
+this is a 1.0 item or not work at all — and it is also the real close for the raw `open` / `ioctl`
+recorded below.
 
-### ~~`sd_present_open`'s device line~~ — GATED in 0.11.0
+---
 
-0.8.0 made everything after the `open()` reachable through `sd_present_open_fd` and recorded the rest
-as needing a display. ⛔ **That was wrong, and 0.11.0 is the correction shipped.** `sd_present_open`
-opens, probes geometry and allocates — it paints NOTHING. Only `sd_present_blit` writes pixels, and
-only that call ever needed the "no test may touch the live display" rule.
+## Decisions that still bind
 
-`programs/present_geom_test.cyr` opens the real framebuffer, asserts the presenter's geometry against
-**its own independent ioctl** on its own read-only descriptor, checks the fd is held and given back,
-opens twice, and closes. ⭐ The independence is the point: a shared helper would agree with sadish by
-construction and prove nothing. VERIFIED on this machine at **2560x1440, 32 bpp, pitch 10240**, with
-nothing drawn. ⚠ It SKIPS, loudly, where there is no device or no permission, printing which branch
-it took — both branches verified.
+Rules a closed item left behind. Each cost something to learn, and each is the kind a later reader
+would undo in good faith.
 
-⇒ **What is left ungated is `sd_present_blit` alone**, the one call that genuinely needs a display,
-and the one line between this suite and a test that draws on the user's screen.
-⚠ UNKNOWN still: whether sadish should present at all on AGNOS — see the section above. A blit gate
-would need a display sadish is allowed to scribble on, which is a different kind of infrastructure
-(a virtual framebuffer, or a machine whose screen nobody minds), not a different test.
+**Do not re-gate `fmt` on `cyrius fmt --check`.** MEASURED (0.9.1): it exits 0 on files the 6.6.6
+formatter would still rewrite, while `cyrius audit`'s fmt stage fails them. CI formats in place and
+lets `git diff --exit-code` report.
+
+**Resolve `lib/` with `cyrius deps`, not `cyrius update`.** `deps` vendors the 9 declared stdlib
+leaves plus their transitive peers — 24 files, which is what `.gitignore` and CI describe. `update`
+vendors the whole 111-file snapshot: same versions, wrong shape.
+
+**`open` and `ioctl` stay raw in `src/present.cyr`; do NOT "finish" the syscall sweep.** 0.9.1
+replaced `1`/`3`/`8` with `SYS_WRITE` / `SYS_CLOSE` / `SYS_LSEEK` at 11 sites. The other two have no
+portable spelling: **aarch64 has no `open`** (only `openat`, so no `SYS_OPEN`) and **AGNOS has no
+`ioctl`**. MEASURED: naming them fails the `--aarch64` and `--agnos` link-checks outright. All four
+remaining raw calls belong to the Linux `/dev/fb0` sink, which is Linux-only by design; the real
+close is the AGNOS presenter backend, not a rename. The reasoning is written at the call site.
+⚠ `programs/` keeps its raw numbers and should — the suites are host-only and never cross-compiled.
+
+**`docs/api.md` is a SECOND copy; the source headers are normative.** Where the two disagree the
+header is right and the reference is the bug. ⚠ `cyrius doc` cannot generate it: it emits only the
+LAST LINE of each doc comment, which for this tree's multi-paragraph headers is usually a fragment.
+
+**`sadish_version()` is derived from `VERSION` by CI.** It returned 900 through 0.9.1 AND 0.10.0 —
+across an ABI break — because the gate asserted the same stale literal. Bump both, or CI stops you.
+
+**Every `docs/development/` path must resolve, and must never be elided.** `src/*.cyr` comments are
+copied verbatim into `dist/sadish.cyr`, so a stale path ships to every consumer. Cross-repo filings
+carry their owning repo (`rekha/…`, `dhancha/…`, `agnos/…`). The sweep is in
+[`issues/README.md`](./issues/README.md); it is clean as of 0.11.0.
+
+---
 
 ## Not sadish's
 
 Consumer-side work that sadish cannot verify or perform is tracked in the consumer's own repo, not
-here. The one open document in this repo is
-[`proposals/2026-09-15-path-capacity-for-known-size-paths.md`](./proposals/2026-09-15-path-capacity-for-known-size-paths.md),
-whose remaining item is an adoption decision that belongs to its filer.
+here.
 
-## The cyrius pin: 6.6.4 → 6.6.6 — DONE in 0.9.1
-
-**Pin is now `cyrius = "6.6.6"` (cyrius.cyml:8), `lib/` re-resolved against it.** The pre-flight
-written here before the bump held item for item: **zero source changes were needed to compile.** Zero
-`struct` declarations (so the new different-struct-copy error and the by-value >8 B deep-copy change
-could not apply), no `async`/`operator` fns, no `ret2`/`rethi` pair returns, no SIMD-typed returns, no
-top-level `{ }` blocks, no `: cstring` parameters, no duplicate global `var`s, no locally defined
-`vec_*`. All 31 suites green on the first build.
-
-⚠ **The two things the pre-flight did NOT predict**, both found by bumping and both fixed in 0.9.1:
-
-1. **The 6.6.6 formatter re-indents continuation lines**, and `programs/paint_focal_test.cyr` had three
-   that drifted. MEASURED: the 6.6.4 formatter rewrote that file to zero lines, 6.6.6 to three.
-   ⛔ Worse, `cyrius fmt <file> --check` **exited 0 on it** while `cyrius audit`'s fmt stage failed it —
-   so CI's format gate, which read that exit code, could not have caught the drift it existed to catch.
-   The gate now formats in place and lets `git diff --exit-code` report. **Do not re-gate on `--check`.**
-2. **The `O_TRUNC` note below was right about scope but pointed at the wrong call.** See the next
-   section.
-
-**The `lib/` re-resolve was the load-bearing step**, as predicted: the vendored fold was 12 libs behind
-the store and every 0.9.0 build carried
-`warning: ./lib/ shadows version-pinned …/lib — 12 bundled lib(s) differ`. `rm -rf lib && mkdir lib &&
-cyrius deps` (what CI does) resolves **24 files** — the 9 declared `[deps] stdlib` leaves plus their
-transitive peers — and clears the warning. ⚠ `cyrius update` instead vendors the **whole 111-file
-snapshot**; same versions, but it is not what `.gitignore` and CI describe. Stay on `cyrius deps`.
-
-## Raw syscall numbers: three of five closed, two deliberately open
-
-The follow-on this file logged as "the hard-coded `2`/`1` are also wrong on aarch64" is **half closed**,
-and the half that stayed open is the more useful record.
-
-**Closed (0.9.1):** `SYS_WRITE` / `SYS_CLOSE` / `SYS_LSEEK` replace `1`/`3`/`8` at 11 sites in `src/`
-(10 in `present.cyr`, 1 in `error.cyr`). The prompt was the compiler itself: `--aarch64` emitted
-`src/present.cyr:376:36: raw syscall 8 is x86_64 lseek; on ELF-aarch64 that number is getxattr`.
-⚠ Pre-existing — 6.6.4 warned too, only less precisely ("not one the aarch64 stdlib declares"); 6.6.6
-naming `getxattr` is what made it worth closing. MEASURED: **all 32 built binaries sha256-identical**
-before and after, so x86_64 codegen provably did not move.
-
-**⛔ Deliberately still raw — and this is the correction to the note above.** The old entry framed the
-open/write pair as one follow-on. They are not the same problem:
-
-- **`open` (raw `2`, two sites)** — **aarch64 has no `open` syscall at all.** It has only `openat`, so
-  the stdlib defines no `SYS_OPEN` for it. There is nothing to name.
-- **`ioctl` (raw `16`, two sites)** — **AGNOS's ABI has no `ioctl`.** No `SYS_IOCTL` either.
-
-MEASURED, not assumed: naming them fails the `--aarch64` and `--agnos` link-checks outright
-(`undefined variable 'SYS_OPEN'` / `'SYS_IOCTL'`). ⇒ A wrong number on a path that cannot run on those
-targets beats a build that does not link, because **every one of those four calls is the Linux
-`/dev/fb0` sink**, which `src/present.cyr`'s header has always scoped as Linux-only. The reasoning is
-written at the call site so a later reader does not "finish" the sweep and break the cross-build.
-⇒ The real close for these two is the **AGNOS presenter backend** (kernel `blit#39`), not a rename —
-and whether sadish should present at all is still the UNKNOWN recorded above.
-
-⚠ **`programs/` keeps its raw numbers** and should: the suites are host-only and never cross-compiled,
-so the collision cannot reach them. Only the shipped library is portable.
+⭐ **There is no open filing in this repo.** `docs/development/issues/` and `proposals/` are both
+fully archived as of 0.11.0 — the last one,
+[`proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md`](./proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md),
+closed when its remaining item landed in **rekha 0.4.3** (the adoption this repo could not witness:
+`rekha_outline_to_sdpath` now opens each glyph at `sd_path_new_cap(v, p)` and `face_test` asserts the
+estimate is exact across all 2,620 LiberationSans glyphs). ⚠ Archived is not deleted — a filing is
+the record of what was measured, and the measurement outlives the bug. What remains open is in this
+file, not in a filing.

@@ -164,7 +164,7 @@ var SD_MITER_LIMIT_MAX = 67108864;
 # each corner was a 16 B SdPoint of its own).
 #
 # ⭐ THE PATH IS OPENED AT ITS EXACT SIZE (0.8.0) — item 2 of
-# docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md's "Still open": this is
+# docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md's "Still open": this is
 # one of the two in-tree sites that knew its size and bought SD_PATH_CAP = 256 + 256 anyway.
 # ⛔ THE COUNTS ARE READ OFF THE FIVE CALLS BELOW, NOT ESTIMATED: moveto + 3 linetos + close = 5
 # verbs; moveto and each lineto carry one point and close carries none = 4 points. Both land under

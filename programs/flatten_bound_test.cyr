@@ -7,7 +7,7 @@
 #      sd_pt_mid and threw all but one away, and the recursion went on subdividing after the output
 #      could take nothing more. MEASURED on 0.7.0: 4,096 maximally non-flat quads through one
 #      sd_path_flatten cost 83,623,976 B in 3,133,451 allocations for 1,048,577 points.
-#   2. sd_path_new_cap (proposals/2026-09-15-path-capacity-for-known-size-paths.md)
+#   2. sd_path_new_cap (proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md)
 #   3. CHECKED ALLOCATIONS in path.cyr + geom.cyr
 #      (issues/archived/2026-09-15-path-construction-stores-through-a-refused-allocation.md)
 #
@@ -424,7 +424,7 @@ fn mixed_path(): i64 {
 # ---- the synthetic ASCII set --------------------------------------------------------------
 # 95 glyph-shaped paths: 1,768 verbs and 2,498 points in total, the largest 61 verbs — the exact
 # shape rekha measured LiberationSans's printable ASCII at
-# (docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md).
+# (docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md).
 # Each is moveto + a linetos + b quadtos + close around a small circle, the quads bulging outward.
 fn glyph_lines(i): i64 {
     if (i == 0) { return 29; }

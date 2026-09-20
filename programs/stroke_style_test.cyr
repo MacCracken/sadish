@@ -703,7 +703,7 @@ fn main(): i64 {
     # fell with it for the first time, 104 -> 24. 0.8.0 opened sd_stroke_seg's rect at
     # sd_path_new_cap(5, 4) and sd_stroke_disc's 16-gon at sd_path_new_cap(17, 16) instead of
     # SD_PATH_CAP = 256 + 256 (item 2 of
-    # docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md); 0.9.0 stores the
+    # docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md); 0.9.0 stores the
     # points INLINE, so a piece path is THREE allocations whatever it holds. The closed square is 4
     # segment rects at 240 B (48 + 8*8 verbs + 8*16 points) and 4 vertex discs at 440 B (48 + 17*8
     # + 16*16): 4 * 240 + 4 * 440 = 2,720. ⛔ The count is still what says neither array grew — 3 a

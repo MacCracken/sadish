@@ -1,5 +1,11 @@
 # sadish — 2D prior-art survey (ecosystem games)
 
+> ⚠ **A DATED RECORD, NOT A PLAN.** This was written before v0.2 and is kept because it says *why*
+> sadish is shaped as it is — what was lifted from the ecosystem games and what was net-new. Its
+> "Suggested v0.2 sequence" below was fully executed and is history: every item shipped by v0.4.0.
+> ⇒ For what is actually left, read [`roadmap.md`](./roadmap.md). Do not treat anything here as
+> outstanding work.
+
 Mined 2026-07-04 from the Cyrius games that already hand-roll 2D drawing, to
 decide what sadish **adopts / extracts up** vs **writes fresh**. Sources:
 `cyrius-bb`, `cyrius-polyomino`, `encom-hits` (and `cyrius-doom`, which shares

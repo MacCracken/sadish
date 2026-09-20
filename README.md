@@ -30,7 +30,7 @@ opt-in exact 2-axis coverage engine — on an allocation seam a consumer can poi
 own arena. Since 0.10.0 a fill, and a styled or dashed stroke, draw through that seam
 **without allocating at all**.
 
-Current release **0.11.0**. The full API — 122 public functions, and the six
+Current release **0.11.0**. The full API — 129 public functions, and the six
 cross-cutting rules most consumer bugs come from — is in
 [`docs/api.md`](./docs/api.md). What shipped in each version is in
 [`CHANGELOG.md`](./CHANGELOG.md); what is left, and what 1.0 still needs, is in

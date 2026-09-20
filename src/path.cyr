@@ -157,10 +157,14 @@ var SD_PATH_NPOINTS_OFFSET = 24;
 var SD_PATH_CAP_OFFSET     = 32;
 var SD_PATH_PCAP_OFFSET    = 40;
 var SD_PATH_SIZE           = 48;
-# One point SLOT of the points array, in bytes: x at +0, y at +8 (0.9.0; 8 B, a pointer, through
-# 0.8.0). ⚠ It is the same 16 as SD_POINT_SIZE and means a different thing — that one is the size
-# of a standalone SdPoint record, which this release does not touch. Nothing makes the two equal
-# but the fact that both hold two i64s.
+# One point SLOT of an SdPath's points array, in bytes: x at +0, y at +8 (0.9.0; 8 B, a pointer,
+# through 0.8.0).
+# ⚠ THREE CONSTANTS ARE 16 AND ALL THREE MEAN SOMETHING DIFFERENT. Nothing makes them equal but the
+# fact that each happens to hold two i64s, and a change to one must not be propagated to the others:
+#   SD_PATH_PT_SIZE      this — the stride of an SdPath's points array
+#   SD_POLYLINE_PT_SIZE  the stride of an SdPolyline's points array (0.10.0)
+#   SD_POINT_SIZE        the size of a standalone SdPoint record (src/geom.cyr), which is now only
+#                        an ARGUMENT type — since 0.10.0 no STORE in sadish is an SdPoint.
 var SD_PATH_PT_SIZE        = 16;
 
 # Which array sd_path_grow doubles.
@@ -208,7 +212,7 @@ fn _sd_path_alloc(vcap, pcap): i64 {
 # 4,192 B in 6. The three SdPoints and the three sd_alloc calls that built them are gone.
 # ⚠ A caller that knows its size should still use sd_path_new_cap: the same small path is 240 B
 # there, and the 95-glyph ASCII set falls from 393,680 B to 58,672 B
-# (docs/development/proposals/2026-09-15-path-capacity-for-known-size-paths.md).
+# (docs/development/proposals/archived/2026-09-15-path-capacity-for-known-size-paths.md).
 fn sd_path_new(): i64 {
     return _sd_path_alloc(SD_PATH_CAP, SD_PATH_PCAP);
 }
