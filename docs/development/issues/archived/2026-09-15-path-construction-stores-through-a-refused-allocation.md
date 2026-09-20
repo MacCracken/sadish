@@ -1,5 +1,11 @@
 # Path construction stores through a refused `sd_alloc` — a hook that returns 0 faults inside sadish
 
+> 📁 **ARCHIVED — the Status line below is current; everything after it is AS FILED.** In-body
+> `file:line` citations, suite counts and any "this filing does not archive" line were true when
+> written and are **not maintained**: re-pointing them would edit the measurement, and the
+> measurement is the point. Where the body and the Status line disagree, the Status line wins.
+> ⇒ For what is actually left, read [`../../roadmap.md`](../../roadmap.md).
+
 **Status:** 🟢 **CLOSED — the table's sites in 0.7.1, the STROKES and the seam contract in 0.7.2.**
 Every ask this filing makes is now met: no `sd_alloc` result in `src/*.cyr` is used unchecked, all
 three stroke entry points return `SADISH_ERR_OOM` instead of faulting or under-drawing in silence,

@@ -608,8 +608,12 @@ fn sd_path_close(path): i64 {
 # two repos that vendor dist/sadish.cyr (crab, puka): sd_path_flatten is the one constructor,
 # src/path.cyr is the one writer, no SdPolyline is ever a field of another record or an array
 # element, and every reader outside this file goes through sd_polyline_count / sd_polyline_points
-# (crab's vendored bundle carries its own 0.6-vintage copy of all of this and is unaffected until
-# it re-vendors). ⚠ THAT SWEEP IS WHAT 0.10.0 RESTED ON TOO — the HEADER is unchanged at 24 B and
+# (crab vendors its own OLDER copy of all of this and is unaffected until it re-vendors — the
+# argument does not rest on which tag: any pre-0.10.0 bundle is self-contained, carrying the
+# matching reader for the layout it also carries. ⚠ The exact tag is UNKNOWN from inside this repo
+# and the two records here disagree — README.md says 0.5.4 as of crab 0.8.10, an archived filing
+# said 0.5.5, this line once said 0.6-vintage. Do not restate a number none of us can check).
+# ⚠ THAT SWEEP IS WHAT 0.10.0 RESTED ON TOO — the HEADER is unchanged at 24 B and
 # the three offsets below are where they were; it is the ARRAY the header points at whose slot
 # changed, which is exactly the shape the sweep found no embedder for.
 # ⛔ It is ONE WORD OF BITS, not two words of booleans, so a third verdict costs no more bytes.
@@ -681,10 +685,12 @@ fn sd_polyline_degraded(pl): i64 {
 # ---- flatten internals (adaptive de Casteljau) ------------------
 # Initial capacity + recursion depth cap. A single curve subdivides to at most 2^depth segments
 # (256: every leaf of the recursion emits one point).
-# SD_FLATTEN_CAP is the INITIAL size of every point / edge store the flatten feeds: sd_path_flatten's
-# result, and raster.cyr's fill edge list, crossings and stroker run — all of which GROW past it
-# since 0.7.0 (through 0.6.0 each dropped what did not fit). It is also the FIXED size of the fill's
-# and stroker's per-curve flatten buffers, which one curve's 2^depth points never fill.
+# ⚠ SD_FLATTEN_CAP NO LONGER SIZES THE POINT STORES — 0.10.0 split that off into SD_FLATTEN_PCAP
+# below, and this paragraph said otherwise until 0.11.0. What it sizes now is the stores whose slot
+# did NOT change when a point went 8 B to 16: raster.cyr's fill EDGE LIST and CROSSINGS, and
+# stroke.cyr's RUN — all of which GROW past it since 0.7.0 (through 0.6.0 each dropped what did not
+# fit). sd_path_flatten's result and the fill's and stroker's per-curve flatten buffers take
+# SD_FLATTEN_PCAP instead. ⛔ Read the two together; they are one decision in two constants.
 var SD_FLATTEN_CAP       = 8192;
 var SD_FLATTEN_MAX_DEPTH = 8;
 

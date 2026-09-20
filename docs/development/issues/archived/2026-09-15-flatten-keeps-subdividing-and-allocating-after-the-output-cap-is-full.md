@@ -1,5 +1,11 @@
 # `sd_path_flatten` keeps subdividing — and allocating mid-points — after its 8,192-point output is full
 
+> 📁 **ARCHIVED — the Status line below is current; everything after it is AS FILED.** In-body
+> `file:line` citations, suite counts and any "this filing does not archive" line were true when
+> written and are **not maintained**: re-pointing them would edit the measurement, and the
+> measurement is the point. Where the body and the Status line disagree, the Status line wins.
+> ⇒ For what is actually left, read [`../../roadmap.md`](../../roadmap.md).
+
 **Status:** 🟢 **CLOSED in 0.8.0 — the BOUND shipped in 0.7.1, the FILL got the budget's scope and the
 STROKES their return code in 0.7.2, and the POLYLINE its own verdict in 0.8.0. All three Still-open
 items are closed.** ⛔ Item 2 was closed by 0.7.2 and this filing did not say so: the finding was

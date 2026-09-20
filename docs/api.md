@@ -26,7 +26,7 @@ sadish turns resolution-independent geometry into **coverage**, and coverage int
                                      PPM file, or SdPresenter → /dev/fb0
 ```
 
-Five records, all opaque pointers you get from a constructor and never free (see §2.2):
+Seven records, all opaque pointers you get from a constructor and never free (see §2.2):
 
 | record | made by | holds |
 |---|---|---|

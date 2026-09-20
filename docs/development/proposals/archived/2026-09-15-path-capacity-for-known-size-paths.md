@@ -1,5 +1,11 @@
 # Capacity-sized paths: `sd_path_new_cap(n_verbs, n_points)` for callers that know the path's size
 
+> 📁 **ARCHIVED — the Status line below is current; everything after it is AS FILED.** In-body
+> `file:line` citations, suite counts and any "this filing does not archive" line were true when
+> written and are **not maintained**: re-pointing them would edit the measurement, and the
+> measurement is the point. Where the body and the Status line disagree, the Status line wins.
+> ⇒ For what is actually left, read [`../../roadmap.md`](../../roadmap.md).
+
 **Status:** 🟢 **CLOSED — item 3 landed in rekha 0.4.3** (2026-09-16), the adoption this repo could not
 witness. `rekha_outline_to_sdpath` counts a glyph's verbs and points (a walk that mirrors its emitter
 branch for branch) and opens the path with `sd_path_new_cap(v, p)`; the five programs are ported to

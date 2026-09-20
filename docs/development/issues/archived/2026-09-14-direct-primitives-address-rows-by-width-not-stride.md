@@ -1,5 +1,11 @@
 # Every direct primitive addresses rows by `width * 4`, so a WRAPPED surface (stride != width*4) shears
 
+> 📁 **ARCHIVED — the Status line below is current; everything after it is AS FILED.** In-body
+> `file:line` citations, suite counts and any "this filing does not archive" line were true when
+> written and are **not maintained**: re-pointing them would edit the measurement, and the
+> measurement is the point. Where the body and the Status line disagree, the Status line wins.
+> ⇒ For what is actually left, read [`../../roadmap.md`](../../roadmap.md).
+
 **Status:** 🟢 **CLOSED in 0.6.0** — every site in the table below (and `sd_surface_write_ppm`, which the
 table missed: it read `w*h` pixels as one flat run) now loads `sd_surface_stride` once per call.
 Gate: `programs/stride_test.cyr`, a hand-built wrapped header with sentinel padding and guard rows

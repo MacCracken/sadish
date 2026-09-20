@@ -72,6 +72,9 @@ A filing closes when its **own asks** are met, not when the headline defect stop
 ⛔ **The status line is the part that goes wrong.** At the 0.7.1 audit, four of five filings here were
 marked closed and three had unmet asks of their own — a truncated contour still filled open, a stroke
 that still faults on a refused allocation, arrays not opened at the capacity the proposal asked for.
-Two named a release, `0.6.1`, that was never cut. All three are still in this directory with corrected
-status lines and a **Still open** section, and they are the worked examples of the failure mode:
+Two named a release, `0.6.1`, that was never cut. They were pulled back out of `archived/`, given
+corrected status lines and a **Still open** section, and only re-archived once those sections were
+genuinely empty — which is why they are the worked examples of the failure mode:
 *archiving is how sadish asserts something is done.* Do not archive a filing to tidy the directory.
+⚠ As of 0.11.0 all of them ARE archived and every **Still open** section reads empty, so this
+directory holds no active filing. That is a statement about the work, not about the directory.

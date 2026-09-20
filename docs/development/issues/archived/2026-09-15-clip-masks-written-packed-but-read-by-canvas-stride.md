@@ -1,5 +1,11 @@
 # Clip masks are WRITTEN packed (`y * w + x`) but READ by the canvas stride (`py * stride + px`)
 
+> 📁 **ARCHIVED — the Status line below is current; everything after it is AS FILED.** In-body
+> `file:line` citations, suite counts and any "this filing does not archive" line were true when
+> written and are **not maintained**: re-pointing them would edit the measurement, and the
+> measurement is the point. Where the body and the Status line disagree, the Status line wins.
+> ⇒ For what is actually left, read [`../../roadmap.md`](../../roadmap.md).
+
 **Status:** 🟢 **CLOSED — the FILED DEFECT was fixed in 0.7.0; the GATE GAP this header used to hide
 was closed in 0.7.2.** The three unpinned coverage loads are now gated by `programs/clip_pitch_test.cyr`
 group K (checks 107-122, three oracle comparisons against the packed twin); **no source change was
