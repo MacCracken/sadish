@@ -1,8 +1,9 @@
 # sadish roadmap
 
-**Where we are:** 0.9.1. 31 RUN suites green, `fmt`/`lint`/`vet` clean, `dist/sadish.cyr` in
-sync, toolchain pinned to **6.6.6**, and the host build is now diagnostic-free (0.9.1 re-resolved the
-12-lib-stale vendored `lib/`). agnos's `tests/gpu/refagree.cyr` holds the default fill byte-identical
+**Where we are:** 0.10.0. 32 RUN suites green, `fmt`/`lint`/`vet` clean, `dist/sadish.cyr` in
+sync, toolchain pinned to **6.6.6**, and the host build is diagnostic-free. 0.10.0 took the
+`SdPolyline` ABI break this file filed under "What 1.0 freezes", so the library now stores points
+ONE way; a fill and a styled or dashed stroke allocate NOTHING on the consumer's seam. agnos's `tests/gpu/refagree.cyr` holds the default fill byte-identical
 across 200 random paths — it has stayed green through every release since 0.6.0 and is the standing
 proof that a change did not move a pixel.
 
@@ -26,6 +27,7 @@ The measurements and contracts live in [`../../CHANGELOG.md`](../../CHANGELOG.md
 | v0.8.0 | exact-size piece paths, a self-describing `SdPolyline`, a testable presenter |
 | v0.9.0 | `SdPath` stores its points inline — the ASCII glyph set 78,656 → 58,672 B, 2,783 → 285 allocations |
 | v0.9.1 | the 6.6.6 pin; a format gate that actually gates; portable syscall constants + an aarch64/AGNOS cross-build |
+| v0.10.0 | `SdPolyline` points inline — a flatten is 5 allocations, not 20,004; `sd_path_transform`; `sd_path_bounds` |
 
 ## The road to 1.0
 
@@ -49,14 +51,19 @@ plus a flattener; the verb/point stream pairing is already per-verb, and a new v
 point count. ⚠ The alternative is to declare arcs a CONSUMER concern and document the cubic
 approximation as the supported path — cheaper, and defensible for a core this size.
 
-**`sd_path_transform`.** VERIFIED: `SdMatrix` and `sd_matrix_apply` exist, but nothing applies a matrix
-to a path — `grep 'fn sd_path_transform' src/` is empty. Every consumer that scales or rotates a path
-writes the loop itself. Blast radius: one function over the inline points array, which 0.9.0 made
-trivial (two i64 per slot, no records to rebuild).
+**~~`sd_path_transform`.~~ CLOSED in 0.10.0** — `sd_path_transform(path, m)` affines every point in
+place and allocates nothing, because 0.9.0's inline slots made it a read, six multiplies and a write.
+MEASURED against the loop it replaces on a 7-point path: the hand-rolled `sd_matrix_apply` rebuild
+costs 14 `sd_alloc` calls and 224 B, this costs 0 and 0. Gated point-by-point against
+`sd_matrix_apply` across five matrices (`programs/transform_test.cyr` group D).
 
-**Path bounds.** VERIFIED: no bounds query exists. `SdPath`'s reserved word was annotated *"future
-flags: subpath-open, bounds-cached"* and 0.7.2 spent it on the point capacity instead, so a cached
-bound now needs a new field or a recompute. Culling, layout and damage tracking all want it.
+**~~Path bounds.~~ CLOSED in 0.10.0** — `sd_path_bounds(path, out)` writes four 16.16 words to a
+caller's 32 B buffer. ⚠ RECOMPUTED, not cached, exactly as this entry predicted: the 48 B record has
+no spare word, so caching would be an ABI break of its own and was not taken.
+⚠ It is the CONTROL-POINT hull, so a path with curves reports a box that contains the drawn shape and
+may exceed it — the conservative answer culling and damage tracking want, gated as a real superset
+(`programs/transform_test.cyr` group H). An empty path is `SADISH_ERR_EMPTY_PATH` with `out`
+untouched, so a degenerate box at the origin can never be mistaken for a real one.
 
 **Blend modes.** VERIFIED: every compositor in the tree is src-over (`src/premul.cyr`, `src/paint.cyr`,
 `src/raster.cyr`). No multiply/screen/darken. ⚠ UNKNOWN whether the consumers want them: that is a
@@ -64,16 +71,28 @@ dhancha/crab question, not a sadish one, and the answer decides whether this bel
 
 ### What 1.0 freezes
 
-**The `SdPolyline` / `SdPath` split.** VERIFIED: 0.9.0 put `SdPath`'s points inline, but `SdPolyline`
-still holds *"an array of i64 `SdPoint` ptrs"* (`src/path.cyr`, the record comment), and its consumers
-read them through `sd_polyline_points` + `sd_point_x`. So the library now stores points two different
-ways and hands consumers both. Making them consistent is the same class of break 0.9.0 just took —
-cheaper now than after 1.0, and the accessors that made 0.9.0 survivable (`sd_path_point_x` / `_y`)
-give the pattern to copy.
+**~~The `SdPolyline` / `SdPath` split.~~ CLOSED in 0.10.0**, and it was the right call to take it
+before 1.0 rather than after. `SdPolyline`'s points are inline 16 B slots like `SdPath`'s, and
+`sd_polyline_point_x` / `_y` are the accessors — the pattern copied from 0.9.0 exactly as this entry
+proposed. ⭐ The deferral had a measurable price that is now repaid: while the output held pointers,
+the flatten had to MATERIALISE a record per emitted point, so what 0.9.0 stopped paying per point the
+flatten started paying. A fill of the hostile 4,096-quad path went 1,110,016 B / 69,376 calls → **0 /
+0**. ⚠ `SdPoint` itself stays published as an argument type (`sd_matrix_apply` takes and returns
+one), but no STORE in sadish is an `SdPoint` any more.
 
 **The error model.** VERIFIED: `src/error.cyr` defines `SadishErr` with codes and a detail pointer, and
 almost nothing constructs one — the library returns bare `SADISH_*` codes and 0. Either the record is
 the contract or the codes are; shipping 1.0 with both leaves a half-built API permanently.
+
+**What a hook can refuse — narrowed by 0.10.0, and worth settling before 1.0.** VERIFIED: a fill, and
+a styled or dashed stroke, no longer allocate on the `sd_alloc` seam at all, so a consumer's hook
+cannot starve them. Their `SADISH_ERR_OOM` returns are still reachable — through the process scratch
+and the edge list — but only from the GLOBAL allocator, which a hook never controlled. ⚠ The ROUND
+stroker is the exception and still allocates per piece. ⇒ The documented contract ("a refusal is a
+return code at every public entry point that can reach one") is still true and now covers far fewer
+situations. Before 1.0, decide whether that asymmetry is the shipped contract or whether the round
+stroker should be brought in line; `src/alloc.cyr` states it either way and
+`programs/stroke_oom_test.cyr` gates both halves.
 
 ### Infrastructure
 

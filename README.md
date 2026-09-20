@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.9.1
+Version: 0.10.0
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -23,11 +23,13 @@ toolkit are all **consumers**, not re-implementations.
 
 The complete 2D vector core is live: paths, curve flattening, analytic anti-aliased
 fill (even-odd + nonzero), styled and dashed stroking, linear/radial/focal gradient
-paint, premultiplied output, affine transforms, clipping, and an opt-in exact
-2-axis coverage engine — on an allocation seam a consumer can point at its own
-arena.
+paint, premultiplied output, affine transforms (including `sd_path_transform`, which
+moves a whole path in place without allocating), path bounds, clipping, and an opt-in
+exact 2-axis coverage engine — on an allocation seam a consumer can point at its own
+arena. Since 0.10.0 a fill, and a styled or dashed stroke, draw through that seam
+**without allocating at all**.
 
-Current release **0.9.1**. What shipped in each version is in
+Current release **0.10.0**. What shipped in each version is in
 [`CHANGELOG.md`](./CHANGELOG.md); what is left, and what 1.0 still needs, is in
 [`docs/development/roadmap.md`](./docs/development/roadmap.md).
 
@@ -68,7 +70,12 @@ as of **v0.6.0**; dashes, focal gradients and premultiplied output as of **v0.7.
 bounded flattening and checked allocations as of **v0.7.1**; hook-safe strokes and
 bounded fills as of **v0.7.2**; exact-size piece paths and a self-describing
 polyline as of **v0.8.0**; inline path points as of **v0.9.0**; portable syscall
-constants and an aarch64 + AGNOS cross-build gate as of **v0.9.1**.
+constants and an aarch64 + AGNOS cross-build gate as of **v0.9.1**; inline POLYLINE
+points, `sd_path_transform` and `sd_path_bounds` as of **v0.10.0**.
+⚠ **v0.10.0 is an ABI break.** A consumer reading a flattened polyline through
+`sd_point_x(load64(sd_polyline_points(pl) + i * 8))` must move to
+`sd_polyline_point_x(pl, i)` / `_y` — the old spelling reads a coordinate as an
+address. See [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## Dependencies
 
@@ -90,7 +97,7 @@ cyrius build programs/smoke.cyr build/sadish-smoke    # link-check
 for t in geom flatten fill blit rotate gradient grow stroke clip aa draw present blend alloc \
          stride stroke_style paint area integration grow_edges paint_focal premul \
          dash clip_pitch paint_premul flatten_bound oom stroke_oom path_cap \
-         present_open inline_points; do
+         present_open inline_points transform; do
   cyrius build "programs/${t}_test.cyr" "build/${t}_test" && "./build/${t}_test"
 done
 ```

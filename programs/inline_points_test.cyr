@@ -376,8 +376,12 @@ fn main(): i64 {
     check(sd_polyline_count(epl) > 2, 1);                              # 77 — ⛔ sd_path_flatten too:
     #                                                                    a curve FROM the origin is
     #                                                                    flattened, not skipped
-    check(sd_point_x(load64(sd_polyline_points(epl) + 0)), 0);         # 78 — and the first point of
-    check(sd_point_y(load64(sd_polyline_points(epl) + 0)), 0);         # 79   the output IS (0, 0)
+    # ⚠ 0.10.0: read through sd_polyline_point_x / _y. The old spelling here — sd_point_x of a
+    # load64 at stride 8 — dereferenced the x COORDINATE as an address and was an immediate SIGSEGV
+    # against this release. That is the consumer-visible shape of the break, caught by group B's
+    # own origin case: the coordinate it read as a pointer was 0.
+    check(sd_polyline_point_x(epl, 0), 0);                             # 78 — and the first point of
+    check(sd_polyline_point_y(epl, 0), 0);                             # 79   the output IS (0, 0)
     # ⚠ AND A DRAWING VERB BEFORE ANY MOVETO IS STILL SKIPPED — the flag's other half. A path whose
     # first verb is a lineto draws nothing and does not fault (raster.cyr's contract since 0.7.1).
     var enomove = sd_path_new();

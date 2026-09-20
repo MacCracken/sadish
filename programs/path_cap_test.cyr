@@ -906,10 +906,14 @@ fn main(): i64 {
     reset_counts();
     check(sd_canvas_stroke_path(ncv, ncurve, 2 * SD_ONE), SADISH_OK); # 208
     sd_alloc_set(prev);
-    check(g_bytes, 6008);                                             # 209 — 73,376 -> 7,144 -> here
-    check(g_calls, 59);                                               # 210 — 234 -> 59
-    check(8 * n_seg + 9 * n_disc + 8 * 16, g_bytes);                  # 211 — rects + discs + points
-    check(8 * n_segc + 9 * n_discc + 8, g_calls);                     # 212
+    # ⚠ 0.10.0: -128 B and -8 calls against 0.9.1's 6,008 / 59. Those were the EIGHT flatten points
+    # of this glyph's curves, at 16 B and one sd_alloc each; the flatten output holds coordinates
+    # now, so they cost nothing and the identity below loses its points term entirely.
+    check(g_bytes, 5880);                                             # 209 — 73,376 -> 7,144 -> here
+    check(g_calls, 51);                                               # 210 — 234 -> 59 -> 51
+    check(8 * n_seg + 9 * n_disc, g_bytes);                           # 211 — rects + discs, NO
+    #                                                                   per-point term any more
+    check(8 * n_segc + 9 * n_discc, g_calls);                         # 212
 
     # N5. A dhancha-SHAPED TEXT DRAW: 54 glyph outlines round-stroked at width 1 — the label length
     # rekha's bench_hotpath measures, against the 54 leading glyphs of this file's own ASCII set.
@@ -931,13 +935,17 @@ fn main(): i64 {
         nli = nli + 1;
     }
     sd_alloc_set(prev);
-    check(g_bytes, 1318728);                                          # 214 — 16,357,904 -> 1,557,176
-    #                                                                   -> here: 12.4x off 0.7.2
-    check(g_calls, 12806);                                            # 215 — ⛔ 50,593 -> 12,806
-    # ⇒ 1,557,176 - 1,318,728 = 238,448 B more off one label's arena per draw, and 37,787 fewer
-    # sd_alloc calls — the per-point allocation this release removes, at label scale. Those
-    # subtractions are NOT checks: the earlier figures are history, not values this tree can
-    # measure, so asserting them against literals would be identities that cannot fail. #214 and
+    check(g_bytes, 1296040);                                          # 214 — 16,357,904 ->
+    #                                                                   1,557,176 -> 1,318,728 ->
+    #                                                                   here: 12.6x off 0.7.2
+    check(g_calls, 11388);                                            # 215 — ⛔ 50,593 -> 12,806 ->
+    #                                                                   11,388: 4.4x off 0.7.2
+    # ⇒ 0.10.0 takes a further 22,688 B and 1,418 sd_alloc calls off one 54-glyph label per draw —
+    # the FLATTEN's per-point allocation, where 0.9.0 removed the PATH's. A label is mostly straight
+    # verbs, so the flatten points are the smaller half; the release's large numbers are in
+    # programs/flatten_bound_test.cyr group D, where a curve-heavy path falls from 69,384 calls to
+    # 8. Those subtractions are NOT checks: the earlier figures are history, not values this tree
+    # can measure, so asserting them against literals would be identities that cannot fail. #214 and
     # #215 are the gates.
 
     # N6. ⛔ AND THE PICTURE DOES NOT MOVE. These three ink totals were MEASURED on 0.7.2 (the

@@ -130,18 +130,15 @@ fn cov_maxdiff(a, b): i64 {
 # Distance (16.16) from (px, py) to the polyline `pl` (an SdPolyline) — skipping the segment INTO
 # point `break1`, where sd_path_flatten's output jumps to the second subpath's moveto.
 fn poly_dist(pl, break1, px, py): i64 {
-    var pts = sd_polyline_points(pl);
     var n = sd_polyline_count(pl);
     var best = 0x7FFFFFFFFFFF;
     var i = 0;
     while (i < n - 1) {
         if (i + 1 != break1) {
-            var a = load64(pts + i * 8);
-            var b = load64(pts + (i + 1) * 8);
-            var ax = sd_point_x(a);
-            var ay = sd_point_y(a);
-            var vx = sd_point_x(b) - ax;
-            var vy = sd_point_y(b) - ay;
+            var ax = sd_polyline_point_x(pl, i);
+            var ay = sd_polyline_point_y(pl, i);
+            var vx = sd_polyline_point_x(pl, i + 1) - ax;
+            var vy = sd_polyline_point_y(pl, i + 1) - ay;
             var wx = px - ax;
             var wy = py - ay;
             var len2 = vx * vx + vy * vy;
@@ -154,8 +151,8 @@ fn poly_dist(pl, break1, px, py): i64 {
                     d = sd_isqrt(wx * wx + wy * wy);
                 } else {
                     if (t >= len2) {
-                        var ex = px - sd_point_x(b);
-                        var ey = py - sd_point_y(b);
+                        var ex = px - sd_polyline_point_x(pl, i + 1);
+                        var ey = py - sd_polyline_point_y(pl, i + 1);
                         d = sd_isqrt(ex * ex + ey * ey);
                     } else {
                         d = sd_abs(wx * vy - wy * vx) / sd_isqrt(len2);
@@ -172,7 +169,6 @@ fn poly_dist(pl, break1, px, py): i64 {
 # The largest miter ratio 1/cos(turn/2) = sqrt(2 / (1 + cos(turn))) over the interior vertices of
 # `pl` (16.16, rounded up); `break1` is the point index that starts its second subpath.
 fn poly_rmax(pl, break1): i64 {
-    var pts = sd_polyline_points(pl);
     var n = sd_polyline_count(pl);
     var rmax = SD_ONE;
     var i = 1;
@@ -181,13 +177,10 @@ fn poly_rmax(pl, break1): i64 {
         if (i == break1) { ok = 0; }
         if (i + 1 == break1) { ok = 0; }
         if (ok != 0) {
-            var p0 = load64(pts + (i - 1) * 8);
-            var p1 = load64(pts + i * 8);
-            var p2 = load64(pts + (i + 1) * 8);
-            var ax = sd_point_x(p1) - sd_point_x(p0);
-            var ay = sd_point_y(p1) - sd_point_y(p0);
-            var bx = sd_point_x(p2) - sd_point_x(p1);
-            var by = sd_point_y(p2) - sd_point_y(p1);
+            var ax = sd_polyline_point_x(pl, i) - sd_polyline_point_x(pl, i - 1);
+            var ay = sd_polyline_point_y(pl, i) - sd_polyline_point_y(pl, i - 1);
+            var bx = sd_polyline_point_x(pl, i + 1) - sd_polyline_point_x(pl, i);
+            var by = sd_polyline_point_y(pl, i + 1) - sd_polyline_point_y(pl, i);
             var la = sd_isqrt(ax * ax + ay * ay);
             var lb = sd_isqrt(bx * bx + by * by);
             if (la > 0) {
@@ -285,9 +278,10 @@ fn ref_stroke_append(run, run_n, fctx): i64 {
     var i = 0;
     while (i < n) {
         if (run_n < SD_FLATTEN_CAP) {
-            var q = load64(pts + i * 8);
-            store64(run + run_n * 16, sd_point_x(q));
-            store64(run + run_n * 16 + 8, sd_point_y(q));
+            store64(run + run_n * 16,
+              load64(pts + i * SD_POLYLINE_PT_SIZE + SD_POINT_X_OFFSET));
+            store64(run + run_n * 16 + 8,
+              load64(pts + i * SD_POLYLINE_PT_SIZE + SD_POINT_Y_OFFSET));
             run_n = run_n + 1;
         }
         i = i + 1;
@@ -365,9 +359,9 @@ fn ref_canvas_stroke_path(cv, path, width): i64 {
             var qey = sd_path_point_y(path, pi + 1);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
+            store64(fctx + 16, SD_FLATTEN_PCAP);
             _sd_flatten_quad_xy(fctx, curx, cury, sd_path_point_x(path, pi),
-              sd_path_point_y(path, pi), qex, qey, 0, tol, SD_FLATTEN_MAX_DEPTH);
+              sd_path_point_y(path, pi), qex, qey, tol, SD_FLATTEN_MAX_DEPTH);
             run_n = ref_stroke_append(run, run_n, fctx);
             curx = qex;
             cury = qey;
@@ -378,10 +372,10 @@ fn ref_canvas_stroke_path(cv, path, width): i64 {
             var key = sd_path_point_y(path, pi + 2);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
+            store64(fctx + 16, SD_FLATTEN_PCAP);
             _sd_flatten_cubic_xy(fctx, curx, cury, sd_path_point_x(path, pi),
               sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
-              sd_path_point_y(path, pi + 1), kex, key, 0, tol, SD_FLATTEN_MAX_DEPTH);
+              sd_path_point_y(path, pi + 1), kex, key, tol, SD_FLATTEN_MAX_DEPTH);
             run_n = ref_stroke_append(run, run_n, fctx);
             curx = kex;
             cury = key;
@@ -626,17 +620,15 @@ fn br_corner(): i64 {
 # The polyline `pl` (second subpath starting at point `break1`, 0 for none) as explicit LINETOs.
 fn poly_path(pl, break1): i64 {
     var p = sd_path_new();
-    var pts = sd_polyline_points(pl);
     var i = 0;
     while (i < sd_polyline_count(pl)) {
-        var q = load64(pts + i * 8);
         var mv = 0;
         if (i == 0) { mv = 1; }
         if (i == break1) { mv = 1; }
         if (mv != 0) {
-            sd_path_moveto(p, sd_point_x(q), sd_point_y(q));
+            sd_path_moveto(p, sd_polyline_point_x(pl, i), sd_polyline_point_y(pl, i));
         } else {
-            sd_path_lineto(p, sd_point_x(q), sd_point_y(q));
+            sd_path_lineto(p, sd_polyline_point_x(pl, i), sd_polyline_point_y(pl, i));
         }
         i = i + 1;
     }
@@ -686,13 +678,19 @@ fn main(): i64 {
     sd_canvas_stroke_path_ex(acv, acurve, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
     var curve_cost = arena_used(g_arena) - a0;
     check(alloc_used() - g0, 0);                                       # 7 — a curve: still 0 on the heap
-    # MEASURED 128 B: the cubic's 7 EMITTED flatten mid-points AND its endpoint, x 16 B, on the
-    # seam, per call. Was 672 B through 0.7.0, when each of those 7 nodes allocated all SIX of its
-    # de Casteljau mids and threw five away, and 112 B through 0.8.0, when the curve's endpoint was
-    # the PATH's own SdPoint and needed no record of its own. 0.9.0 stores a path's points inline,
-    # so an emitted endpoint is materialised like any other output point: +16 B per curve VERB, set
-    # against 16 B and one sd_alloc per POINT that building the path no longer pays.
-    check(curve_cost, 128);                                            # 8
+    # ⭐⭐ MEASURED **0 B** since 0.10.0 — a styled stroke of a CURVE now asks the consumer's seam
+    # for nothing at all. The arc of this number is the arc of how a flattened point is stored:
+    #   0.7.0  672 B — each of the 7 subdivision nodes allocated all SIX of its de Casteljau mids
+    #                  and threw five away
+    #   0.7.1  112 B — the recursion carries coordinates; only the mid that reaches the output
+    #                  is materialised (7 x 16)
+    #   0.9.0  128 B — +16: a path's points went inline, so the curve's ENDPOINT was no longer a
+    #                  record to hand down and had to be materialised like any other
+    #   0.10.0   0 B — the flatten output went inline too. An emitted point is two stores into the
+    #                  per-curve buffer; there is nothing left to allocate.
+    # ⇒ Together with check 6 (straight lines, already 0 B), a styled stroke of ANY path is now
+    # allocation-free on the seam once the scratch is warm.
+    check(curve_cost, 0);                                              # 8
     a0 = arena_used(g_arena);
     sd_canvas_stroke_path_ex(acv, acurve, W2, SD_CAP_ROUND, SD_JOIN_MITER, ML4);
     check(arena_used(g_arena) - a0, curve_cost);                       # 9 — identical on the next call
@@ -958,11 +956,10 @@ fn main(): i64 {
     sd_path_quadto(cu, 20 * SD_ONE, 18 * SD_ONE, 34 * SD_ONE + H, 28 * SD_ONE);
     var cpl = sd_path_flatten(cu, SD_ONE >> 2);
     var cbreak = 0;
-    var cpts = sd_polyline_points(cpl);
     var cq = 1;
     while (cq < sd_polyline_count(cpl)) {
-        if (sd_point_x(load64(cpts + cq * 8)) == 8 * SD_ONE) {
-            if (sd_point_y(load64(cpts + cq * 8)) == 27 * SD_ONE) { cbreak = cq; }
+        if (sd_polyline_point_x(cpl, cq) == 8 * SD_ONE) {
+            if (sd_polyline_point_y(cpl, cq) == 27 * SD_ONE) { cbreak = cq; }
         }
         cq = cq + 1;
     }

@@ -50,6 +50,20 @@
 #         may have paid for one doubling — path.cyr says so). A FILL or a STROKE is not: coverage
 #         written before the refusal STAYS ON THE CANVAS, and the code says the picture is a
 #         prefix. Clear and retry, or draw into a scratch canvas.
+#       ⭐⭐ 0.10.0 NARROWS WHAT A HOOK CAN REFUSE AT ALL, AND THAT IS WORTH READING BEFORE RELYING
+#         ON THE PARAGRAPH ABOVE. A flattened point costs no allocation since the flatten output
+#         holds coordinates (src/path.cyr), so the per-point sd_alloc that used to sit inside every
+#         fill and every styled/dashed stroke is GONE. MEASURED: a fill of a hostile 4,096-quad path
+#         asked the seam for 1,110,016 B in 69,376 calls at 0.9.1 and asks for **nothing** here
+#         (programs/flatten_bound_test.cyr #102-103); a styled stroke of a cubic, 128 B -> 0
+#         (stroke_style_test #8); a dashed one, 224 B -> 0 (dash_test #128).
+#         ⇒ A FILL AND A STYLED OR DASHED STROKE CANNOT BE STARVED BY A HOOK ANY MORE. They still
+#         return SADISH_ERR_OOM where the code says they do — the paths are reachable through the
+#         process scratch and the edge list, which draw from the GLOBAL allocator by design and were
+#         never a hook's to refuse — but a consumer testing its own error path by refusing from its
+#         hook will now get a complete picture and SADISH_OK. ⚠ The ROUND stroker is the exception
+#         and still allocates per piece (its per-segment and per-vertex paths, on this seam), so it
+#         starves exactly as before; programs/stroke_oom_test.cyr holds both halves.
 #       ⛔ WHAT STILL FAULTS: a CALLER that ignores a documented 0 and hands it back to sadish.
 #         MEASURED on this tree — `sd_path_moveto(0, x, y)` on a refused path, `sd_polyline_count(0)`
 #         on a refused flatten and `sd_canvas_coverage_at(0, …)` on a refused canvas are each

@@ -16,13 +16,11 @@ fn check(got, want): i64 {
 
 # Is (x, y) present among the polyline's points?
 fn pl_has(pl, x, y): i64 {
-    var pts = sd_polyline_points(pl);
     var n = sd_polyline_count(pl);
     var i = 0;
     while (i < n) {
-        var p = load64(pts + i * 8);
-        if (sd_point_x(p) == x) {
-            if (sd_point_y(p) == y) { return 1; }
+        if (sd_polyline_point_x(pl, i) == x) {
+            if (sd_polyline_point_y(pl, i) == y) { return 1; }
         }
         i = i + 1;
     }
@@ -31,13 +29,11 @@ fn pl_has(pl, x, y): i64 {
 
 # Are ALL polyline points inside [x0,x1] x [y0,y1]?
 fn pl_in_bbox(pl, x0, y0, x1, y1): i64 {
-    var pts = sd_polyline_points(pl);
     var n = sd_polyline_count(pl);
     var i = 0;
     while (i < n) {
-        var p = load64(pts + i * 8);
-        var px = sd_point_x(p);
-        var py = sd_point_y(p);
+        var px = sd_polyline_point_x(pl, i);
+        var py = sd_polyline_point_y(pl, i);
         if (px < x0) { return 0; }
         if (px > x1) { return 0; }
         if (py < y0) { return 0; }
@@ -72,11 +68,10 @@ fn main(): i64 {
     var qpl = sd_path_flatten(qp, tol);
     var qc = sd_polyline_count(qpl);
     if (qc < 3) { g_fails = g_fails + 1; }              # subdivided
-    var qpts = sd_polyline_points(qpl);
-    check(sd_point_x(load64(qpts + 0)), 0);             # first == p0
-    check(sd_point_y(load64(qpts + 0)), 0);
-    check(sd_point_x(load64(qpts + (qc - 1) * 8)), 4 * SD_ONE);  # last == p2
-    check(sd_point_y(load64(qpts + (qc - 1) * 8)), 0);
+    check(sd_polyline_point_x(qpl, 0), 0);              # first == p0
+    check(sd_polyline_point_y(qpl, 0), 0);
+    check(sd_polyline_point_x(qpl, qc - 1), 4 * SD_ONE);  # last == p2
+    check(sd_polyline_point_y(qpl, qc - 1), 0);
     check(pl_has(qpl, 2 * SD_ONE, 1 * SD_ONE), 1);      # exact t=0.5 point (2,1)
     check(pl_in_bbox(qpl, 0, 0, 4 * SD_ONE, 2 * SD_ONE), 1);     # convex hull
 
@@ -87,11 +82,10 @@ fn main(): i64 {
     var kpl = sd_path_flatten(kp, tol);
     var kc = sd_polyline_count(kpl);
     if (kc < 3) { g_fails = g_fails + 1; }
-    var kpts = sd_polyline_points(kpl);
-    check(sd_point_x(load64(kpts + 0)), 0);             # first == p0
-    check(sd_point_y(load64(kpts + 0)), 0);
-    check(sd_point_x(load64(kpts + (kc - 1) * 8)), 4 * SD_ONE);  # last == p3
-    check(sd_point_y(load64(kpts + (kc - 1) * 8)), 0);
+    check(sd_polyline_point_x(kpl, 0), 0);              # first == p0
+    check(sd_polyline_point_y(kpl, 0), 0);
+    check(sd_polyline_point_x(kpl, kc - 1), 4 * SD_ONE);  # last == p3
+    check(sd_polyline_point_y(kpl, kc - 1), 0);
     check(pl_in_bbox(kpl, 0, 0, 4 * SD_ONE, 4 * SD_ONE), 1);     # convex hull
 
     if (g_fails == 0) {

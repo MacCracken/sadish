@@ -187,7 +187,7 @@ var _sd_fill_ectx = 0;         # edge builder ctx (24 B): +0 edges  +8 count  +1
 var _sd_fill_edges = 0;        # _sd_fill_edges_cap * 32 — GROWS (0.7.0)
 var _sd_fill_edges_cap = 0;    # edges the current block holds (SD_FLATTEN_CAP until a path needs more)
 var _sd_fill_trunc = 0;        # 1 if THIS fill's edge list dropped an edge (a growth failed)
-var _sd_fill_fbuf = 0;         # SD_FLATTEN_CAP * 8 — flatten output for one curve verb (FIXED, below)
+var _sd_fill_fbuf = 0;         # SD_FLATTEN_PCAP * 16 — flatten output for one curve verb (FIXED, below)
 var _sd_fill_fctx = 0;         # flatten ctx (24 B)
 var _sd_fill_cross = 0;        # _sd_fill_cross_cap * 16 — (x, dir) crossings — GROWS (0.7.0)
 var _sd_fill_cross_cap = 0;    # >= every edge list that is walked: the fill's AND the stroke batch's
@@ -196,13 +196,14 @@ var _sd_fill_accrow_cap = 0;   # pixels the current accrow block can hold
 # ⭐ 16 B A POINT, x at +0 and y at +8, INLINE (0.9.0; _sd_stroke_run_cap * 8 SdPoint POINTERS
 # through 0.8.0). A path's points are coordinates now, so a run built from them has nothing to point
 # AT — and a run of coordinates is what keeps a straight verb's anchor from costing an allocation on
-# the consumer's seam at every stroke. The flatten output it also copies from is still SdPoints;
-# _sd_run_append reads the two words out of each. ⚠ MEASURED one-time cost: 131,072 B against
+# the consumer's seam at every stroke. ⭐ 0.10.0: the flatten output it copies FROM is now inline
+# too, so _sd_run_append is a straight 16 B -> 16 B copy with nothing to dereference on either side.
+# ⚠ MEASURED one-time cost: 131,072 B against
 # 65,536 B — this block doubled, ONCE, on the global heap (never sd_alloc), and it is the whole
 # price of the seam saving.
 var _sd_stroke_run = 0;        # _sd_stroke_run_cap * 16 — the stroker's polyline run — GROWS (0.7.0)
 var _sd_stroke_run_cap = 0;    # points the current run block holds
-var _sd_stroke_fbuf = 0;       # SD_FLATTEN_CAP * 8 — the stroker's OWN flatten output (FIXED)
+var _sd_stroke_fbuf = 0;       # SD_FLATTEN_PCAP * 16 — the stroker's OWN flatten output (FIXED)
 var _sd_stroke_fctx = 0;       # the stroker's OWN flatten ctx (24 B)
 # ⚠ The SD_AA_AREA engine's accumulator (_sd_area_acc, (w+1)*8) is the same kind of scratch but
 # lives with its engine in src/coverage.cyr, allocated on the first AREA fill — NOT here, so a
@@ -352,11 +353,11 @@ fn _sd_scratch_init(): i64 {
     if (_sd_fill_ectx != 0) { return 1; }
     var ectx = alloc(24);
     var edges = alloc(SD_FLATTEN_CAP * 32);
-    var fbuf = alloc(SD_FLATTEN_CAP * 8);
+    var fbuf = alloc(SD_FLATTEN_PCAP * SD_POLYLINE_PT_SIZE);
     var fctx = alloc(24);
     var cross = alloc(SD_FLATTEN_CAP * 16);
     var srun = alloc(SD_FLATTEN_CAP * 16);      # 16 B a run point since 0.9.0, not 8
-    var sfbuf = alloc(SD_FLATTEN_CAP * 8);
+    var sfbuf = alloc(SD_FLATTEN_PCAP * SD_POLYLINE_PT_SIZE);
     var sfctx = alloc(24);
     var ok = 1;
     if (ectx == 0) { ok = 0; }
@@ -495,8 +496,9 @@ fn sd_edge_add(ectx, ax, ay, bx, by): i64 {
 # returns the last point as the pair (x, y) — the new current point, or the argument back when the
 # ctx emitted nothing.
 # ⚠ COORDINATES IN AND OUT (0.9.0): it took and returned an SdPoint POINTER, which the fill's verb
-# walk no longer has for a path anchor. The ctx's own points are still SdPoints — the flatten
-# output's shape did not change — and are read the same way.
+# walk no longer has for a path anchor. ⭐ AND SINCE 0.10.0 THE CTX'S OWN POINTS ARE COORDINATES
+# TOO — this loop used to load a pointer per point and call sd_point_x / _y through it; it now reads
+# the two words in place, one dependent load fewer per point and nothing to fault on.
 fn sd_fill_edges_from(ectx, fctx, cx, cy): (i64, i64) {
     var pts = load64(fctx + 0);
     var n = load64(fctx + 8);
@@ -504,9 +506,8 @@ fn sd_fill_edges_from(ectx, fctx, cx, cy): (i64, i64) {
     var prevy = cy;
     var i = 0;
     while (i < n) {
-        var p = load64(pts + i * 8);
-        var px = sd_point_x(p);
-        var py = sd_point_y(p);
+        var px = load64(pts + i * SD_POLYLINE_PT_SIZE + SD_POINT_X_OFFSET);
+        var py = load64(pts + i * SD_POLYLINE_PT_SIZE + SD_POINT_Y_OFFSET);
         sd_edge_add(ectx, prevx, prevy, px, py);
         prevx = px;
         prevy = py;
@@ -752,7 +753,7 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
                 }
                 _sd_flatten_quad_xy(fctx, curx, cury, sd_path_point_x(path, pi),
                   sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
-                  sd_path_point_y(path, pi + 1), 0, tol, SD_FLATTEN_MAX_DEPTH);
+                  sd_path_point_y(path, pi + 1), tol, SD_FLATTEN_MAX_DEPTH);
                 var qlx, qly = sd_fill_edges_from(ectx, fctx, curx, cury);
                 curx = qlx;
                 cury = qly;
@@ -772,7 +773,7 @@ fn sd_fill_impl(cv, path, rule, combine): i64 {
                 _sd_flatten_cubic_xy(fctx, curx, cury, sd_path_point_x(path, pi),
                   sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
                   sd_path_point_y(path, pi + 1), sd_path_point_x(path, pi + 2),
-                  sd_path_point_y(path, pi + 2), 0, tol, SD_FLATTEN_MAX_DEPTH);
+                  sd_path_point_y(path, pi + 2), tol, SD_FLATTEN_MAX_DEPTH);
                 var klx, kly = sd_fill_edges_from(ectx, fctx, curx, cury);
                 curx = klx;
                 cury = kly;

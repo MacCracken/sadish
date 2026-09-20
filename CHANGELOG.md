@@ -5,6 +5,124 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-09-20 — SdPolyline stores its points inline, and a path can transform and bound itself
+
+⚠ **ABI BREAK**, the one `docs/development/roadmap.md` filed under "What 1.0 freezes". 0.9.0 put
+`SdPath`'s points inline and deliberately left `SdPolyline` alone — *"a second ABI break in one
+release is how a consumer stops trusting the version number"* — and that deferral had a visible
+price: because the flatten OUTPUT still held pointers, what the path stopped paying per point the
+flatten started paying. This closes it. Two additive functions ride along; both are pure additions
+and break nothing.
+
+⛔ **Rendering does not move.** A 255-measurement oracle across fills (both rules), round / styled /
+dashed strokes, clips and flatten geometry on **both AA engines** diffs to **zero** against 0.9.1 on
+every ink total, weighted ink checksum, point count, verdict and flattened-coordinate checksum —
+**225 of 255 measurements byte-identical, and the 30 that moved are all `flat_bytes` / `flat_calls`,
+which is the release.** 32 RUN suites green (31 + the new one); `lint`, `vet`, `fmt`,
+`distlib --check` and the aarch64 + AGNOS cross-builds clean.
+
+### Changed — a flattened point costs no allocation
+
+`SdPolyline`'s points array holds the coordinates **INLINE — x at +0, y at +8, 16 B a slot** — where
+it held 8 B pointers to separately allocated 16 B `SdPoint`s. The 24 B header and its three offsets
+do not move; only the array's stride does.
+
+⭐ **The per-point allocation leaves the library entirely.** MEASURED, each from its own suite:
+
+| | 0.9.1 | 0.10.0 |
+|---|---:|---:|
+| styled stroke of a cubic, on the seam | 128 B | **0** |
+| dashed stroke of a cubic | 224 B | **0** |
+| fill of the hostile 4,096-quad path | 1,110,016 B / 69,376 calls | **0 / 0** |
+| `sd_path_flatten`, 20,001 points | 20,004 calls | **5** |
+| 4,096 curves under a 64-point budget | 4,165 calls | **4** |
+| 54-glyph label, round-stroked | 1,318,728 B / 12,806 calls | 1,296,040 B / 11,388 |
+
+⇒ Nothing in a flatten is per-point or per-curve any more; what is left is **per-doubling** of the
+output array. A fill of any path, and a styled or dashed stroke of any path, now draw through a
+consumer's `sd_alloc` hook **without asking it for a single byte**.
+
+⚠ **`SD_FLATTEN_PCAP` = 4096 is new** — the initial capacity of the three point stores
+(`sd_path_flatten`'s output and the fill's and stroker's per-curve buffers), halved as the slot
+doubled, exactly as `SD_PATH_PCAP` was for 0.9.0. At 4096 × 16 the first allocation is **65,536 B,
+byte-identical to every release since 0.7.0**. `SD_FLATTEN_CAP` = 8192 still sizes the stores whose
+slot did not change: the fill's edge list and crossings, and the stroker's run.
+
+⚠ **What the wider slot also does, said plainly.** A slot is 16 B where it was 8, and reaching a
+given capacity takes one more doubling — so on a bump arena with no `free()`, where every superseded
+array stays charged, the CUMULATIVE bytes of a LARGE flatten go **up**: a 20,001-point flatten is
+778,816 B → 983,088. The two figures describing memory a consumer actually holds both improve —
+**live bytes 582,160 → 524,288** and **calls 20,004 → 5** — and a consumer whose arena is reset per
+frame pays the live figure. The trade was taken deliberately: halving `SD_FLATTEN_PCAP` keeps the
+common case (a glyph, a small path) on the same 65,536 B first block rather than 131,072.
+`programs/grow_edges_test.cyr` C7 works it through in full.
+
+### Added — the accessors that make the break survivable
+
+```
+sd_polyline_point_x(pl, i)    sd_polyline_point_y(pl, i)
+```
+
+⚠ No bounds check — bound the loop on `sd_polyline_count`. ⭐ These exist for exactly the reason
+`sd_path_point_x` / `_y` did at 0.9.0: through 0.9.1 there was **no accessor**, so every reader in
+this tree and every consumer open-coded `sd_point_x(load64(sd_polyline_points(pl) + i * 8))`. That
+spelling now reads an x COORDINATE as an address — **an immediate SIGSEGV** for any path off the
+origin, and a silently wrong answer for one on it. `sd_polyline_points` stays published for a caller
+that walks the block itself, which must now stride `SD_POLYLINE_PT_SIZE` (= 16).
+
+### Added — `sd_path_transform` and `sd_path_bounds`
+
+Both VERIFIED missing at 0.9.1 and hand-rolled by every consumer; both pure additions.
+
+```
+sd_path_transform(path, m)     # affine every point IN PLACE; SADISH_OK / SADISH_ERR_BOUNDS
+sd_path_bounds(path, out)      # 4 x 16.16 into a 32 B buffer; SADISH_ERR_EMPTY_PATH if no points
+```
+
+⭐ **`sd_path_transform` allocates NOTHING**, which is the whole reason it exists: `sd_matrix_apply`
+takes and returns an `SdPoint`, so the loop a consumer writes by hand costs one 16 B record per point
+plus a second path to hold the result. MEASURED on a 7-point path: the hand-rolled shape makes **14
+`sd_alloc` calls / 224 B**, this makes **0 / 0**. It is the same arithmetic as `sd_matrix_apply` to
+the raw unit — gated point-by-point against it across five matrices.
+⚠ IN PLACE: the original geometry is gone. It transforms the CONTROL points, which is exact for
+affine (the affine image of a Bézier is the Bézier of the images of its control points), so curves
+are not re-approximated.
+
+⚠ **`sd_path_bounds` is the control-point hull, not the ink.** A Bézier lies inside its control
+polygon and need not touch it, so a path with curves reports a box that CONTAINS the drawn shape and
+may exceed it — the conservative answer culling, damage tracking and layout all want. Gated as a
+real superset: every point of the flattened path falls inside the reported box, and the box is
+strictly larger for a curve that bows away from its control. ⛔ Recomputed per call, not cached:
+`SdPath`'s 48 B record has no spare word (0.7.2 spent the one annotated *"bounds-cached"* on the
+point capacity), so caching would be an ABI break of its own.
+⚠ An empty path returns `SADISH_ERR_EMPTY_PATH` and **`out` is not written** — a zeroed box would
+read as a real degenerate box at the origin, and a culler would keep the object instead of dropping
+it.
+
+### Changed — what a hook can still refuse
+
+⛔ **A fill and a styled or dashed stroke can no longer be starved by a consumer's hook.** They still
+return `SADISH_ERR_OOM` where the code says they do, but the reachable paths are now the process
+scratch and the edge list, which draw from the GLOBAL allocator by design and were never a hook's to
+refuse. A consumer testing its own error path by refusing from its hook will get a complete picture
+and `SADISH_OK`. ⚠ The ROUND stroker is the exception — its per-segment and per-vertex piece paths
+are real `sd_alloc` calls and starve exactly as before. `programs/stroke_oom_test.cyr` holds both
+halves, and `src/alloc.cyr`'s seam contract says so.
+
+### Added — `programs/transform_test.cyr` (71 checks)
+
+The gate for all three additions, and for the one thing no other suite covers: that the polyline
+accessors agree with a RAW strided read of the block, which is the read a consumer walking the array
+itself will write. Also holds `(0, 0)` as a real point in the flatten output — the same trap 0.9.0's
+inline points sprang on paths, where a null test used to mean "no point".
+
+### Fixed — a test that was passing for two reasons at once
+
+`programs/stroke_oom_test.cyr` #108 compared a ROUND/MITER stroke against reference case **4**
+(BUTT/BEVEL) and asserted only that the two DIFFERED — which they did whether or not the starvation
+under test worked. Now that the stroke cannot be starved, the comparison names the right picture
+(case 5) and asserts equality.
+
 ## [0.9.1] - 2026-09-20 — the 6.6.6 pin, and the two things the gates were not catching
 
 A patch release: **no API, no ABI, no rendering change.** The toolchain pin moves 6.6.4 → 6.6.6 and

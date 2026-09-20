@@ -316,14 +316,12 @@ fn cubic_ring(n): i64 {
 # The polyline `pl` as a closed path of explicit LINETOs.
 fn poly_closed(pl): i64 {
     var p = sd_path_new();
-    var pts = sd_polyline_points(pl);
     var i = 0;
     while (i < sd_polyline_count(pl)) {
-        var q = load64(pts + i * 8);
         if (i == 0) {
-            sd_path_moveto(p, sd_point_x(q), sd_point_y(q));
+            sd_path_moveto(p, sd_polyline_point_x(pl, i), sd_polyline_point_y(pl, i));
         } else {
-            sd_path_lineto(p, sd_point_x(q), sd_point_y(q));
+            sd_path_lineto(p, sd_polyline_point_x(pl, i), sd_polyline_point_y(pl, i));
         }
         i = i + 1;
     }
@@ -491,13 +489,16 @@ fn main(): i64 {
     arena_reset(g_arena);
     _sd_grow_limit = SD_GROW_LIMIT_DEFAULT;   # back to the shipped ceiling
     # B7. sd_path_flatten on a hook that runs out: the result keeps 8,192 points and says so.
-    # ⚠ THE ARENA IS SIZED DIFFERENTLY SINCE 0.9.0, AND THE REFUSAL IT DRIVES IS THE SAME ONE. A
-    # path's points are inline coordinates now, so sd_path_flatten materialises an SdPoint for every
-    # point it EMITS (and, past the cap, for every one it then drops) — 9,001 x 16 B here — where
-    # through 0.8.0 the anchors of a straight-verb path were the path's own records and cost the
-    # hook nothing. The arena holds the 65,536 B output array, the ctx, all 9,001 SdPoints and the
-    # 24 B header, and NOT the 131,072 B doubling: that is what is refused, exactly as before.
-    var fa = arena_new(65536 + 24 + 9001 * 16 + 24);
+    # ⚠ THE ARENA IS SIZED DIFFERENTLY AGAIN AT 0.10.0, AND THE REFUSAL IT DRIVES IS STILL THE SAME
+    # ONE. The flatten OUTPUT holds coordinates now, so the 9,001 per-point SdPoints are GONE — and
+    # SD_FLATTEN_PCAP halved to 4,096 as the slot doubled, so the first array is the same 65,536 B
+    # it has always been but holds half as many points. The consequence for this group is that the
+    # walk now takes ONE MORE DOUBLING before it runs out:
+    #     65,536 (4,096 slots) + 24 (ctx) + 131,072 (the doubling to 8,192) + 24 (header)
+    # and it is the doubling to 16,384 — 262,144 B — that is refused. Same result as every release
+    # since 0.7.0: 8,192 points kept, _sd_flat_trunc set, nothing half-built.
+    # ⭐ The arena is 196,656 B where 0.9.1 needed 209,600 for the identical outcome.
+    var fa = arena_new(65536 + 24 + 131072 + 24);
     var fpath = vpoly(0, 9000, 64);
     var prev_hook = sd_alloc_set(&hook_alloc);
     var keep_arena = g_arena;
@@ -508,8 +509,8 @@ fn main(): i64 {
     check(fpl != 0, 1);                                               # 42
     check(sd_polyline_count(fpl), 8192);                              # 43
     check(_sd_flat_trunc, 1);                                         # 44
-    check(arena_used(fa), 65536 + 24 + 9001 * 16 + 24);               # 45 — the doubling was refused
-    check(sd_point_y(load64(sd_polyline_points(fpl) + 8191 * 8)), ONE + 16384 + 8191 * 64);   # 46
+    check(arena_used(fa), 65536 + 24 + 131072 + 24);                  # 45 — the doubling was refused
+    check(sd_polyline_point_y(fpl, 8191), ONE + 16384 + 8191 * 64);   # 46
 
     # ── C) GROWTH: exact figures from cold capacities, 0 B on the hook, 0 B warm ────
     # (paths are built first, off the hook: the arena is reset after this group)
@@ -616,20 +617,36 @@ fn main(): i64 {
     g0 = alloc_used();
     sd_canvas_fill_path(c6, drow, SD_FILL_NONZERO);
     check(alloc_used() - g0, 0);                                      # 75
-    # C7. sd_path_flatten's result is the CALLER's: on the hook, 65,536 + 131,072 + 262,144 B of
-    # arrays for 20,001 points, + 20,001 x 16 B of SdPoints (0.9.0: every emitted point is
-    # materialised, because the path holds coordinates and not records), + ctx 24 + polyline header
-    # 24 (16 through 0.7.2, before the header carried its own truncated/degraded verdict); the
-    # global heap pays nothing.
+    # C7. sd_path_flatten's result is the CALLER's, and 0.10.0 changes the SHAPE of what it asks
+    # for. The 20,001 x 16 B of SdPoints are gone — an emitted point is two stores now — but a slot
+    # in the array costs 16 B instead of 8, and SD_FLATTEN_PCAP halved to 4,096, so reaching a
+    # 20,001-point capacity takes FOUR doublings where 0.9.1 took three:
+    #     0.9.1   65,536 + 131,072 + 262,144  (caps 8,192 -> 32,768, 8 B a slot)  = 458,752
+    #           + 20,001 x 16 of SdPoints                                         = 320,016
+    #   0.10.0   65,536 + 131,072 + 262,144 + 524,288  (caps 4,096 -> 32,768)     = 983,040
+    #           + no points at all                                                =       0
+    # ⚠ SO THE CUMULATIVE ARENA FIGURE GOES UP, 778,816 -> 983,088, AND THAT IS SAID PLAINLY. It is
+    # an artifact of an arena with no free(): every superseded array stays charged. The two numbers
+    # that describe memory a consumer actually HOLDS both improve —
+    #   LIVE bytes   582,160 -> 524,288   (the final array, plus the points that no longer exist)
+    #   sd_alloc calls  20,004 ->      5
+    # — and a consumer whose arena is reset per frame pays the live figure, not this one. ⛔ The
+    # trade was taken deliberately: halving PCAP keeps the COMMON case (a glyph, a small path)
+    # allocating the same 65,536 B first block it has since 0.7.0 rather than 131,072. See
+    # SD_FLATTEN_PCAP's header for the other half of that decision.
     a0 = arena_used(g_arena);
     g0 = alloc_used();
     sd_path_flatten(v20k, ONE >> 2);
-    check(arena_used(g_arena) - a0, 65536 + 131072 + 262144 + 20001 * 16 + 24 + 24);   # 76
+    check(arena_used(g_arena) - a0, 65536 + 131072 + 262144 + 524288 + 24 + 24);   # 76
     check(alloc_used() - g0, 0);                                      # 77
     check(_sd_flat_trunc, 0);                                         # 78
     a0 = arena_used(g_arena);
     sd_path_flatten(vpre, ONE >> 2);
-    check(arena_used(g_arena) - a0, 65536 + 8192 * 16 + 24 + 24);     # 79 — at or under 8,192: as 0.6.0
+    # ⚠ 196,656 BOTH SIDES OF 0.10.0, BY COINCIDENCE, AND THE EXPRESSION IS REWRITTEN SO IT STOPS
+    # LOOKING LIKE A CONSTANT THAT SURVIVED. 8,192 points used to mean 65,536 B of array (8,192
+    # slots x 8) plus 8,192 SdPoints x 16; it now means 65,536 B of array (4,096 slots x 16) plus
+    # ONE doubling to 131,072. Same total, entirely different allocations — 3 calls now, 8,195 then.
+    check(arena_used(g_arena) - a0, 65536 + 131072 + 24 + 24);        # 79 — at or under 8,192
     check(sd_alloc_set(0), &hook_alloc);                              # 80
     arena_reset(g_arena);
 
@@ -887,9 +904,8 @@ fn main(): i64 {
     var ibad = 0;
     var ik = 0;
     while (ik <= 20000) {
-        var ip = load64(sd_polyline_points(pl20k) + ik * 8);
-        if (sd_point_y(ip) != ONE + 16384 + ik * 64) { ibad = ibad + 1; }
-        if (sd_point_x(ip) != 4 * ONE + 32768) { ibad = ibad + 1; }
+        if (sd_polyline_point_y(pl20k, ik) != ONE + 16384 + ik * 64) { ibad = ibad + 1; }
+        if (sd_polyline_point_x(pl20k, ik) != 4 * ONE + 32768) { ibad = ibad + 1; }
         ik = ik + 1;
     }
     check(ibad, 0);                                                   # 142 — every point, across both doublings
@@ -897,21 +913,22 @@ fn main(): i64 {
     # ── J) THE GUARDS, WHITE-BOX ────
     # J1. Only sd_path_flatten's ctx grows. A full ctx of any other kind — the fill's and stroker's
     # per-curve buffers — drops the point and allocates nothing, even on a hook.
-    var jbuf = alloc(16);
+    var jbuf = alloc(2 * SD_POLYLINE_PT_SIZE);
     var jctx = alloc(24);
     store64(jctx + 0, jbuf);
     store64(jctx + 8, 0);
     store64(jctx + 16, 2);
     check(sd_alloc_set(&hook_alloc), 0);                              # 143
     a0 = arena_used(g_arena);
-    sd_flat_emit(jctx, 11);
-    sd_flat_emit(jctx, 22);
-    sd_flat_emit(jctx, 33);
+    sd_flat_emit(jctx, 11, 12);
+    sd_flat_emit(jctx, 22, 23);
+    sd_flat_emit(jctx, 33, 34);
     check(arena_used(g_arena) - a0, 0);                               # 144
     check(sd_alloc_set(0), &hook_alloc);                              # 145
     check(load64(jctx + 8) + load64(jctx + 16), 4);                   # 146 — 2 kept, cap unchanged
     check(load64(jctx + 0), jbuf);                                    # 147
-    check(load64(jbuf + 8), 22);                                      # 148
+    check(load64(jbuf + SD_POLYLINE_PT_SIZE + SD_POINT_X_OFFSET), 22); # 148 — slot 1's x
+    check(load64(jbuf + SD_POLYLINE_PT_SIZE + SD_POINT_Y_OFFSET), 23); # 148b — and its y
     # J2. An edge arriving at a FULL batch grows it (the backstop behind the unit reserve), and the
     # batch stays whole: the area engine takes it. The rect and cancelling pairs of B4, past 32,768.
     check(_sd_sb_cap, 32768);                                         # 149

@@ -208,13 +208,11 @@ fn or_path_rev(): i64 {
 # Load a single-subpath path's flattened polyline into the oracle (same tol sd_fill_impl uses).
 fn or_from_flatten(path): i64 {
     var pl = sd_path_flatten(path, SD_ONE >> 2);
-    var pts = sd_polyline_points(pl);
     var n = sd_polyline_count(pl);
     g_vn = 0;
     var i = 0;
     while (i < n) {
-        var pt = load64(pts + i * 8);
-        or_add(sd_point_x(pt), sd_point_y(pt));
+        or_add(sd_polyline_point_x(pl, i), sd_polyline_point_y(pl, i));
         i = i + 1;
     }
     return n;

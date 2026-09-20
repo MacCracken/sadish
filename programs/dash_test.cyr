@@ -266,15 +266,12 @@ fn vpoly(first, last, step): i64 {
 # ---- polyline arithmetic (the dash walk's own) ------------------------------------------------
 # Total length of `pl` by per-segment sd_isqrt — exactly what the dash walk accumulates.
 fn poly_len(pl): i64 {
-    var pts = sd_polyline_points(pl);
     var n = sd_polyline_count(pl);
     var s = 0;
     var i = 0;
     while (i < n - 1) {
-        var a = load64(pts + i * 8);
-        var b = load64(pts + (i + 1) * 8);
-        var dx = sd_point_x(b) - sd_point_x(a);
-        var dy = sd_point_y(b) - sd_point_y(a);
+        var dx = sd_polyline_point_x(pl, i + 1) - sd_polyline_point_x(pl, i);
+        var dy = sd_polyline_point_y(pl, i + 1) - sd_polyline_point_y(pl, i);
         s = s + sd_isqrt(dx * dx + dy * dy);
         i = i + 1;
     }
@@ -284,24 +281,20 @@ fn poly_len(pl): i64 {
 # The point at distance `d` along `pl`, cut exactly as _sd_dash_subpath cuts it. Past the end it is
 # the last point.
 fn arc_at(pl, d): (i64, i64) {
-    var pts = sd_polyline_points(pl);
     var n = sd_polyline_count(pl);
     var rem = d;
     var i = 0;
     while (i < n - 1) {
-        var a = load64(pts + i * 8);
-        var b = load64(pts + (i + 1) * 8);
-        var ax = sd_point_x(a);
-        var ay = sd_point_y(a);
-        var dx = sd_point_x(b) - ax;
-        var dy = sd_point_y(b) - ay;
+        var ax = sd_polyline_point_x(pl, i);
+        var ay = sd_polyline_point_y(pl, i);
+        var dx = sd_polyline_point_x(pl, i + 1) - ax;
+        var dy = sd_polyline_point_y(pl, i + 1) - ay;
         var seg = sd_isqrt(dx * dx + dy * dy);
         if (seg > rem) { return (ax + (dx * rem) / seg, ay + (dy * rem) / seg); }
         rem = rem - seg;
         i = i + 1;
     }
-    var l = load64(pts + (n - 1) * 8);
-    return (sd_point_x(l), sd_point_y(l));
+    return (sd_polyline_point_x(pl, n - 1), sd_polyline_point_y(pl, n - 1));
 }
 
 # Coverage of the pixel the point at distance `d` along `pl` falls in.
@@ -871,14 +864,18 @@ fn main(): i64 {
     g0 = alloc_used();
     sd_canvas_stroke_path_dash(pd, pv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0);
     check(alloc_used() - g0, 262144 + 16384);                     # 127 — MEASURED: 278,528 B
-    # 0.7.1: the cubic's EMITTED mid-points x 16 B. Was 1,248 B — 13 subdivision nodes x 6
-    # sd_pt_mid each — until the recursion started carrying coordinates and allocating only the
-    # one mid per node that reaches the output.
-    # ⚠ 0.9.0: 208 -> 224 B, ONE more SdPoint. The path's points are inline coordinates now, so the
-    # curve's own ENDPOINT has no record to hand to the flatten and is materialised like any other
-    # emitted point (src/path.cyr's _sd_flatten_cubic_xy). It is +16 B per CURVE VERB flattened,
-    # against the 16 B and one sd_alloc per POINT that building the path no longer pays.
-    check(arena_used(g_arena) - pa, 224);                         # 128 — the cubic's mid-points
+    # ⭐⭐ 0.10.0: 224 -> **0**. THE WHOLE ARC OF THIS NUMBER, because it is the one figure in the
+    # tree that has tracked every change to how a flattened point is stored:
+    #   0.7.0  1,248 B — 13 subdivision nodes x 6 sd_pt_mid each, every mid a 16 B record
+    #   0.7.1    208 B — the recursion carries COORDINATES; only the one mid per node that
+    #                    reaches the output is materialised
+    #   0.9.0    224 B — +16, ONE more: the path's points went inline, so the curve's own
+    #                    ENDPOINT had no record to hand down and was materialised like any other
+    #   0.10.0     0 B — the flatten OUTPUT went inline too, so an emitted point is two stores
+    #                    into the array and there is nothing left to allocate per point at all.
+    # ⇒ A dashed stroke of a cubic now draws through the consumer's hook without asking it for a
+    # single byte. That is the release, measured in one line.
+    check(arena_used(g_arena) - pa, 0);                           # 128 — the cubic's mid-points
     check(_sd_dash_cap, 16384);                                   # 129
     check(cov_diff(pd, pref), 0);                                 # 130 — the flags crossed intact
     check(lit_rows(pd, 0, 9), 0);                                 # 131 — and no miter spike
@@ -886,7 +883,7 @@ fn main(): i64 {
     pa = arena_used(g_arena);
     sd_canvas_stroke_path_dash(pd2, pv, 4 * ONE, BU, MI, 4 * ONE, plong, 1, 0);
     check(alloc_used() - g0, 0);                                  # 132 — warm: 0 B of buffer
-    check(arena_used(g_arena) - pa, 224);                         # 133 — and the mid-points again
+    check(arena_used(g_arena) - pa, 0);                           # 133 — and the mid-points again
     check(sd_alloc_set(0), &hook_alloc);                          # 134
     arena_reset(g_arena);
     check(_sd_dash_trunc, 0);                                     # 135

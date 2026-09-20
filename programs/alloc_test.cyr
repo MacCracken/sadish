@@ -259,15 +259,15 @@ fn main(): i64 {
     gc = alloc_used();
     sd_canvas_fill_path(cv, blob, SD_FILL_NONZERO);
     var quad_cost2 = alloc_used() - gc;
-    # The quads' flatten points are proportional to the work and stay on the seam: MEASURED 192 B
-    # for this blob (12 records x 16 B — 10 emitted mid-points plus, since 0.9.0, each of the two
-    # curve ENDPOINTS, which the path no longer holds as records to hand through), identical on the
-    # second call, and far below the 328,544 B the same fill cost on 0.5.4 (16x16). ⚠ 160 B through
-    # 0.8.0.
-    # ⚠ This read 480 B (30 mid-points) through 0.7.0, when the recursion also allocated the
-    # subdivision nodes' throwaway mid-points; 0.7.1 takes those onto a fixed per-depth scratch.
-    # The checks below bound the cost rather than pin it, so the figure is documentation.
-    check(quad_cost > 0, 1);                                           # 43
+    # ⭐⭐ 0.10.0: A FILL OF CURVES COSTS THE SEAM **0 B**. The flatten output went inline, so an
+    # emitted point is two stores into raster.cyr's process-lifetime per-curve buffer and there is
+    # nothing per-point left to allocate. The arc, for this one blob:
+    #     0.5.4  328,544 B      0.7.0  480 B (30 mid-points, throwaway nodes included)
+    #     0.7.1  160 B          0.9.0  192 B (+2: the curve endpoints the path stopped holding)
+    #     0.10.0   0 B
+    # ⚠ The check is now an EQUALITY, not a bound — 0 is a fact, not a budget — and #44 still holds
+    # it identical on the second call, which is what says the buffer is reused and not re-taken.
+    check(quad_cost, 0);                                               # 43
     check(quad_cost, quad_cost2);                                      # 44
     check(quad_cost < 32768, 1);                                       # 45
     gc = alloc_used();

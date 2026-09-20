@@ -1,0 +1,317 @@
+# programs/transform_test.cyr — RUN test for 0.10.0's three additions:
+#
+#   sd_path_transform(path, m)        affine a path's points IN PLACE, allocating nothing
+#   sd_path_bounds(path, out)         the control-point box, into a caller's 32 B buffer
+#   sd_polyline_point_x / _y(pl, i)   read a flattened point's coordinates
+#
+# ⛔ WHAT THIS SUITE OWNS. The polyline accessors are the survivable half of 0.10.0's ABI break and
+# are exercised all over the tree (programs/flatten_test.cyr, dash_test, area_test, stroke_style_test
+# all read through them now); what is NOT covered anywhere else is that they agree with a RAW strided
+# read of the block sd_polyline_points still hands back — which is the read a consumer walking the
+# array itself will write, and the one that silently changed meaning. Groups A and B own that.
+# Groups C-F own sd_path_transform, and G-H sd_path_bounds.
+#
+# ⭐ THE TRANSFORM'S CONTRACT IS "the same arithmetic as sd_matrix_apply, without the allocation",
+# so the oracle for every case is sd_matrix_apply itself, point by point, to the raw unit. That is
+# group D and it is what makes the other groups' figures meaningful.
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "transform_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+var ONE = 65536;
+
+# ---- hooks ----------------------------------------------------------------------------------
+var g_bytes = 0;
+var g_calls = 0;
+
+fn hook_count(n): i64 {
+    g_calls = g_calls + 1;
+    g_bytes = g_bytes + n;
+    return alloc(n);
+}
+
+fn reset_counts(): i64 {
+    g_bytes = 0;
+    g_calls = 0;
+    return 0;
+}
+
+# ---- corpus ---------------------------------------------------------------------------------
+# A path with every verb type, deliberately straddling the origin and both axes so a sign error
+# in the matrix arithmetic cannot cancel.
+fn mixed_path(): i64 {
+    var p = sd_path_new();
+    if (p == 0) { return 0; }
+    sd_path_moveto(p, 0 - (3 * ONE), 2 * ONE);
+    sd_path_lineto(p, 5 * ONE, 0 - ONE);
+    sd_path_quadto(p, 9 * ONE, 4 * ONE, 2 * ONE, 7 * ONE);
+    sd_path_cubicto(p, 0 - ONE, 11 * ONE, 13 * ONE, 0 - (6 * ONE), 4 * ONE, ONE);
+    sd_path_close(p);
+    return p;
+}
+
+# The same points, as a second path — a transform is IN PLACE, so every comparison needs a witness
+# built independently rather than a copy taken after the fact.
+fn mixed_twin(): i64 { return mixed_path(); }
+
+fn main(): i64 {
+    alloc_init();
+
+    # ── A) THE POLYLINE ACCESSORS ARE THE LAYOUT ──────────────────────
+    # Every flattened point, read both ways: through the accessors, and through a raw strided read
+    # of sd_polyline_points. They must agree on all of them — that IS the published stride.
+    var ap = mixed_path();
+    check(ap != 0, 1);                                                 # 1
+    var apl = sd_path_flatten(ap, ONE >> 2);
+    check(apl != 0, 1);                                                # 2
+    var an = sd_polyline_count(apl);
+    check(an > 8, 1);                                                  # 3 — the curves subdivided
+    var apts = sd_polyline_points(apl);
+    var abad = 0;
+    var ai = 0;
+    while (ai < an) {
+        var rx = load64(apts + ai * SD_POLYLINE_PT_SIZE + SD_POINT_X_OFFSET);
+        var ry = load64(apts + ai * SD_POLYLINE_PT_SIZE + SD_POINT_Y_OFFSET);
+        if (sd_polyline_point_x(apl, ai) != rx) { abad = abad + 1; }
+        if (sd_polyline_point_y(apl, ai) != ry) { abad = abad + 1; }
+        ai = ai + 1;
+    }
+    check(abad, 0);                                                    # 4 — accessor == raw read
+    # ⛔ AND THE STRIDE IS 16, NOT 8 — stated as a value and not only as a layout. Two consecutive
+    # points are 16 B apart, so point 1's x sits where 0.9.1 put point 2's POINTER.
+    check(SD_POLYLINE_PT_SIZE, 16);                                    # 5
+    if (an > 1) {
+        check(load64(apts + 16), sd_polyline_point_x(apl, 1));         # 6
+        check(load64(apts + 24), sd_polyline_point_y(apl, 1));         # 7
+    } else {
+        check(0, 0);                                                   # 6 — unreachable; keeps the
+        check(0, 0);                                                   # 7   numbering stable
+    }
+
+    # ── B) (0, 0) IS A POINT HERE TOO ─────────────────────────
+    # The same trap 0.9.0's inline points sprang on paths: a coordinate of 0 is a real coordinate,
+    # and a walk that used a null test as "no point" reads the origin as absent. A curve THROUGH the
+    # origin must appear in the output.
+    var bp = sd_path_new();
+    sd_path_moveto(bp, 0 - (4 * ONE), 0);
+    sd_path_quadto(bp, 0, 0 - (4 * ONE), 4 * ONE, 0);
+    var bpl = sd_path_flatten(bp, ONE >> 2);
+    check(bpl != 0, 1);                                                # 8
+    check(sd_polyline_point_x(bpl, 0), 0 - (4 * ONE));                 # 9 — first is the moveto
+    check(sd_polyline_point_y(bpl, 0), 0);                             # 10 — whose y IS zero
+    var bn = sd_polyline_count(bpl);
+    check(sd_polyline_point_x(bpl, bn - 1), 4 * ONE);                  # 11 — last is the endpoint
+    check(sd_polyline_point_y(bpl, bn - 1), 0);                        # 12
+
+    # ── C) sd_path_transform: THE GUARDS ────────────────────────
+    check(sd_path_transform(0, sd_matrix_identity()), SADISH_ERR_BOUNDS);   # 13 — null path
+    var cp = mixed_path();
+    check(sd_path_transform(cp, 0), SADISH_ERR_BOUNDS);                # 14 — null matrix
+    # ⚠ A refused matrix constructor answers 0, and that 0 must not be dereferenced — this is the
+    # same contract sd_matrix_apply keeps (src/geom.cyr).
+    var cempty = sd_path_new();
+    check(sd_path_transform(cempty, sd_matrix_identity()), SADISH_OK); # 15 — no points: a no-op
+    check(sd_path_point_count(cempty), 0);                             # 16 — and still none
+
+    # ── D) THE ORACLE: IDENTICAL TO sd_matrix_apply, POINT BY POINT ────────────
+    # Five matrices, each applied both ways. sd_path_transform must land on exactly the coordinates
+    # sd_matrix_apply computes for the same input — not near them.
+    var dmats = alloc(5 * 8);
+    store64(dmats + 0,  sd_matrix_identity());
+    store64(dmats + 8,  sd_matrix_translate(3 * ONE + 17, 0 - (2 * ONE) - 5));
+    store64(dmats + 16, sd_matrix_scale(2 * ONE + 32768, ONE >> 1));
+    store64(dmats + 24, sd_matrix_rotate(34314));   # pi/6 in 16.16 radians
+    store64(dmats + 32, sd_matrix_mul(sd_matrix_translate(7 * ONE, 0 - (3 * ONE)),
+        sd_matrix_scale(0 - ONE, 3 * ONE)));
+    var dbad = 0;
+    var dm = 0;
+    while (dm < 5) {
+        var m = load64(dmats + dm * 8);
+        var dsrc = mixed_twin();        # the untransformed witness
+        var dst = mixed_path();
+        check(sd_path_transform(dst, m), SADISH_OK);                   # 17, 20, 23, 26, 29
+        check(sd_path_point_count(dst), sd_path_point_count(dsrc));    # 18, 21, 24, 27, 30 — count
+        #                                                                is untouched
+        var di = 0;
+        while (di < sd_path_point_count(dsrc)) {
+            var want = sd_matrix_apply(m, sd_point_new(sd_path_point_x(dsrc, di),
+                sd_path_point_y(dsrc, di)));
+            if (sd_path_point_x(dst, di) != sd_point_x(want)) { dbad = dbad + 1; }
+            if (sd_path_point_y(dst, di) != sd_point_y(want)) { dbad = dbad + 1; }
+            di = di + 1;
+        }
+        check(dbad, 0);                                                # 19, 22, 25, 28, 31
+        dm = dm + 1;
+    }
+
+    # ── E) IT ALLOCATES NOTHING ───────────────────────────
+    # ⭐ THE REASON THE FUNCTION EXISTS. The loop a consumer writes by hand — sd_matrix_apply over
+    # every point, into a path it rebuilds — costs one 16 B record per point plus a whole second
+    # path. This costs zero, because a point is two i64 in a flat array and the transform writes
+    # them back where it found them.
+    var ep = mixed_path();
+    var enpts = sd_path_point_count(ep);
+    check(enpts, 7);                                                   # 32 — 1 + 1 + 2 + 3, close
+    #                                                                    consumes no point
+    var em = sd_matrix_rotate(51472);               # pi/4 in 16.16 radians
+    var eprev = sd_alloc_set(&hook_count);
+    reset_counts();
+    check(sd_path_transform(ep, em), SADISH_OK);                       # 33
+    sd_alloc_set(eprev);
+    check(g_calls, 0);                                                 # 34 — ⛔ NOT ONE ALLOCATION
+    check(g_bytes, 0);                                                 # 35
+    # ...and the hand-rolled shape it replaces, measured beside it so the figure is not an assertion
+    # about nothing: one sd_point_new per point, on the same hook.
+    var ep2 = mixed_path();
+    eprev = sd_alloc_set(&hook_count);
+    reset_counts();
+    var ek = 0;
+    while (ek < enpts) {
+        sd_matrix_apply(em, sd_point_new(sd_path_point_x(ep2, ek), sd_path_point_y(ep2, ek)));
+        ek = ek + 1;
+    }
+    sd_alloc_set(eprev);
+    check(g_calls, 2 * enpts);                                         # 36 — 16 calls for 8 points
+    check(g_bytes, 2 * enpts * 16);                                    # 37 — the input record and
+    #                                                                    the result record, each way
+
+    # ── F) IN PLACE, AND COMPOSABLE ──────────────────────────
+    # Two transforms applied in sequence == one transform by the product. ⚠ Not to the raw unit:
+    # each sd_path_transform rounds its 16.16 multiplies once, so a two-step path rounds twice where
+    # the composed matrix rounds once. The check is a tight BOUND, and it is stated rather than
+    # hidden — an implementation that composed wrongly is off by orders of magnitude, not by 2.
+    var fa = sd_matrix_translate(5 * ONE, 0 - (2 * ONE));
+    var fb = sd_matrix_scale(3 * ONE, 0 - (2 * ONE));
+    var fseq = mixed_path();
+    sd_path_transform(fseq, fa);
+    sd_path_transform(fseq, fb);
+    var fone = mixed_path();
+    sd_path_transform(fone, sd_matrix_mul(fb, fa));      # fb AFTER fa
+    var fbad = 0;
+    var fi = 0;
+    while (fi < sd_path_point_count(fone)) {
+        if (sd_abs(sd_path_point_x(fseq, fi) - sd_path_point_x(fone, fi)) > 2) { fbad = fbad + 1; }
+        if (sd_abs(sd_path_point_y(fseq, fi) - sd_path_point_y(fone, fi)) > 2) { fbad = fbad + 1; }
+        fi = fi + 1;
+    }
+    check(fbad, 0);                                                    # 38 — within 2 raw units
+    # and the VERB stream is untouched by any of it
+    var fverb = mixed_path();
+    var fnv = sd_path_verb_count(fverb);
+    sd_path_transform(fverb, fb);
+    check(sd_path_verb_count(fverb), fnv);                             # 39
+    check(sd_path_verb_at(fverb, 0), SD_VERB_MOVETO);                  # 40
+    check(sd_path_verb_at(fverb, 2), SD_VERB_QUADTO);                  # 41
+    check(sd_path_verb_at(fverb, 3), SD_VERB_CUBICTO);                 # 42
+    check(sd_path_verb_at(fverb, 4), SD_VERB_CLOSE);                   # 43
+
+    # ── G) sd_path_bounds: THE BOX, AND THE GUARDS ─────────────────────
+    var gout = alloc(SD_BOUNDS_SIZE);
+    check(SD_BOUNDS_SIZE, 32);                                         # 44 — four 16.16 words
+    check(sd_path_bounds(0, gout), SADISH_ERR_BOUNDS);                 # 45 — null path
+    var gp = mixed_path();
+    check(sd_path_bounds(gp, 0), SADISH_ERR_BOUNDS);                   # 46 — null out
+    # ⛔ AN EMPTY PATH IS SADISH_ERR_EMPTY_PATH AND `out` IS NOT WRITTEN. A zeroed box would read as
+    # a real, degenerate box at the origin, and a culler would keep the object instead of dropping
+    # it. The canary below is what holds that: it must survive the call untouched.
+    store64(gout + 0, 123456789);
+    var gempty = sd_path_new();
+    check(sd_path_bounds(gempty, gout), SADISH_ERR_EMPTY_PATH);        # 47
+    check(load64(gout + 0), 123456789);                                # 48 — ⛔ NOT written
+
+    # the real box of mixed_path(): min/max over its eight control points
+    check(sd_path_bounds(gp, gout), SADISH_OK);                        # 49
+    check(load64(gout + 0),  0 - (3 * ONE));                           # 50 — min x (the moveto)
+    check(load64(gout + 8),  0 - (6 * ONE));                           # 51 — min y (a cubic ctrl)
+    check(load64(gout + 16), 13 * ONE);                                # 52 — max x (a cubic ctrl)
+    check(load64(gout + 24), 11 * ONE);                                # 53 — max y (a cubic ctrl)
+    # a single-point path is a degenerate box at that point, not an error
+    var gdot = sd_path_new();
+    sd_path_moveto(gdot, 7 * ONE, 0 - (9 * ONE));
+    check(sd_path_bounds(gdot, gout), SADISH_OK);                      # 54
+    check(load64(gout + 0),  7 * ONE);                                 # 55
+    check(load64(gout + 16), 7 * ONE);                                 # 56 — max == min
+    check(load64(gout + 8),  0 - (9 * ONE));                           # 57
+    check(load64(gout + 24), 0 - (9 * ONE));                           # 58
+
+    # ── H) BOUNDS IS THE CONTROL HULL, NOT THE INK — SAID AS A MEASUREMENT ─────
+    # ⚠ A Bézier lies INSIDE its control polygon and need not touch it, so the box a curve reports
+    # is a superset of the shape drawn. That is the documented contract (conservative is what a
+    # culler needs); this holds it to being a real superset rather than a coincidence, by flattening
+    # the same path and checking every emitted point falls inside the reported box — and that the
+    # box is strictly LARGER than the flattened extent for a curve that bows away from its control.
+    var hp = sd_path_new();
+    sd_path_moveto(hp, 0, 0);
+    sd_path_quadto(hp, 8 * ONE, 16 * ONE, 16 * ONE, 0);   # apex reaches y = 8, control says 16
+    check(sd_path_bounds(hp, gout), SADISH_OK);                        # 59
+    check(load64(gout + 24), 16 * ONE);                                # 60 — the CONTROL's y
+    var hpl = sd_path_flatten(hp, ONE >> 6);
+    var hmaxy = 0;
+    var hout = 0;
+    var hi = 0;
+    while (hi < sd_polyline_count(hpl)) {
+        var hx = sd_polyline_point_x(hpl, hi);
+        var hy = sd_polyline_point_y(hpl, hi);
+        if (hy > hmaxy) { hmaxy = hy; }
+        if (hx < load64(gout + 0))  { hout = hout + 1; }
+        if (hx > load64(gout + 16)) { hout = hout + 1; }
+        if (hy < load64(gout + 8))  { hout = hout + 1; }
+        if (hy > load64(gout + 24)) { hout = hout + 1; }
+        hi = hi + 1;
+    }
+    check(hout, 0);                                                    # 61 — ⛔ every drawn point
+    #                                                                    is inside the reported box
+    check(hmaxy < 16 * ONE, 1);                                        # 62 — and the box is bigger
+    check(hmaxy > 7 * ONE, 1);                                         # 63 — the apex is near y = 8
+
+    # ── I) BOUNDS AFTER A TRANSFORM IS THE TRANSFORMED BOX ──────────────────
+    # The two additions compose: transforming a path then bounding it agrees with bounding the
+    # transformed control points directly. ⚠ Only for an axis-preserving matrix — a rotation turns
+    # the box into a hull of a rotated rectangle, which is NOT the rotated box, and asserting that
+    # would be asserting something false.
+    var ip = mixed_path();
+    var im = sd_matrix_scale(2 * ONE, 3 * ONE);
+    sd_path_transform(ip, im);
+    check(sd_path_bounds(ip, gout), SADISH_OK);                        # 64
+    check(load64(gout + 0),  sd_fixed_mul(2 * ONE, 0 - (3 * ONE)));    # 65 — min x scaled
+    check(load64(gout + 16), sd_fixed_mul(2 * ONE, 13 * ONE));         # 66 — max x scaled
+    check(load64(gout + 8),  sd_fixed_mul(3 * ONE, 0 - (6 * ONE)));    # 67 — min y scaled
+    check(load64(gout + 24), sd_fixed_mul(3 * ONE, 11 * ONE));         # 68 — max y scaled
+    # and bounds allocates nothing either
+    var iprev = sd_alloc_set(&hook_count);
+    reset_counts();
+    check(sd_path_bounds(ip, gout), SADISH_OK);                        # 69
+    sd_alloc_set(iprev);
+    check(g_calls, 0);                                                 # 70 — a query, not a builder
+    check(g_bytes, 0);                                                 # 71
+
+    if (g_fails == 0) {
+        var ok = "transform_test: PASS (sd_path_transform, sd_path_bounds, polyline accessors)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "transform_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

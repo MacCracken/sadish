@@ -321,12 +321,12 @@ fn _sd_round_walk(cv, path, hw): i64 {
         if (verb == SD_VERB_QUADTO) {
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
+            store64(fctx + 16, SD_FLATTEN_PCAP);
             if (has_cur != 0) {         # a curve before any moveto is skipped (see raster.cyr)
                 var qex = sd_path_point_x(path, pi + 1);
                 var qey = sd_path_point_y(path, pi + 1);
                 _sd_flatten_quad_xy(fctx, curx, cury, sd_path_point_x(path, pi),
-                  sd_path_point_y(path, pi), qex, qey, 0, tol, SD_FLATTEN_MAX_DEPTH);
+                  sd_path_point_y(path, pi), qex, qey, tol, SD_FLATTEN_MAX_DEPTH);
                 run_n = _sd_run_append(run_n, fctx, 0);
                 curx = qex;
                 cury = qey;
@@ -336,13 +336,13 @@ fn _sd_round_walk(cv, path, hw): i64 {
         if (verb == SD_VERB_CUBICTO) {
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
+            store64(fctx + 16, SD_FLATTEN_PCAP);
             if (has_cur != 0) {         # a curve before any moveto is skipped (see raster.cyr)
                 var kex = sd_path_point_x(path, pi + 2);
                 var key = sd_path_point_y(path, pi + 2);
                 _sd_flatten_cubic_xy(fctx, curx, cury, sd_path_point_x(path, pi),
                   sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
-                  sd_path_point_y(path, pi + 1), kex, key, 0, tol, SD_FLATTEN_MAX_DEPTH);
+                  sd_path_point_y(path, pi + 1), kex, key, tol, SD_FLATTEN_MAX_DEPTH);
                 run_n = _sd_run_append(run_n, fctx, 0);
                 curx = kex;
                 cury = key;
@@ -654,18 +654,21 @@ fn _sd_inner_grow(n): i64 {
 # is dropped (see _sd_run_fits). Returns the new count. (0.7.0: was sd_stroke_append(run, run_n,
 # fctx), bounded by SD_FLATTEN_CAP; the run pointer is no longer a parameter because growth
 # replaces the block.)
-# ⚠ THE CTX'S POINTS ARE STILL SdPoints AND THE RUN IS NOT (0.9.0): each emitted point's two
-# coordinates are COPIED into the run's 16 B slot, so nothing in the run points at anything. That is
-# what lets a flatten's per-curve buffer be rewound under a run that is still being stroked.
+# ⭐ BOTH SIDES ARE COORDINATES NOW (0.10.0; the ctx held SdPoint ptrs through 0.9.1, and this
+# function loaded one per point to read its two words out). The COPY is still a copy and must stay
+# one: it is what lets a flatten's per-curve buffer be rewound under a run that is still being
+# stroked. ⛔ Do not "optimise" it into an alias of the buffer — the rewind would then rewrite the
+# run underneath the stroker.
 fn _sd_run_append(run_n, fctx, flags): i64 {
     var pts = load64(fctx + 0);
     var n = load64(fctx + 8);
     var i = 0;
     while (i < n) {
         if (_sd_run_fits(run_n + 1, flags) != 0) {
-            var p = load64(pts + i * 8);
-            store64(_sd_stroke_run + run_n * 16, sd_point_x(p));
-            store64(_sd_stroke_run + run_n * 16 + 8, sd_point_y(p));
+            store64(_sd_stroke_run + run_n * 16,
+              load64(pts + i * SD_POLYLINE_PT_SIZE + SD_POINT_X_OFFSET));
+            store64(_sd_stroke_run + run_n * 16 + 8,
+              load64(pts + i * SD_POLYLINE_PT_SIZE + SD_POINT_Y_OFFSET));
             run_n = run_n + 1;
         }
         i = i + 1;
@@ -1331,9 +1334,9 @@ fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
             var qey = sd_path_point_y(path, pi + 1);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
+            store64(fctx + 16, SD_FLATTEN_PCAP);
             _sd_flatten_quad_xy(fctx, curx, cury, sd_path_point_x(path, pi),
-              sd_path_point_y(path, pi), qex, qey, 0, tol, SD_FLATTEN_MAX_DEPTH);
+              sd_path_point_y(path, pi), qex, qey, tol, SD_FLATTEN_MAX_DEPTH);
             var qn0 = run_n;
             run_n = _sd_run_append(run_n, fctx, 1);
             _sd_sb_mark_curve(qn0, run_n);
@@ -1348,10 +1351,10 @@ fn _sd_styled_walk(cv, path, hw, cap, join, ml, dashed): i64 {
             var key = sd_path_point_y(path, pi + 2);
             store64(fctx + 0, fbuf);
             store64(fctx + 8, 0);
-            store64(fctx + 16, SD_FLATTEN_CAP);
+            store64(fctx + 16, SD_FLATTEN_PCAP);
             _sd_flatten_cubic_xy(fctx, curx, cury, sd_path_point_x(path, pi),
               sd_path_point_y(path, pi), sd_path_point_x(path, pi + 1),
-              sd_path_point_y(path, pi + 1), kex, key, 0, tol, SD_FLATTEN_MAX_DEPTH);
+              sd_path_point_y(path, pi + 1), kex, key, tol, SD_FLATTEN_MAX_DEPTH);
             var cn0 = run_n;
             run_n = _sd_run_append(run_n, fctx, 1);
             _sd_sb_mark_curve(cn0, run_n);

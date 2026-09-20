@@ -390,7 +390,10 @@ fn main(): i64 {
     # because they are keyed to so_count and not written down. A capacity one slot short of its
     # site's real need still doubles an array and reads 11 here (MEASURED, as a mutation).
     check(so_count(0, SD_AA_SUBSCANLINE), 3 + 3 + 3);                  # 14
-    check(so_count(2, SD_AA_SUBSCANLINE) > 0, 1);                      # 15 — the curve's mid-points
+    # ⭐⭐ 0.10.0: A CURVE COSTS THE SEAM NOTHING EITHER, so #12/#13's "0 B once warm" promise now
+    # covers the whole styled walk and not just its straight cases. The flatten output holds
+    # coordinates, so the curve's mid-points are stores into the process-lifetime per-curve buffer.
+    check(so_count(2, SD_AA_SUBSCANLINE), 0);                          # 15 — 0.9.1: > 0
 
     # ── B) THE ROUND STROKER: EVERY K, BOTH ENGINES ────────────────────
     # ⛔ K = 0 is the audit's SIGSEGV: the piece path's constructor refused (sd_path_new then,
@@ -666,15 +669,23 @@ fn main(): i64 {
     sd_canvas_clear(h2);
     check(sd_canvas_stroke_path(h2, g_line, SO_WIDTH), SADISH_OK);      # 104
     check(cov_diff(h2, so_ref(0, SD_AA_SUBSCANLINE)), 0);              # 105
-    # The styled path's partial picture is the same story through a different mechanism: a starved
-    # flatten leaves a COARSER polyline, so its ink is not a subset — only its code is honest.
+    # ⛔⛔ THE STYLED PATH USED TO HAVE A PARTIAL PICTURE HERE, AND AT 0.10.0 IT NO LONGER CAN.
+    # Its flatten allocates nothing on the seam, so a budget of ONE does not starve it: the stroke
+    # is whole and the code is SADISH_OK. What remains starvable in a stroke is the ROUND stroker's
+    # per-piece PATHS (#118 below, and every sweep in group B) — those are real sd_path_new_cap
+    # calls on the seam and are refused exactly as before. ⇒ The styled walk is allocation-free;
+    # the round walk is not. 0.9.1 read SADISH_ERR_OOM and a coarser, non-subset picture here.
     var h3 = so_canvas(SD_AA_SUBSCANLINE);
     so_budget(1);
     check(sd_canvas_stroke_path_ex(h3, g_curve, SO_WIDTH, SD_CAP_ROUND, SD_JOIN_MITER, SO_ML),
-      SADISH_ERR_OOM);                                                 # 106
+      SADISH_OK);                                                      # 106 — nothing to refuse
     so_restore();
-    check(cov_sum(h3) > 0, 1);                                         # 107 — a chord-ish stroke, drawn
-    check(cov_diff(h3, so_ref(4, SD_AA_SUBSCANLINE)) > 0, 1);          # 108 — and not the true one
+    check(cov_sum(h3) > 0, 1);                                         # 107 — drawn
+    # ⚠ CASE 5, NOT 4. h3 is drawn ROUND/MITER, and draw_case encodes that as 2 + cap*3 + join =
+    # 2 + 3 + 0 = 5; case 4 is BUTT/BEVEL. The 0.9.1 line compared against 4 and asserted only that
+    # the two DIFFERED, which they did for two reasons at once — the starvation and the wrong
+    # reference. Now that the stroke is whole, the comparison has to name the right picture.
+    check(cov_diff(h3, so_ref(5, SD_AA_SUBSCANLINE)), 0);              # 108 — and it IS the true one
 
     # ── I) THE WITNESS: THE CODE IS PER CALL, sd_flatten_truncated() IS STILL STICKY ───
     # ⚠ The filing's "the witness is sticky: nothing in a stroke clears _sd_flat_trunc, so it reads
@@ -683,16 +694,27 @@ fn main(): i64 {
     # sd_path_flatten clears it), and the RETURN CODE answers for the call.
     sd_path_flatten(g_line, SD_ONE >> 2);
     check(sd_flatten_truncated(), 0);                                  # 109
+    # ⚠ RE-AIMED AT 0.10.0. A starved STYLED stroke used to be how this group raised the flag; its
+    # flatten allocates nothing now, so it cannot. The flag's owner is unchanged — only
+    # sd_path_flatten sets and clears it — so the verdict is raised the way group L3 of
+    # programs/flatten_bound_test.cyr does: refuse a flatten's array DOUBLING.
     var i1 = so_canvas(SD_AA_SUBSCANLINE);
     so_budget(2);
     check(sd_canvas_stroke_path_ex(i1, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
-      SADISH_ERR_OOM);                                                 # 110
+      SADISH_OK);                                                      # 110 — nothing to refuse
     so_restore();
-    check(sd_flatten_truncated(), 1);                                  # 111 — mid-points were lost
+    check(sd_flatten_truncated(), 0);                                  # 111 — and nothing was lost
     var i2 = so_canvas(SD_AA_SUBSCANLINE);
     check(sd_canvas_stroke_path_ex(i2, g_curve, SO_WIDTH, SD_CAP_BUTT, SD_JOIN_MITER, SO_ML),
       SADISH_OK);                                                      # 112 ⭐ no leak into the next call
     check(cov_diff(i2, so_ref(2, SD_AA_SUBSCANLINE)), 0);              # 113
+    # Raise a REAL standing verdict for #117 to find: a flatten whose doubling is refused.
+    var i_pcap = SD_FLATTEN_PCAP;
+    SD_FLATTEN_PCAP = 16;
+    so_budget(2);                       # out, ctx, then the doubling — refused
+    sd_path_flatten(g_curve, SD_ONE >> 2);
+    so_restore();
+    SD_FLATTEN_PCAP = i_pcap;
     check(sd_flatten_truncated(), 1);                                  # 114 ⚠ and still sticky, as ever
     # ⭐ THE ROUND STROKER SCOPES AND RESTORES THE SAME WAY, and this is the pair that gates it —
     # the reason _sd_round_walk exists as a function separate from sd_canvas_stroke_path. A HEALTHY

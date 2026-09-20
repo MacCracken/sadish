@@ -503,13 +503,21 @@ fn main(): i64 {
     # guards on _sd_fill_ectx itself and not on the status (checks 123 and 126 run through that
     # line in both directions).
     var save_cap = SD_FLATTEN_CAP;
+    var save_pcap = SD_FLATTEN_PCAP;
     _sd_fill_ectx = 0;                       # force a re-initialisation
     SD_FLATTEN_CAP = 300000000;              # * 8 = 2,400,000,000 B, over ALLOC_MAX
+    # ⚠ BOTH KNOBS SINCE 0.10.0. The two per-curve POINT buffers are sized by SD_FLATTEN_PCAP now,
+    # not SD_FLATTEN_CAP — so raising CAP alone left fbuf and sfbuf at 65,536 B each, and they were
+    # GRANTED while the other three were refused (MEASURED: 131,144 B instead of 72). That would
+    # still exercise the ensemble, but it would no longer be the "five refused" shape this group
+    # describes, so raise the one that sizes them too.
+    SD_FLATTEN_PCAP = 300000000;             # * 16, likewise over ALLOC_MAX
     var gk = alloc_used();
     check(sd_canvas_fill_path(cv, full, SD_FILL_NONZERO), SADISH_ERR_OOM);   # 123
     check(_sd_fill_ectx, 0);                                           # 124 ⭐ nothing was published
     check(alloc_used() - gk, 3 * 24);                                  # 125 — only the three 24 B ctxs
     SD_FLATTEN_CAP = save_cap;
+    SD_FLATTEN_PCAP = save_pcap;
     gk = alloc_used();
     check(sd_canvas_fill_path(cv, full, SD_FILL_NONZERO), SADISH_OK);  # 126 ⭐ the retry succeeds
     check(alloc_used() - gk, 655432);                                  # 127 — a whole fresh scratch
