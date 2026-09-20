@@ -382,13 +382,24 @@ fn _sd_dash_subpath(cv, run, inner, n, closed, hw, cap, join, ml): i64 {
         var going = 1;
         while (going != 0) {
             going = 0;
-            if (seg - pos > _sd_dash_rem) {         # a boundary strictly inside (pos, seg)
-                pos = pos + _sd_dash_rem;
-                var cx = ax + (dx * pos) / seg;
-                var cy = ay + (dy * pos) / seg;
-                _sd_dash_turn(cv, cx, cy, hw, cap, join, ml);
-                _sd_dash_zeros(cv, cx, cy, hw, cap, join, ml);
-                going = 1;
+            # ⛔⛔ BOUND THE WALK BY THE PIECE BUFFER (0.11.2). The loop below advances by
+            # _sd_dash_rem, so the iteration count is segment_length / dash_period — and BOTH are
+            # attacker-chosen: a pattern of one raw 16.16 unit over a long path is ~3e9 boundaries.
+            # The MEMORY was already bounded (a refused growth sets _sd_dash_trunc and the point is
+            # dropped), but the WORK was not: the walk kept cutting dashes into a buffer that could
+            # not take them. ⇒ Once truncation is flagged, nothing further can be stored, so
+            # continuing changes no pixel — stopping here is free of rendering consequence and is
+            # what makes the work bounded by the buffer rather than by the input.
+            if (_sd_dash_trunc != 0) { going = 0; }
+            else {
+                if (seg - pos > _sd_dash_rem) {         # a boundary strictly inside (pos, seg)
+                    pos = pos + _sd_dash_rem;
+                    var cx = ax + (dx * pos) / seg;
+                    var cy = ay + (dy * pos) / seg;
+                    _sd_dash_turn(cv, cx, cy, hw, cap, join, ml);
+                    _sd_dash_zeros(cv, cx, cy, hw, cap, join, ml);
+                    going = 1;
+                }
             }
         }
         _sd_dash_rem = _sd_dash_rem - (seg - pos);

@@ -1,6 +1,6 @@
 # sadish roadmap
 
-**Where we are:** 0.11.1. 35 RUN suites green; `fmt`, `lint`, `vet` and `distlib --check` clean;
+**Where we are:** 0.11.2. 35 RUN suites green; `fmt`, `lint`, `vet` and `distlib --check` clean;
 `dist/sadish.cyr` in sync; toolchain pinned to **6.6.6**; the host build diagnostic-free and the
 aarch64 + AGNOS cross-builds gated. agnos's `tests/gpu/refagree.cyr` holds the default fill
 byte-identical across 200 random paths — green through every release since 0.6.0, and the standing
@@ -35,6 +35,7 @@ The measurements and contracts live in [`../../CHANGELOG.md`](../../CHANGELOG.md
 | v0.10.0 | `SdPolyline` points inline — a flatten is 5 allocations, not 20,004; `sd_path_transform`; `sd_path_bounds` |
 | v0.11.0 | pattern paint + `SD_SPREAD_NONE`; `docs/api.md`; the `/dev/fb0` device line gated |
 | v0.11.1 | the audit release — four crashes, a heap overflow, a size-wrap and a non-terminating rotate |
+| v0.11.2 | the optimization half — 8.5x a styled stroke, 8.0x a mapped pattern, a quadratic sort made linear |
 
 ---
 
@@ -101,28 +102,23 @@ before 1.0**, because adding a verb after it is an ABI change.
 them: a dhancha/crab question, not a sadish one, and the answer decides whether this belongs in 1.0
 at all.
 
-### Performance — found by the 0.11.1 audit, deliberately deferred
+### ~~Performance — found by the 0.11.1 audit~~ — CLOSED in 0.11.2
 
-⚠ Each of these is a REAL win and a REWRITE. 0.11.1 took only the two that were also correctness
-bugs (CORDIC's non-terminating reduction, and the per-pixel colour unpack in `sd_hline`/`sd_vline`).
-The rest need their own before/after measurement alongside a byte-identical rendering proof, which
-is why they are here and not in that release. VERIFIED against the tree at 0.11.1:
+All five landed, each byte-identical against the 340-measurement oracle. The headline: a styled
+stroke **8.49x**, a mapped pattern blit **8.04x**, a round stroke **2.82x**, and a reverse-ordered
+120-bar fill **7.3x** (138.5 ms → 18.9). Measurements are in
+[`../../CHANGELOG.md`](../../CHANGELOG.md).
 
-- **The crossings insertion sort — O(nc²) per sub-scanline, in TWO places.** `src/raster.cyr` and
-  `src/stroke.cyr`'s flush carry the same sort. Cheap for a few crossings, quadratic for a
-  self-intersecting outline, which is exactly what an untrusted glyph can be.
-- **`sd_canvas_fill_union` sweeps the WHOLE canvas per piece.** The round stroker calls it once per
-  segment and per vertex, so a stroke is O(pieces × canvas area) regardless of the piece's size.
-  The largest single win on the list.
-- **The fill rescans its entire edge list for every sub-scanline of every row.** An active edge
-  table is the standard answer; it is also the biggest change.
-- **The clip node and mask base are re-loaded per pixel** in both coverage writers — loop-invariant.
-- **The mapped pattern blit runs a 16-bit long division per pixel** and discards all 16 fraction
-  bits (nearest sampling). A DDA would carry it, exactly as the radial gradient already does.
+⚠ **One finding did not survive measurement, and that is worth keeping.** The crossings insertion
+sort was the audit's most-converged perf finding, and on ordinary geometry replacing it moved
+nothing — crossings usually arrive nearly sorted, where insertion sort is linear. It earns its place
+only against an adversarially-ordered path, which is a SECURITY win rather than a throughput one.
+⇒ The lesson for the next sweep: a converged finding is a hypothesis, not a measurement.
 
-⚠ Also raised and NOT yet settled: the dash walk iterates `segment_length / pattern_period` with no
-cap, so an attacker-chosen tiny period over a long path is unbounded work that is nonetheless
-"doing what was asked". Decide whether a cap belongs there before 1.0.
+⚠ **Still open, and now the only unbounded-work item left:** nothing caps how many dashes a pattern
+may cut — 0.11.2 bounded the walk by the piece buffer, so the work is finite, but a caller asking
+for ten million dashes still gets ten million dashes' worth of work. Decide before 1.0 whether that
+is the contract.
 
 ### Infrastructure
 

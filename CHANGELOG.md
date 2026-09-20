@@ -5,6 +5,109 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.2] - 2026-09-20 — the optimization half: 8.5x on a styled stroke, 8.0x on a mapped pattern
+
+0.11.1 repaired the audit's correctness findings and deferred its performance ones. This is those,
+done. ⛔ **Every change is byte-identical output.** The 340-measurement oracle — fills (both rules,
+both AA engines), all three strokers, dashes, clips, gradient paint, pattern paint, both
+premultiplied sinks, flatten geometry — diffs to **zero** against 0.11.1 after every single edit,
+and was re-run after each. 35 RUN suites green; `lint`, `vet`, `fmt`, `distlib --check` and the
+aarch64 + AGNOS cross-builds clean.
+
+MEASURED on this host, 256x256 unless noted, ns per operation:
+
+| | 0.11.1 | 0.11.2 | |
+|---|---:|---:|---|
+| styled stroke, 24-point star | 53,575,677 | **6,307,238** | **8.49x** |
+| mapped pattern blit | 13,776,412 | **1,714,151** | **8.04x** |
+| round stroke, 60-segment zigzag (128x96) | 14,662,832 | **5,195,205** | **2.82x** |
+| clipped fill | 1,774,815 | 1,570,203 | 1.13x |
+| fill, 24-point star | 1,691,164 | 1,541,470 | 1.10x |
+| unmapped pattern blit | 1,392,832 | 1,401,785 | 1.00x — untouched, as it should be |
+
+### Changed — the fill's row loop is bounded by the path, not the canvas
+
+⭐ **The largest win, and it is one loop bound.** `sd_fill_impl` swept `py = 0 .. h` for every fill.
+For each row outside the shape it still zeroed the whole accumulator, rescanned **every edge**
+`ssy` times, and wrote every pixel. A small path on a big canvas paid for the canvas.
+⛔ **And the round stroker calls this once per segment and per vertex**, so a stroke paid for the
+whole canvas per piece — which is why a styled stroke, whose round caps and joins fill through
+`sd_canvas_fill_union`, was 8.5x more expensive than it needed to be.
+⇒ The edge list's own y extent bounds the loop, widened a row each way (a sub-scanline near a
+boundary belongs to the neighbouring row) and clamped to the canvas.
+
+⚠ **The two combine modes are NOT symmetric, and this is the part that could have gone wrong.**
+With `combine != 0` (`sd_canvas_fill_union`) an outside row resolves to `c < oldc` and stores `oldc`
+back — a provable no-op, so it is skipped outright. With `combine == 0` (`sd_canvas_fill_path`) an
+outside row stores **zero**, which is a real clear of whatever the canvas held, so it still happens —
+as a flat row fill rather than a per-pixel walk through the clip test. Skipping there would have left
+stale ink outside every shape. Both directions are gated (`programs/harden_test.cyr` group F).
+
+### Changed — the crossings sort is shell, not insertion: a quadratic DoS becomes linear
+
+Both `src/raster.cyr`'s fill and `src/stroke.cyr`'s flush carried the same O(nc²) insertion sort.
+⚠ **It shows no win on ordinary geometry** — MEASURED, the benchmarks above moved by less than noise
+when only the sort changed, because crossings usually arrive nearly sorted and insertion sort's best
+case is linear. That is said plainly rather than claiming a win it does not deliver.
+⛔ **What it fixes is the adversarial case**, which a consumer rasterizing untrusted outlines can be
+handed: emit the geometry right-to-left and every scanline's crossings arrive in descending x.
+MEASURED, a fill of N reverse-ordered bars:
+
+| bars | insertion sort | shell sort | |
+|---|---:|---:|---|
+| 30 | 10,279,676 | 4,340,836 | 2.4x |
+| 60 | 36,413,952 | 8,719,048 | 4.2x |
+| 120 | **138,511,664** | **18,923,719** | **7.3x** |
+
+Insertion sort scales 3.5x, 3.8x per doubling — quadratic. Shell sort scales 2.0x, 2.2x — linear.
+⚠ **Shell sort is not stable and insertion sort was.** Safe here and only here: two crossings with
+equal x bound a zero-width span, so their order cannot change the winding on the far side and no
+pixel lies between them. Gated by painting the same bars in both orders and diffing the coverage
+(`programs/harden_test.cyr` group G), not by that argument.
+
+### Changed — the mapped pattern blit carries its coordinate instead of dividing for it
+
+Two 16-iteration long divisions **per pixel** made a mapped pattern blit 9.9x an unmapped one. Two
+facts collapse them:
+1. `sd_asr(_sd_paint_divq(N, mdet, 16), 16)` **is** `floor(N / mdet)` — the sixteen fraction bits
+   were computed and then shifted away, and nearest sampling never wanted them. MEASURED over 6,138
+   (value, divisor) pairs across six divisors: identical for every one.
+2. `N` is **linear in x** — `N(x+1, y) - N(x, y) = md * SD_ONE`, a per-blit constant. So the quotient
+   carries as quotient-plus-remainder exactly like the linear gradient's DDA, and a pixel step is
+   two adds and a compare.
+
+Two divisions per **row** now replace two per **pixel**. ⚠ The DDA advances on every pixel, covered
+or not, where the old code computed nothing for an uncovered one — a few adds against a long
+division, which is the right side of that trade at any coverage a pattern is worth using for.
+⛔ The 0.11.0 `sd_asr` fix is not regressed: the shift it guarded no longer exists, and
+`_sd_paint_floordiv` floors rather than truncating, so negative texel indices are still exact —
+`programs/pattern_test.cyr` group D is the gate.
+
+### Changed — the clip node and its mask base are hoisted out of the pixel loop
+
+Both were re-loaded **per pixel** for a value that cannot change during a fill; the mask's row base
+is folded in too, so the inner loop indexes `clipbase + px`. Clip overhead against an unclipped fill
+fell from 8% to **1.9%**.
+
+### Changed — `sd_hline` / `sd_vline` (carried from 0.11.1) and the dash walk is bounded
+
+⛔ **The dash walk's iteration count was attacker-chosen.** It advances by the remaining dash
+length, so the count is `segment_length / dash_period` — a one-unit pattern over a long path is
+~3e9 boundaries. The **memory** was already bounded (a refused growth sets `_sd_dash_trunc` and
+drops the point), but the **work** was not: the walk kept cutting dashes into a buffer that could
+not take them. It now stops when truncation is flagged, which changes no pixel — nothing further
+could be stored — and makes the work bounded by the buffer rather than by the input.
+
+### Added — `programs/harden_test.cyr` groups F and G (77 checks total, up from 63)
+
+Group F gates the row bound in **both** combine directions — that `fill_path` still clears outside
+the shape and that `fill_union` still does not. Group G gates the sort by painting the same bars
+left-to-right and right-to-left and diffing the coverage.
+⭐ **One of these found a wrong assumption of mine while being written.** The first draft asserted
+that an edge-less path clears the canvas under `fill_path`. It does not, and never did:
+`sd_fill_impl` returns at `if (n_edges == 0)` upstream of the row loop. The check now records the
+real contract, and exists precisely because the row bound looks like it could have changed it.
+
 ## [0.11.1] - 2026-09-20 — the audit release: four crashes, a heap overflow and a hang
 
 A P-1 sweep of `src/` across ten lenses — signed shifts, overflow, division, memory safety,

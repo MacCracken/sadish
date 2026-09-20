@@ -181,8 +181,95 @@ fn main(): i64 {
     check(sd_cos(102944) < 64, 1);                                     # 62 — cos(pi/2) ~ 0
     check(sd_sin(102944) > SD_ONE - 64, 1);                            # 63 — sin(pi/2) ~ 1
 
+    # ── F) 0.11.2's ROW BOUND: WHAT IT MUST STILL DO ──────────────
+    # ⛔⛔ THE RISKIEST CHANGE IN 0.11.2. sd_fill_impl now skips the rows outside the path's own y
+    # extent instead of sweeping the whole canvas — an 8.5x win on a styled stroke. But the two
+    # combine modes are NOT symmetric, and getting that wrong leaves stale ink on screen:
+    #   · sd_canvas_fill_path OVERWRITES, so a row outside the shape must still be CLEARED.
+    #   · sd_canvas_fill_union takes max(new, old), so an outside row is a provable no-op and is
+    #     skipped — clearing there would erase the caller's earlier pieces, which is exactly what
+    #     the round stroker accumulates.
+    # Both directions are asserted, because only one of them is what the optimization is for.
+    var fw = 32;
+    var fcv = sd_canvas_new(fw, fw);
+    check(fcv != 0, 1);                                                # 64
+    # paint the whole canvas, then fill a SMALL path: everything outside it must go back to 0
+    memset(sd_canvas_coverage(fcv), 200, fw * fw);
+    var fp = sd_path_new();
+    sd_path_moveto(fp, 4 * ONE, 4 * ONE);
+    sd_path_lineto(fp, 10 * ONE, 4 * ONE);
+    sd_path_lineto(fp, 10 * ONE, 10 * ONE);
+    sd_path_lineto(fp, 4 * ONE, 10 * ONE);
+    sd_path_close(fp);
+    check(sd_canvas_fill_path(fcv, fp, SD_FILL_NONZERO), SADISH_OK);   # 65
+    check(sd_canvas_coverage_at(fcv, 6, 6) > 0, 1);                    # 66 — inside: painted
+    check(sd_canvas_coverage_at(fcv, 25, 25), 0);                      # 67 — ⛔ far outside: CLEARED
+    check(sd_canvas_coverage_at(fcv, 6, 25), 0);                       # 68 — below the bbox
+    check(sd_canvas_coverage_at(fcv, 25, 6), 0);                       # 69 — beside it
+    check(sd_canvas_coverage_at(fcv, 0, 0), 0);                        # 70 — the far corner
+    # and fill_union must NOT clear: the round stroker's whole model is accumulation
+    var ucv = sd_canvas_new(fw, fw);
+    memset(sd_canvas_coverage(ucv), 200, fw * fw);
+    check(sd_canvas_fill_union(ucv, fp, SD_FILL_NONZERO), SADISH_OK);  # 71
+    check(sd_canvas_coverage_at(ucv, 25, 25), 200);                    # 72 — ⛔ UNTOUCHED
+    check(sd_canvas_coverage_at(ucv, 0, 0), 200);                      # 73
+    check(sd_canvas_coverage_at(ucv, 6, 6) >= 200, 1);                 # 74 — and max(new, old)
+    # ⚠ A PATH THAT PRODUCES NO EDGES LEAVES THE CANVAS ALONE — it does NOT clear. sd_fill_impl
+    # returns at `if (n_edges == 0)` before the row loop ever runs, and always has. This check
+    # exists because the 0.11.2 row bound looks like it could have changed that and did not: the
+    # early return is upstream of it. ⛔ MEASURED as a wrong assumption while writing this suite —
+    # the first draft asserted 0 here and failed, which is the useful kind of test failure.
+    var ecv = sd_canvas_new(fw, fw);
+    memset(sd_canvas_coverage(ecv), 200, fw * fw);
+    var ep = sd_path_new();
+    sd_path_moveto(ep, ONE, ONE);
+    sd_canvas_fill_path(ecv, ep, SD_FILL_NONZERO);
+    check(sd_canvas_coverage_at(ecv, 16, 16), 200);                    # 75 — untouched, not cleared
+
+    # ── G) THE CROSSINGS SORT ON DESCENDING INPUT ─────────────────
+    # ⭐ Emitting bars RIGHT-TO-LEFT makes every scanline's crossings arrive in descending x — the
+    # insertion sort's worst case, and MEASURED at 120 bars it was 138.5 ms against shell sort's
+    # 18.9. The assertion here is CORRECTNESS, not speed: a sort that is fast and wrong is worse.
+    # Both orders must paint the identical picture.
+    var fwd = sd_path_new();
+    var rev = sd_path_new();
+    var bi = 0;
+    while (bi < 10) {
+        var bx = (2 + bi * 3) * ONE;
+        sd_path_moveto(fwd, bx, 2 * ONE);
+        sd_path_lineto(fwd, bx + 2 * ONE, 2 * ONE);
+        sd_path_lineto(fwd, bx + 2 * ONE, 28 * ONE);
+        sd_path_lineto(fwd, bx, 28 * ONE);
+        sd_path_close(fwd);
+        var rx = (2 + (9 - bi) * 3) * ONE;
+        sd_path_moveto(rev, rx, 2 * ONE);
+        sd_path_lineto(rev, rx + 2 * ONE, 2 * ONE);
+        sd_path_lineto(rev, rx + 2 * ONE, 28 * ONE);
+        sd_path_lineto(rev, rx, 28 * ONE);
+        sd_path_close(rev);
+        bi = bi + 1;
+    }
+    var c1 = sd_canvas_new(fw, fw);
+    var c2 = sd_canvas_new(fw, fw);
+    sd_canvas_fill_path(c1, fwd, SD_FILL_NONZERO);
+    sd_canvas_fill_path(c2, rev, SD_FILL_NONZERO);
+    var sdiff = 0;
+    var sy2 = 0;
+    while (sy2 < fw) {
+        var sx2 = 0;
+        while (sx2 < fw) {
+            if (sd_canvas_coverage_at(c1, sx2, sy2) != sd_canvas_coverage_at(c2, sx2, sy2)) {
+                sdiff = sdiff + 1;
+            }
+            sx2 = sx2 + 1;
+        }
+        sy2 = sy2 + 1;
+    }
+    check(sdiff, 0);                                                   # 76 — ⛔ order-independent
+    check(sd_canvas_coverage_at(c1, 3, 15) > 0, 1);                    # 77 — and it really painted
+
     if (g_fails == 0) {
-        var ok = "harden_test: PASS (pattern stops, null guards, size wraps, present crop, rotate)\n";
+        var ok = "harden_test: PASS (pattern stops, null guards, size wraps, present crop, rotate, row bound, sort)\n";
         syscall(1, 1, ok, strlen(ok));
     } else {
         var bad = "harden_test: FAIL\n";
