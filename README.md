@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.9.0
+Version: 0.9.1
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -27,7 +27,7 @@ paint, premultiplied output, affine transforms, clipping, and an opt-in exact
 2-axis coverage engine — on an allocation seam a consumer can point at its own
 arena.
 
-Current release **0.9.0**. What shipped in each version is in
+Current release **0.9.1**. What shipped in each version is in
 [`CHANGELOG.md`](./CHANGELOG.md); what is left, and what 1.0 still needs, is in
 [`docs/development/roadmap.md`](./docs/development/roadmap.md).
 
@@ -67,7 +67,8 @@ live as of **v0.4.0**; styled strokes, gradient paint and exact 2-axis coverage
 as of **v0.6.0**; dashes, focal gradients and premultiplied output as of **v0.7.0**;
 bounded flattening and checked allocations as of **v0.7.1**; hook-safe strokes and
 bounded fills as of **v0.7.2**; exact-size piece paths and a self-describing
-polyline as of **v0.8.0**; inline path points as of **v0.9.0**.
+polyline as of **v0.8.0**; inline path points as of **v0.9.0**; portable syscall
+constants and an aarch64 + AGNOS cross-build gate as of **v0.9.1**.
 
 ## Dependencies
 
@@ -76,7 +77,7 @@ polyline as of **v0.8.0**; inline path points as of **v0.9.0**.
   leaf. Resolved by `cyrius deps` into `lib/`.
 
 All deps are pinned in `cyrius.cyml`; the toolchain pin is
-`cyrius = "6.6.4"`.
+`cyrius = "6.6.6"`.
 
 ## Quick Start
 

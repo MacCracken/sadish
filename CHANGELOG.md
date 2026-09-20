@@ -5,6 +5,84 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-09-20 — the 6.6.6 pin, and the two things the gates were not catching
+
+A patch release: **no API, no ABI, no rendering change.** The toolchain pin moves 6.6.4 → 6.6.6 and
+`lib/` is re-resolved against it. The pin bump itself needed no source change — the roadmap's
+pre-flight (zero `struct` declarations, no `async`/`operator` fns, no `ret2`/`rethi` pairs, no
+top-level `{ }` blocks, no locally defined `vec_*`) held item for item. What the bump *did* do is
+surface two defects the CI gates had been passing over, and both are fixed here. All 31 RUN suites
+green; `lint`, `vet` and `distlib --check` clean.
+
+### Fixed — `cyrius fmt --check` was a false negative, so the format gate was blind
+
+VERIFIED: `programs/paint_focal_test.cyr` had three continuation lines indented 12 spaces where the
+6.6.6 formatter wants 10 — and `cyrius fmt <file> --check` **exited 0 on it anyway**, while
+`cyrius audit`'s fmt stage failed the same file. The drift is genuinely 6.6.6's: MEASURED, the 6.6.4
+formatter rewrote the file to zero lines, the 6.6.6 formatter to three.
+
+⛔ **The file is the small half of this.** CI's "Format check" step gated on that `--check` exit code,
+so the gate could not have caught the drift it was there to catch — any 6.6.6 re-indent would have
+landed on `main` unreported. The step now formats in place on the clean checkout and lets
+`git diff --exit-code` report, which cannot silently agree: `lib/` is gitignored, so only tracked
+source can dirty the tree at that point. ⚠ The `--check` flag is left unused rather than trusted.
+VERIFIED after the fix by formatting a COPY of every file in `src/` and `programs/` and diffing it
+against the original: **0 of 46 files drift.**
+
+### Fixed — raw x86_64 syscall numbers in `src/`, byte-for-byte
+
+VERIFIED: the aarch64 build emitted exactly one warning, and it was a real portability bug —
+`src/present.cyr:376` issued `syscall(8, …)` for `lseek`, and **8 on ELF-aarch64 is `getxattr`**. The
+roadmap had already predicted this class ("the hard-coded `2`/`1` are also wrong on aarch64"); 6.6.6's
+sharpened diagnostic names the colliding call, which is what made it worth closing now. ⚠ Pre-existing,
+not introduced by the bump — 6.6.4 warned too, less precisely.
+
+**11** sites in `src/` (10 in `present.cyr`, 1 in `error.cyr`) now take the stdlib's target-dispatched
+constants — `SYS_WRITE` / `SYS_CLOSE` / `SYS_LSEEK` — instead of `1`/`3`/`8`.
+⭐ **MEASURED that this moves nothing on the shipped target:** builds are byte-deterministic (verified by
+building one program twice), and **all 32 binaries — every `programs/*.cyr`, smoke included — are
+sha256-identical before and after the substitution.** On x86_64 the constants *are* 1/3/8, and the
+codegen proves it rather than asserting it.
+
+⛔ **The sweep stops at three of five, and the reason is the interesting part.** `open` and `ioctl` have
+NO spelling that exists on every target sadish builds for: **aarch64 has no `open` at all** (only
+`openat`, so the stdlib defines no `SYS_OPEN` for it) and **AGNOS's ABI has no `ioctl`** (no
+`SYS_IOCTL`). MEASURED, not assumed: naming them fails the `--aarch64` and `--agnos` link-checks
+outright — `undefined variable 'SYS_OPEN'` and `undefined variable 'SYS_IOCTL'`. That is strictly worse
+than a wrong number on a path that cannot run on those targets anyway, because everything reached
+through those four calls is the **Linux `/dev/fb0` sink**, which this file's header has always scoped as
+Linux-only; the AGNOS sink is a separate backend (kernel `blit#39`), not a port of this one. They stay
+raw, with the reasoning written at the call site so the sweep is not "finished" by a later reader.
+
+⚠ **This is the first real use of `lib/syscalls.cyr` from `src/`** — at 0.9.0 nothing in `src/` referenced
+a `SYS_*` or `sys_*` symbol. It adds no consumer burden: `syscalls` was already in `[deps] stdlib` and
+already listed in the `dist/sadish.deps` sidecar. VERIFIED by compiling a consumer-style program that
+includes the nine declared stdlib leaves plus `dist/sadish.cyr` and calls through both changed paths
+(`sd_surface_write_ppm` → `SYS_WRITE`/`SYS_CLOSE`, `sadish_err_print_name` → `SYS_WRITE`): links and
+runs clean.
+
+⚠ **`programs/` keeps its raw numbers** (`syscall(2, …)` in `present_open_test.cyr`, `oom_test.cyr`,
+`stride_test.cyr` and others). Deliberate: the suites are host-only and never cross-compiled, so the
+aarch64 collision cannot reach them. Only the shipped library is portable.
+
+### Added — CI cross-builds aarch64 and AGNOS, and fails on the warning that started this
+
+The portability fix above rots unless something gates it, and the roadmap's standing
+"CI builds the host target only" gap is exactly why nothing would have. A new step link-checks
+`programs/smoke.cyr` for **`--aarch64` and `--agnos`** and **fails on the compiler's own `raw syscall`
+diagnostic**, so a re-introduced raw number is caught at the PR rather than at a port.
+⚠ Link-check only — CI has neither an aarch64 nor an AGNOS host, so the binaries are built and not run;
+the RUN suites stay x86_64. VERIFIED locally: all four targets (`x86_64`, `--aarch64`, `--agnos`,
+`--win`) build with **zero** raw-syscall warnings. ⭐ AGNOS is the point of the stack and this is the
+first time anything has proven sadish still compiles for it.
+
+### Changed — toolchain
+
+- `cyrius` pin **6.6.4 → 6.6.6** (`cyrius.cyml`).
+- `lib/` re-resolved from the 6.6.6 store. ⭐ This also clears the standing
+  `warning: ./lib/ shadows version-pinned …/lib — 12 bundled lib(s) differ` that every build carried
+  at 0.9.0: the vendored fold had drifted 12 libs behind. The build is now diagnostic-free on the host.
+
 ## [0.9.0] - 2026-09-16 — SdPath stores its points inline
 
 One change, shipped alone because it is an ABI break: `SdPath`'s points array holds the coordinates

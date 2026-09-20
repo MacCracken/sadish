@@ -85,6 +85,6 @@ fn sadish_err_name(code): i64 {
 # sadish_err_code, which turns the null record into SADISH_ERR_OOM.
 fn sadish_err_print_name(code): i64 {
     var name = sadish_err_name(code);
-    syscall(1, 2, name, strlen(name));
+    syscall(SYS_WRITE, 2, name, strlen(name));
     return 0;
 }

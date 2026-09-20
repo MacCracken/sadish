@@ -107,10 +107,11 @@ fn sd_surface_write_ppm(s, path): i64 {
         if (rgb == 0) { return SADISH_ERR_OOM; }
     }
     # open(path, O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, mode 0644 = 420)
+    # ⚠ RAW 2, not SYS_OPEN — deliberate, see the note above _sd_present_probe's ioctls.
     var fd = syscall(2, path, 577, 420);
     if (fd < 0) { return SADISH_ERR_OTHER; }
     var hlen = sd_ppm_header(hdr, w, h);
-    syscall(1, fd, hdr, hlen);
+    syscall(SYS_WRITE, fd, hdr, hlen);
     # ⚠ Row by row at the surface's stride, not one run of w*h pixels: on a WRAPPED
     # surface the bytes between one row's end and the next row's start are not its pixels.
     var j = 0;
@@ -128,8 +129,8 @@ fn sd_surface_write_ppm(s, path): i64 {
         }
         y = y + 1;
     }
-    syscall(1, fd, rgb, n * 3);
-    syscall(3, fd);
+    syscall(SYS_WRITE, fd, rgb, n * 3);
+    syscall(SYS_CLOSE, fd);
     return SADISH_OK;
 }
 
@@ -161,7 +162,7 @@ var SD_PRESENTER_SIZE    = 72;
 fn _sd_presenter_build(fd, xres, yres, bpp, pitch): i64 {
     var p = sd_alloc(SD_PRESENTER_SIZE);
     if (p == 0) {
-        syscall(3, fd);
+        syscall(SYS_CLOSE, fd);
         return 0;
     }
     store64(p + SD_PRES_FD_OFFSET, fd);
@@ -171,7 +172,7 @@ fn _sd_presenter_build(fd, xres, yres, bpp, pitch): i64 {
     store64(p + SD_PRES_PITCH_OFFSET, pitch);
     var blit = sd_alloc(pitch * yres);
     if (blit == 0) {
-        syscall(3, fd);
+        syscall(SYS_CLOSE, fd);
         return 0;
     }
     # ⛔ THIS memset IS THE LETTERBOX, not hygiene. sd_present_blit paints only the scaled surface;
@@ -200,12 +201,12 @@ fn _sd_presenter_build(fd, xres, yres, bpp, pitch): i64 {
 fn _sd_present_probe(fd): i64 {
     var vinfo = sd_alloc(256);
     if (vinfo == 0) {
-        syscall(3, fd);
+        syscall(SYS_CLOSE, fd);
         return 0;
     }
     var finfo = sd_alloc(256);
     if (finfo == 0) {
-        syscall(3, fd);
+        syscall(SYS_CLOSE, fd);
         return 0;
     }
     # ⛔ THESE TWO memsets ARE WHAT MAKES "a device that answers nothing" MEAN 640x480x32. The
@@ -217,6 +218,15 @@ fn _sd_present_probe(fd): i64 {
     # Gated by programs/present_open_test.cyr group I.
     memset(vinfo, 0, 256);
     memset(finfo, 0, 256);
+    # ⚠ RAW 16, not SYS_IOCTL — and this is the one place the 0.9.1 sweep to the stdlib's
+    # target-dispatched constants deliberately STOPPED. Three of the five calls this file makes have
+    # a spelling that exists on every target sadish builds for (SYS_WRITE / SYS_CLOSE / SYS_LSEEK);
+    # the other two do not: aarch64 has no `open` at all (only `openat`, hence no SYS_OPEN), and
+    # AGNOS's ABI has no `ioctl` (hence no SYS_IOCTL). Naming them would break the `--aarch64` and
+    # `--agnos` link-checks outright, which is worse than the number being wrong on a path that
+    # cannot run there anyway: everything reached through these two calls is the LINUX /dev/fb0
+    # sink, and the header says so. The AGNOS sink is a separate backend (kernel blit#39), not a
+    # port of this one. ⇒ Leave them raw until that backend exists; do not "finish" the sweep.
     syscall(16, fd, 0x4600, vinfo);   # ioctl FBIOGET_VSCREENINFO
     syscall(16, fd, 0x4602, finfo);   # ioctl FBIOGET_FSCREENINFO
     var xres = load32(vinfo + 0);     # fb_var_screeninfo.xres
@@ -373,14 +383,14 @@ fn sd_present_blit(p, s): i64 {
 
     var rows = sh * scale;
     if (yoff + rows > yres) { rows = yres - yoff; }
-    syscall(8, fd, yoff * pitch, 0);                    # lseek SEEK_SET
-    syscall(1, fd, blit + yoff * pitch, rows * pitch);  # write active band
+    syscall(SYS_LSEEK, fd, yoff * pitch, 0);                    # lseek SEEK_SET
+    syscall(SYS_WRITE, fd, blit + yoff * pitch, rows * pitch);  # write active band
     return SADISH_OK;
 }
 
 # @public — close the framebuffer fd.
 fn sd_present_close(p): i64 {
     if (p == 0) { return SADISH_OK; }
-    syscall(3, load64(p + SD_PRES_FD_OFFSET));
+    syscall(SYS_CLOSE, load64(p + SD_PRES_FD_OFFSET));
     return SADISH_OK;
 }

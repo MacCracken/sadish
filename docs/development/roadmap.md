@@ -1,9 +1,10 @@
 # sadish roadmap
 
-**Where we are:** 0.9.0, tagged. 31 RUN suites green, `fmt`/`lint`/`vet` clean, `dist/sadish.cyr` in
-sync. agnos's `tests/gpu/refagree.cyr` holds the default fill byte-identical across 200 random paths —
-it has stayed green through every release since 0.6.0 and is the standing proof that a change did not
-move a pixel.
+**Where we are:** 0.9.1. 31 RUN suites green, `fmt`/`lint`/`vet` clean, `dist/sadish.cyr` in
+sync, toolchain pinned to **6.6.6**, and the host build is now diagnostic-free (0.9.1 re-resolved the
+12-lib-stale vendored `lib/`). agnos's `tests/gpu/refagree.cyr` holds the default fill byte-identical
+across 200 random paths — it has stayed green through every release since 0.6.0 and is the standing
+proof that a change did not move a pixel.
 
 Each entry below says how its claim was established: **VERIFIED** = read out of the tree while writing
 this, **MEASURED** = a figure from the release that shipped it, **UNKNOWN** = cannot be settled from
@@ -24,6 +25,7 @@ The measurements and contracts live in [`../../CHANGELOG.md`](../../CHANGELOG.md
 | v0.7.1–0.7.2 | bounded flattening, checked allocations, hook-safe strokes |
 | v0.8.0 | exact-size piece paths, a self-describing `SdPolyline`, a testable presenter |
 | v0.9.0 | `SdPath` stores its points inline — the ASCII glyph set 78,656 → 58,672 B, 2,783 → 285 allocations |
+| v0.9.1 | the 6.6.6 pin; a format gate that actually gates; portable syscall constants + an aarch64/AGNOS cross-build |
 
 ## The road to 1.0
 
@@ -79,9 +81,13 @@ the contract or the codes are; shipping 1.0 with both leaves a half-built API pe
 this file. Every contract lives in a source header, so a consumer learns the library by reading
 `dist/sadish.cyr` — 7,866 lines. The headers are good; they are just not reachable as documentation.
 
-**CI builds the host target only.** VERIFIED: `.github/workflows/ci.yml` builds `programs/smoke.cyr`
-and each suite with no `--agnos` pass. AGNOS is the point of the stack and nothing proves sadish still
-compiles for it.
+**~~CI builds the host target only.~~ CLOSED in 0.9.1** — `.github/workflows/ci.yml` now carries a
+"Cross-target link-check (aarch64 + AGNOS)" step that builds `programs/smoke.cyr` for both and fails
+on the compiler's `raw syscall` portability diagnostic. VERIFIED locally across all four targets
+(`x86_64`, `--aarch64`, `--agnos`, `--win`): zero raw-syscall warnings.
+⚠ **What it does NOT do:** run anything. CI has neither an aarch64 nor an AGNOS host, so this is a
+link-check — it proves sadish still *compiles* for AGNOS, which is what was missing, not that it
+behaves there. Executing on AGNOS remains UNKNOWN from inside this repo.
 
 ### The AGNOS present path — and a correction
 
@@ -130,3 +136,59 @@ Consumer-side work that sadish cannot verify or perform is tracked in the consum
 here. The one open document in this repo is
 [`proposals/2026-09-15-path-capacity-for-known-size-paths.md`](./proposals/2026-09-15-path-capacity-for-known-size-paths.md),
 whose remaining item is an adoption decision that belongs to its filer.
+
+## The cyrius pin: 6.6.4 → 6.6.6 — DONE in 0.9.1
+
+**Pin is now `cyrius = "6.6.6"` (cyrius.cyml:8), `lib/` re-resolved against it.** The pre-flight
+written here before the bump held item for item: **zero source changes were needed to compile.** Zero
+`struct` declarations (so the new different-struct-copy error and the by-value >8 B deep-copy change
+could not apply), no `async`/`operator` fns, no `ret2`/`rethi` pair returns, no SIMD-typed returns, no
+top-level `{ }` blocks, no `: cstring` parameters, no duplicate global `var`s, no locally defined
+`vec_*`. All 31 suites green on the first build.
+
+⚠ **The two things the pre-flight did NOT predict**, both found by bumping and both fixed in 0.9.1:
+
+1. **The 6.6.6 formatter re-indents continuation lines**, and `programs/paint_focal_test.cyr` had three
+   that drifted. MEASURED: the 6.6.4 formatter rewrote that file to zero lines, 6.6.6 to three.
+   ⛔ Worse, `cyrius fmt <file> --check` **exited 0 on it** while `cyrius audit`'s fmt stage failed it —
+   so CI's format gate, which read that exit code, could not have caught the drift it existed to catch.
+   The gate now formats in place and lets `git diff --exit-code` report. **Do not re-gate on `--check`.**
+2. **The `O_TRUNC` note below was right about scope but pointed at the wrong call.** See the next
+   section.
+
+**The `lib/` re-resolve was the load-bearing step**, as predicted: the vendored fold was 12 libs behind
+the store and every 0.9.0 build carried
+`warning: ./lib/ shadows version-pinned …/lib — 12 bundled lib(s) differ`. `rm -rf lib && mkdir lib &&
+cyrius deps` (what CI does) resolves **24 files** — the 9 declared `[deps] stdlib` leaves plus their
+transitive peers — and clears the warning. ⚠ `cyrius update` instead vendors the **whole 111-file
+snapshot**; same versions, but it is not what `.gitignore` and CI describe. Stay on `cyrius deps`.
+
+## Raw syscall numbers: three of five closed, two deliberately open
+
+The follow-on this file logged as "the hard-coded `2`/`1` are also wrong on aarch64" is **half closed**,
+and the half that stayed open is the more useful record.
+
+**Closed (0.9.1):** `SYS_WRITE` / `SYS_CLOSE` / `SYS_LSEEK` replace `1`/`3`/`8` at 11 sites in `src/`
+(10 in `present.cyr`, 1 in `error.cyr`). The prompt was the compiler itself: `--aarch64` emitted
+`src/present.cyr:376:36: raw syscall 8 is x86_64 lseek; on ELF-aarch64 that number is getxattr`.
+⚠ Pre-existing — 6.6.4 warned too, only less precisely ("not one the aarch64 stdlib declares"); 6.6.6
+naming `getxattr` is what made it worth closing. MEASURED: **all 32 built binaries sha256-identical**
+before and after, so x86_64 codegen provably did not move.
+
+**⛔ Deliberately still raw — and this is the correction to the note above.** The old entry framed the
+open/write pair as one follow-on. They are not the same problem:
+
+- **`open` (raw `2`, two sites)** — **aarch64 has no `open` syscall at all.** It has only `openat`, so
+  the stdlib defines no `SYS_OPEN` for it. There is nothing to name.
+- **`ioctl` (raw `16`, two sites)** — **AGNOS's ABI has no `ioctl`.** No `SYS_IOCTL` either.
+
+MEASURED, not assumed: naming them fails the `--aarch64` and `--agnos` link-checks outright
+(`undefined variable 'SYS_OPEN'` / `'SYS_IOCTL'`). ⇒ A wrong number on a path that cannot run on those
+targets beats a build that does not link, because **every one of those four calls is the Linux
+`/dev/fb0` sink**, which `src/present.cyr`'s header has always scoped as Linux-only. The reasoning is
+written at the call site so a later reader does not "finish" the sweep and break the cross-build.
+⇒ The real close for these two is the **AGNOS presenter backend** (kernel `blit#39`), not a rename —
+and whether sadish should present at all is still the UNKNOWN recorded above.
+
+⚠ **`programs/` keeps its raw numbers** and should: the suites are host-only and never cross-compiled,
+so the collision cannot reach them. Only the shipped library is portable.

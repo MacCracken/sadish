@@ -1,6 +1,16 @@
 # Capacity-sized paths: `sd_path_new_cap(n_verbs, n_points)` for callers that know the path's size
 
-**Status:** 🟡 **STILL OPEN — items 1 and 2 are closed; item 3 is a REKHA ask this repo cannot
+**Status:** 🟢 **CLOSED — item 3 landed in rekha 0.4.3** (2026-09-16), the adoption this repo could not
+witness. `rekha_outline_to_sdpath` counts a glyph's verbs and points (a walk that mirrors its emitter
+branch for branch) and opens the path with `sd_path_new_cap(v, p)`; the five programs are ported to
+`sd_path_point_x` / `_y` / `sd_path_verb_at` and `[deps.sadish]` is 0.9.0, commit-pinned.
+MEASURED on rekha's tree, its own ASCII set: **433,648 B → 59,784 B** (the 1,112 B over this file's
+58,672 are the sub-8-slot paths meeting `SD_PATH_CAP_MIN`), a 54-character label **231,928 B → 55,320 B**
+of arena, `rekha_outline_to_sdpath` 921 → 818 ns; and `rekha/programs/face_test.cyr` now asserts
+`sd_path_verb_cap == sd_path_verb_count` and the same for points across all 2,620 LiberationSans glyphs
+— the estimate is exact for every one, so no path grows. rekha also now checks every `sd_path_*` status,
+so a refused growth returns 0 instead of a silently truncated glyph.
+**Was:** 🟡 **STILL OPEN — items 1 and 2 are closed; item 3 is a REKHA ask this repo cannot
 verify.** 0.7.2 gave the verb and point arrays separate capacities (`SD_PATH_CAP_OFFSET` = verbs,
 `SD_PATH_PCAP_OFFSET` = points, in the 48 B record's former `reserved` word), so
 `sd_path_new_cap(n_verbs, n_points)` opens each array at exactly its own requested capacity and each

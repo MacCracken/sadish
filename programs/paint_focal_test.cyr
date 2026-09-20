@@ -1587,7 +1587,7 @@ fn main(): i64 {
         var gr2 = sd_gradient_radial(30 * ONE + 5 + tx, 21 * ONE + 7 + ty, 17 * ONE + 3);
         var gf1 = sd_gradient_radial_focal(30 * ONE + 5, 21 * ONE + 7, 17 * ONE + 3, 22 * ONE + 3, 25 * ONE);
         var gf2 = sd_gradient_radial_focal(30 * ONE + 5 + tx, 21 * ONE + 7 + ty, 17 * ONE + 3,
-            22 * ONE + 3 + tx, 25 * ONE + ty);
+          22 * ONE + 3 + tx, 25 * ONE + ty);
         pf_zigzag(gl1);
         pf_zigzag(gl2);
         pf_zigzag(gr1);
@@ -1616,12 +1616,12 @@ fn main(): i64 {
     while (gsp < 3) {
         var ql1 = sd_gradient_linear(3 * ONE + 999, 2 * ONE, 25 * ONE + 7, 29 * ONE + 3);
         var ql2 = sd_gradient_linear(0 - 2 * ONE + 40 * ONE + 3, 3 * ONE + 999 - 2 * ONE,
-            0 - (29 * ONE + 3) + 40 * ONE + 3, 25 * ONE + 7 - 2 * ONE);
+          0 - (29 * ONE + 3) + 40 * ONE + 3, 25 * ONE + 7 - 2 * ONE);
         var qr1 = sd_gradient_radial(10 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3);
         var qr2 = sd_gradient_radial(0 - (11 * ONE + 7) + 40 * ONE + 3, 10 * ONE + 5 - 2 * ONE, 17 * ONE + 3);
         var qf1 = sd_gradient_radial_focal(10 * ONE + 5, 11 * ONE + 7, 17 * ONE + 3, 3 * ONE, 14 * ONE + 11);
         var qf2 = sd_gradient_radial_focal(0 - (11 * ONE + 7) + 40 * ONE + 3, 10 * ONE + 5 - 2 * ONE, 17 * ONE + 3,
-            0 - (14 * ONE + 11) + 40 * ONE + 3, 3 * ONE - 2 * ONE);
+          0 - (14 * ONE + 11) + 40 * ONE + 3, 3 * ONE - 2 * ONE);
         pf_zigzag(ql1);
         pf_zigzag(ql2);
         pf_zigzag(qr1);

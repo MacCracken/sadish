@@ -55,17 +55,24 @@ jobs:
           [ $fail -eq 0 ] || { echo "lint: warnings present"; exit 1; }
 
       - name: Format check
-        # cyrius fmt reports via EXIT CODE with --check (0 = clean); file goes
-        # BEFORE the flag.
+        # ⚠ `cyrius fmt <file> --check` exits 0 on files the 6.6.6 formatter
+        # would still rewrite — MEASURED on programs/paint_focal_test.cyr,
+        # which --check called clean while `cyrius fmt` re-indented three
+        # continuation lines (and `cyrius audit`'s fmt stage failed it). So the
+        # --check exit code is NOT a gate. Format in place on the clean
+        # checkout and let git report the drift; lib/ is gitignored, so only
+        # tracked source can dirty the tree here.
         run: |
-          fail=0
           for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr; do
             [ -e "$f" ] || continue
-            if ! cyrius fmt "$f" --check > /dev/null 2>&1; then
-              echo "needs fmt: $f"; fail=1
-            fi
+            cyrius fmt "$f" > /dev/null 2>&1 || true
           done
-          [ $fail -eq 0 ] || { echo "fmt: drift detected"; exit 1; }
+          if ! git diff --quiet -- src programs tests; then
+            echo "fmt: drift detected — run 'cyrius fmt' on these and commit"
+            git --no-pager diff --stat -- src programs tests
+            exit 1
+          fi
+          echo "fmt: clean"
 
       - name: Vet
         run: cyrius vet programs/smoke.cyr
@@ -88,6 +95,29 @@ jobs:
 
       - name: Verify ELF
         run: xxd -l 4 build/sadish-smoke | grep -q "7f45 4c46"
+
+      - name: Cross-target link-check (aarch64 + AGNOS)
+        # AGNOS is the point of the stack, and 0.9.1 replaced src/'s raw x86_64
+        # syscall numbers with the stdlib's target-dispatched SYS_* constants
+        # (syscall 8 is `lseek` on x86_64 but `getxattr` on ELF-aarch64). That
+        # fix rots unless something gates it, so: cross-build, and FAIL on the
+        # compiler's own "raw syscall" portability warning.
+        # ⚠ Link-check only — these binaries are not run here (no aarch64 or
+        # AGNOS host). The suites stay x86_64, and programs/ keeps its raw
+        # numbers deliberately: host-only tests are never cross-compiled.
+        run: |
+          mkdir -p build
+          fail=0
+          for tgt in aarch64 agnos; do
+            echo "== --$tgt =="
+            out=$(cyrius build "--$tgt" programs/smoke.cyr "build/smoke-$tgt" 2>&1) || {
+              echo "$out"; echo "cross: --$tgt failed to build"; fail=1; continue; }
+            if echo "$out" | grep -E 'raw syscall'; then
+              echo "cross: raw syscall warning on --$tgt"; fail=1
+            fi
+            echo "  ok: $(wc -c < "build/smoke-$tgt") bytes"
+          done
+          [ $fail -eq 0 ] || { echo "cross-target link-check failed"; exit 1; }
 
       - name: Test (RUN suites)
         # Every programs/*_test.cyr is a self-checking RUN test: it draws/acts,
