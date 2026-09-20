@@ -1,0 +1,194 @@
+# programs/present_geom_test.cyr — RUN test for sd_present_open ITSELF: the two tokens
+# "/dev/fb0", the geometry probe behind them, and the descriptor hygiene around both.
+#
+# ⛔⛔ WHY THIS SUITE EXISTS, AND WHY IT IS NOT present_open_test. present_open_test drives
+# EVERYTHING BELOW the device name over a regular file — sd_present_open_path and
+# sd_present_open_fd, their four allocation guards, their fd hygiene — and its header states, in
+# capitals, that sd_present_open is "named in comments and nowhere else". That left exactly one
+# line of the library ungated: the device name itself.
+#
+# ⛔ THE CORRECTION THIS SUITE RESTS ON. 0.8.0 recorded the rest of sd_present_open as "needing a
+# display" and wrote it off. That was wrong. sd_present_open OPENS, PROBES AND ALLOCATES — it paints
+# NOTHING. Only sd_present_blit writes pixels, and only that call has ever needed the "no test may
+# touch the live display" rule. ⇒ Opening the real framebuffer, reading its geometry back and
+# closing it is safe, is what this file does, and leaves only the blit ungated.
+# ⛔ NOTHING HERE CALLS sd_present_blit, AND NOTHING HERE MAY BE EDITED INTO DOING SO. That is the
+# one line between this suite and a test that draws on the user's screen.
+#
+# ⚠ IT SKIPS, LOUDLY, WHERE THERE IS NO DEVICE. CI has no framebuffer at all and /dev/fb0 is
+# root:video on a desktop, so a non-member cannot open it. Both are SKIPS, not failures — and the
+# suite prints WHICH BRANCH IT TOOK on every run, because a skip that reads like a pass is worse
+# than no gate at all.
+#
+# ⭐ THE ORACLE IS THE DEVICE, NOT SADISH. Every geometry assertion compares the presenter's fields
+# against this file's OWN ioctl on its OWN descriptor. A shared helper would agree with sadish by
+# construction and prove nothing; two independent reads of the same kernel struct do not.
+# Exit code = failed checks; each failure prints its check number. A skip exits 0.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "present_geom_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+fn say(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+
+fn say_kv(tag, v): i64 {
+    syscall(1, 1, tag, strlen(tag));
+    fmt_int_fd(1, v);
+    syscall(1, 1, "\n", 1);
+    return 0;
+}
+
+# ---- the independent oracle ------------------------------------------------------------------
+# This file's OWN read of the device's geometry, through its OWN descriptor. Deliberately a second
+# implementation of the same four loads sadish makes: see the header.
+var g_xres = 0;
+var g_yres = 0;
+var g_bpp = 0;
+var g_pitch = 0;
+
+# Opens /dev/fb0 READ-ONLY, ioctls both screeninfo structs, closes. Returns 1 on success, 0 if the
+# device cannot be opened at all. ⚠ O_RDONLY: this suite has no business holding a writable
+# descriptor to the display.
+fn probe_device(): i64 {
+    var buf = alloc(512);
+    memset(buf, 0, 512);
+    var fd = syscall(2, "/dev/fb0", 0, 0);              # open O_RDONLY
+    if (fd < 0) { return 0; }
+    syscall(16, fd, 0x4600, buf);                       # ioctl FBIOGET_VSCREENINFO
+    syscall(16, fd, 0x4602, buf + 256);                 # ioctl FBIOGET_FSCREENINFO
+    g_xres  = load32(buf + 0);                          # fb_var_screeninfo.xres
+    g_yres  = load32(buf + 4);                          # .yres
+    g_bpp   = load32(buf + 24);                         # .bits_per_pixel
+    g_pitch = load32(buf + 256 + 48);                   # fb_fix_screeninfo.line_length
+    syscall(3, fd);
+    return 1;
+}
+
+# ---- descriptor hygiene ----------------------------------------------------------------------
+# /proc/self/fd holds one entry per open descriptor, plus "." and "..", plus the directory fd the
+# listing itself holds: the process's own count is entries - 3. (The same instrument
+# present_open_test uses, and from the GLOBAL alloc for the same reason.)
+var g_dirbuf = 0;
+
+fn fd_count(): i64 {
+    var d = syscall(2, "/proc/self/fd", 65536, 0);      # open O_RDONLY|O_DIRECTORY
+    if (d < 0) { return 0 - 1; }
+    var n = 0;
+    var got = syscall(217, d, g_dirbuf, 4096);          # getdents64
+    while (got > 0) {
+        var pos = 0;
+        while (pos < got) {
+            n = n + 1;
+            pos = pos + load16(g_dirbuf + pos + 16);    # linux_dirent64.d_reclen
+        }
+        got = syscall(217, d, g_dirbuf, 4096);
+    }
+    syscall(3, d);
+    return n - 3;
+}
+
+fn main(): i64 {
+    alloc_init();
+    g_dirbuf = alloc(4096);
+
+    if (probe_device() == 0) {
+        # ⚠ THE SKIP BRANCH, SAID OUT LOUD. No framebuffer, or no permission on one. Either way
+        # there is nothing to assert against and the suite passes without having tested anything.
+        say("present_geom_test: SKIP — /dev/fb0 could not be opened (no device, or not in group\n");
+        say("present_geom_test:        'video'). Nothing was asserted. This is NOT a pass.\n");
+        return 0;
+    }
+
+    say("present_geom_test: device geometry read independently of sadish:\n");
+    say_kv("present_geom_test:   xres  ", g_xres);
+    say_kv("present_geom_test:   yres  ", g_yres);
+    say_kv("present_geom_test:   bpp   ", g_bpp);
+    say_kv("present_geom_test:   pitch ", g_pitch);
+
+    # ⚠ WHAT SADISH DOES WHEN THE DEVICE ANSWERS NOTHING. _sd_present_probe leaves its zeroed
+    # buffers and three <= 0 fallbacks turn that into 640x480x32 with a derived pitch. A device
+    # that ioctls successfully cannot hit them, but a stub framebuffer can — so the expectations
+    # below are computed the same way rather than assumed, and the suite is honest on either.
+    var want_x = g_xres;
+    if (want_x <= 0) { want_x = 640; }
+    var want_y = g_yres;
+    if (want_y <= 0) { want_y = 480; }
+    var want_b = g_bpp;
+    if (want_b <= 0) { want_b = 32; }
+    var want_p = g_pitch;
+    var minp = want_x * (want_b / 8);
+    if (want_p < minp) { want_p = minp; }
+
+    # ── A) THE OPEN, THE GEOMETRY, THE CLOSE ───────────────────────
+    var before = fd_count();
+    check(before >= 0, 1);                                             # 1 — the instrument works
+    var p = sd_present_open();
+    check(p != 0, 1);                                                  # 2 — ⭐ THE DEVICE LINE,
+    #                                                                    reached by no other suite
+    if (p == 0) {
+        say("present_geom_test: FAIL — the device probed but sd_present_open returned 0\n");
+        return 1;
+    }
+    check(load64(p + SD_PRES_XRES_OFFSET), want_x);                    # 3 — against the DEVICE
+    check(load64(p + SD_PRES_YRES_OFFSET), want_y);                    # 4
+    check(load64(p + SD_PRES_BPP_OFFSET), want_b);                     # 5
+    check(load64(p + SD_PRES_PITCH_OFFSET), want_p);                   # 6
+    # the scratch band exists and the fd is real
+    check(load64(p + SD_PRES_BLIT_OFFSET) != 0, 1);                    # 7
+    check(load64(p + SD_PRES_FD_OFFSET) >= 0, 1);                      # 8
+    # ⛔ AND THE PITCH IS CONSISTENT WITH THE WIDTH IT REPORTS. A presenter whose pitch is under
+    # xres * bpp/8 would blit rows that overlap — the "tiles across the top band" defect
+    # docs/development/prior-art.md records, which is the reason this record carries a pitch at all.
+    check(load64(p + SD_PRES_PITCH_OFFSET) >= load64(p + SD_PRES_XRES_OFFSET) *
+      (load64(p + SD_PRES_BPP_OFFSET) / 8), 1);                        # 9
+    # one descriptor held while open
+    var during = fd_count();
+    check(during, before + 1);                                         # 10
+    check(sd_present_close(p), SADISH_OK);                             # 11
+    # ⛔ AND IT IS GIVEN BACK. A presenter that returned a record while leaking its fd would pass
+    # every geometry check above and show up nowhere else in the tree.
+    check(fd_count(), before);                                         # 12
+
+    # ── B) IT IS REPEATABLE ─────────────────────────────
+    # ⚠ Opening twice in one process is a real usage (a consumer that reopens after a mode change),
+    # and it is also what says the first close really released the device rather than appearing to.
+    var p2 = sd_present_open();
+    check(p2 != 0, 1);                                                 # 13
+    check(load64(p2 + SD_PRES_XRES_OFFSET), want_x);                   # 14 — same answer
+    check(load64(p2 + SD_PRES_YRES_OFFSET), want_y);                   # 15
+    check(sd_present_close(p2), SADISH_OK);                            # 16
+    check(fd_count(), before);                                         # 17
+
+    # ── C) THE NULL CONTRACT ────────────────────────────
+    check(sd_present_close(0), SADISH_OK);                             # 18 — documented no-op
+    check(fd_count(), before);                                         # 19
+
+    if (g_fails == 0) {
+        say("present_geom_test: PASS (sd_present_open on the real device; nothing drawn)\n");
+    } else {
+        say("present_geom_test: FAIL\n");
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

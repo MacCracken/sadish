@@ -5,6 +5,106 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] - 2026-09-20 — pattern paint, an API reference, and the device line gets a gate
+
+Three roadmap items close: the **image/pattern paint** capability gap, the **"no API reference"**
+infrastructure gap, and the `sd_present_open` device line that 0.8.0 wrongly wrote off as
+untestable. No ABI break — `SdGradient` grows a fourth *kind*, not a field. 34 RUN suites green
+(32 + two new); `lint`, `vet`, `fmt`, `distlib --check` and the aarch64 + AGNOS cross-builds clean.
+
+### Added — pattern paint: a paint that samples a surface
+
+```
+sd_pattern_new(src)                  sd_paint_is_pattern(p)     sd_pattern_source(p)
+sd_pattern_set_filter(p, f)          sd_pattern_filter(p)
+```
+
+A **pattern** is a fourth paint kind (`SD_PAINT_PATTERN`) beside the three gradients. It shares the
+record, the spread, the matrix and both blit entries — `sd_canvas_blit_paint_at` and
+`sd_canvas_blit_paint_premul_at` take it unchanged — and differs only in where a pixel's colour
+comes from: one **source texel**, nearest-neighbour, instead of a stop ramp. A consumer can now draw
+a bitmap, a repeating tile or a cached atlas, which is what a canvas/SVG layer could not do at all.
+
+⭐ **A pattern is ONE allocation**: the 88 B record. It has no stops and no ramp, so it skips the
+4,164 B a gradient spends on those — and the blit dispatches on the kind BEFORE reading either
+field, which is what makes that safe. ⭐ **A pattern blit allocates nothing**, the 0.10.0 property,
+held for the new kind on both the plain and matrix-mapped paths.
+
+⚠ **The source is borrowed, not copied.** It must outlive the pattern, and mutating it changes what
+the pattern paints. Under a per-frame arena, a pattern must not outlive the surface it samples.
+
+⚠ **Nearest only, but the filter is a FIELD, not an assumption.** `sd_pattern_set_filter` refuses
+anything else with `SADISH_ERR_UNSUPPORTED` rather than silently doing nearest, so bilinear can land
+later without an ABI break and a consumer that asks for a filter it did not get is told. Nearest is
+the right default and not merely the cheap one: at 1:1 — a cached tile, an icon, a glyph atlas — it
+is exact, and smoothing there is a defect.
+
+### Added — `SD_SPREAD_NONE`, and a refusal that finally means something
+
+A fourth spread: **paint nothing outside the source rect** (SVG's `pattern`, Canvas's `no-repeat`).
+Without it a consumer could tile or smear edge pixels but never draw one bitmap once.
+
+⛔ **It SKIPS the pixel rather than writing it transparent**, and the difference is real: the
+straight blit forces destination alpha 255, so a "transparent write" still stamps an opaque pixel
+and loses what the destination had. Gated directly (`programs/pattern_test.cyr` group E).
+
+⛔ **A gradient cannot be set to it** — `sd_gradient_set_spread` answers `SADISH_ERR_UNSUPPORTED`,
+and that is the **first use of that code anywhere in the library** (it had zero return sites and
+existed only in the enum). A gradient's `t` is defined everywhere on the plane, so there is no rect
+to be outside of; padding it silently would paint the last stop over the whole canvas. ⚠ A value
+merely outside the enum is still `SADISH_ERR_BOUNDS` — the two refusals differ on purpose.
+⚠ **Behaviour change:** `sd_gradient_set_spread(g, 3)` returned `SADISH_ERR_BOUNDS` through 0.10.0,
+because 3 was one past the last spread. It is `SADISH_ERR_UNSUPPORTED` now.
+
+### Fixed — a signed-shift bug the new suite caught before it shipped
+
+⛔ The pattern sampler's first draft reduced a 16.16 pattern-space coordinate to a texel index with
+`>> SD_SHIFT`. **Cyrius's `>>` is LOGICAL**, so every canvas pixel left of or above a translated
+pattern — exactly what a translating matrix produces — had its sign bits zero-filled and became an
+enormous positive index. MEASURED as that mutation: the three pixels left of the origin read texels
+1, 2, 0 under `REPEAT` instead of 0, 1, 2, and 2, 2, 2 under `PAD` instead of 0, 0, 0. The fix is
+`sd_asr`; `programs/pattern_test.cyr` group D is the gate, and it exists because a negative texel
+index is only reachable through a matrix, which no other suite builds.
+
+### Fixed — `sadish_version()` was stale for two releases
+
+⛔ It returned **900** through 0.9.1 AND 0.10.0 — including across the 0.10.0 **ABI break**, which is
+precisely the release a version probe exists to let a consumer detect. `programs/integration_test.cyr`
+asserted the same stale literal, so the gate agreed with the bug and no suite could see it.
+⇒ It returns **1100**, and CI now **derives the expected number from the `VERSION` file** and fails
+if either the function or the test disagrees. The number cannot drift again.
+
+### Added — `docs/api.md`, a real API reference
+
+VERIFIED at 0.10.0: every contract lived in a source header, so a consumer learned the library by
+reading `dist/sadish.cyr` — now 8,000+ lines. `docs/api.md` covers all **122** public functions by
+module, and front-loads the six cross-cutting rules most consumer bugs come from: 16.16 coordinates
+and why `>>` is not the shift you want; the allocation seam and what a refusal costs; **what a hook
+can still refuse after 0.10.0**; the integer error model and its overloaded codes; the
+0-means-opaque alpha rule and the two alpha worlds; and that none of it is thread safe.
+
+⚠ `cyrius doc` was not used: it captures only the LAST LINE of each doc comment, which for this
+tree's multi-paragraph headers is usually a fragment. The reference is written, and the source
+headers stay normative — where the two disagree, the header is right and the reference is a bug.
+⭐ Its worked example is compiled and run, and every constant in its table is machine-checked.
+
+### Added — `programs/present_geom_test.cyr`: the device line, gated at last
+
+`sd_present_open` — the two tokens `"/dev/fb0"` — was reached by no test in the tree.
+`present_open_test` drives everything BELOW the device name over a regular file and says so in
+capitals; 0.8.0 recorded the rest as "needing a display" and wrote it off. ⛔ **That was wrong:**
+`sd_present_open` opens, probes and allocates but paints NOTHING. Only `sd_present_blit` writes
+pixels, and only that call ever needed the "no test may touch the live display" rule.
+
+The new suite opens the real framebuffer, asserts the presenter's geometry against **its own
+independent ioctl** on its own read-only descriptor (a shared helper would agree with sadish by
+construction and prove nothing), checks the descriptor is held and then given back, opens twice, and
+closes. VERIFIED on a 2560x1440 32bpp device: pitch 10240, nothing drawn.
+⚠ It **SKIPS, loudly**, where there is no framebuffer or no permission — CI has no device and
+`/dev/fb0` is `root:video` — printing which branch it took, because a skip that reads like a pass is
+worse than no gate. Both branches verified. ⛔ It never calls `sd_present_blit`, and that line is
+the only thing between this suite and a test that draws on the user's screen.
+
 ## [0.10.0] - 2026-09-20 — SdPolyline stores its points inline, and a path can transform and bound itself
 
 ⚠ **ABI BREAK**, the one `docs/development/roadmap.md` filed under "What 1.0 freezes". 0.9.0 put

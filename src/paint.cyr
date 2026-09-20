@@ -163,9 +163,31 @@
 var SD_GRADIENT_LINEAR = 0;
 var SD_GRADIENT_RADIAL = 1;
 var SD_GRADIENT_FOCAL  = 2;
+# ⭐ A FOURTH KIND, AND NOT A GRADIENT (0.11.0) — a PATTERN samples a source SdSurface instead of a
+# stop ramp. It shares this record, its spread and its matrix, and paints through the same two blit
+# entries; what differs is only where a pixel's colour comes from. ⚠ The record is still spelled
+# SdGradient for ABI continuity; read it as SdPaint.
+var SD_PAINT_PATTERN   = 3;
+
 var SD_SPREAD_PAD     = 0;
 var SD_SPREAD_REPEAT  = 1;
 var SD_SPREAD_REFLECT = 2;
+# ⭐ PATTERNS ONLY (0.11.0): paint NOTHING outside the source rect — SVG's `pattern` and Canvas's
+# `no-repeat`. Without it a consumer can tile or smear edge pixels but cannot draw one bitmap once.
+# ⛔ A GRADIENT CANNOT BE SET TO IT: sd_gradient_set_spread answers SADISH_ERR_UNSUPPORTED, so the
+# mistake is caught where it is made rather than painting something surprising. A gradient that
+# somehow carries it anyway pads — _sd_gradient_spread's fall-through has always treated an unknown
+# spread as PAD, and that is left standing as the defensive answer, not as an invitation.
+var SD_SPREAD_NONE    = 3;
+
+# ---- pattern filtering -------------------------------------------
+# ⚠ ONE MODE TODAY. The filter is a FIELD, not a constant, so bilinear can land later without an ABI
+# break: sd_pattern_set_filter refuses anything else with SADISH_ERR_UNSUPPORTED rather than
+# silently doing nearest, so a consumer that asks for a filter it did not get is told.
+# ⛔ Nearest is the RIGHT default, not just the cheap one: at 1:1 — a cached tile, an icon, a glyph
+# atlas, which is what a UI toolkit actually blits — it is exact, and any smoothing there is a
+# defect. Bilinear earns its cost only under a scaling or rotating matrix.
+var SD_FILTER_NEAREST = 0;
 
 # The ramp: 2^10 cells over t in [0, 1], stored as N + 1 entries so t = 1 has its own.
 var SD_GRADIENT_RAMP_BITS = 10;
@@ -452,9 +474,124 @@ fn sd_gradient_add_stop(g, offset, color): i64 {
 fn sd_gradient_set_spread(g, spread): i64 {
     if (g == 0) { return SADISH_ERR_BOUNDS; }
     if (spread < SD_SPREAD_PAD) { return SADISH_ERR_BOUNDS; }
+    # ⛔ SD_SPREAD_NONE IS A PATTERN'S, AND THE TWO REFUSALS DIFFER ON PURPOSE (0.11.0). A spread
+    # outside the enum entirely is SADISH_ERR_BOUNDS — a bad argument. SD_SPREAD_NONE on a GRADIENT
+    # is SADISH_ERR_UNSUPPORTED — a real request this paint kind cannot honour, which is exactly
+    # what that code has always meant and, until now, the only thing in the tree that meant it.
+    # ⚠ "Nothing outside" has no meaning for a gradient: t is defined everywhere on the plane, so
+    # there is no rect to be outside OF. Padding it silently would paint the last stop over the
+    # whole canvas, which is the opposite of what the caller asked for.
+    if (spread == SD_SPREAD_NONE) {
+        if (load64(g + SD_GRADIENT_KIND_OFFSET) != SD_PAINT_PATTERN) { return SADISH_ERR_UNSUPPORTED; }
+        store64(g + SD_GRADIENT_SPREAD_OFFSET, spread);
+        return SADISH_OK;
+    }
     if (spread > SD_SPREAD_REFLECT) { return SADISH_ERR_BOUNDS; }
     store64(g + SD_GRADIENT_SPREAD_OFFSET, spread);
     return SADISH_OK;
+}
+
+# ================================================================
+# Pattern paint (0.11.0) — a paint whose colour at a point is a TEXEL of a source surface.
+# ================================================================
+# @public — a pattern that samples `src`, one source texel per canvas pixel, nearest-neighbour.
+# Returns the paint ptr, or 0 for a null `src` or on OOM. Spread PAD, filter SD_FILTER_NEAREST,
+# no matrix — so by default texel (0, 0) sits on canvas pixel (0, 0) and the pattern draws at 1:1.
+#
+#   var p = sd_pattern_new(tile);
+#   sd_gradient_set_spread(p, SD_SPREAD_REPEAT);   # tile it (PAD / REFLECT / NONE also apply)
+#   sd_gradient_set_matrix(p, m);                  # optional: m maps pattern space -> canvas space
+#   sd_canvas_blit_paint_at(cv, dest, p, dx, dy);  # the SAME entry a gradient uses
+#
+# ⭐ ONE ALLOCATION, NOT THREE. A gradient takes its record, its stop array and its 4,100 B ramp; a
+# pattern has no stops and no ramp, so it takes the 88 B record alone and leaves those two fields 0.
+# The blit dispatches on the kind BEFORE it reads either, which is what makes that safe.
+# ⚠ THE SOURCE IS BORROWED, NOT COPIED. `src` must outlive the pattern and every blit through it,
+# and mutating `src` changes what the pattern paints — there is no snapshot. Under a consumer's
+# frame arena that means a pattern must not outlive the surface it samples.
+# ⚠ A pattern samples the source's RAW pixel bytes: byte 3 is the alpha it composites with, with NO
+# legacy 0-means-opaque mapping. That is the right rule and it is not a trap, because the mapping
+# already happened at STORE time — sd_plot and every draw.cyr primitive write sd_alpha_of(colour),
+# so a surface drawn with sd_rgb holds 255 and samples opaque. A byte 3 of 0 is therefore a pixel
+# nothing ever wrote (a fresh surface is zeroed) or one written transparent on purpose, and both
+# mean transparent. ⛔ It is sd_surface_rgba_at's rule, not sd_surface_pixel_at's, which drops alpha.
+fn sd_pattern_new(src): i64 {
+    if (src == 0) { return 0; }
+    var p = sd_alloc(SD_GRADIENT_SIZE);
+    if (p == 0) { return 0; }
+    store64(p + SD_GRADIENT_KIND_OFFSET, SD_PAINT_PATTERN);
+    store64(p + SD_GRADIENT_SPREAD_OFFSET, SD_SPREAD_PAD);
+    store64(p + SD_GRADIENT_A_OFFSET, src);                 # the borrowed source surface
+    store64(p + SD_GRADIENT_B_OFFSET, SD_FILTER_NEAREST);   # the filter field
+    store64(p + SD_GRADIENT_C_OFFSET, 0);
+    store64(p + SD_GRADIENT_D_OFFSET, 0);
+    store64(p + SD_GRADIENT_STOPS_OFFSET, 0);               # ⛔ no stops, no ramp — see the header
+    store64(p + SD_GRADIENT_NSTOPS_OFFSET, 0);
+    store64(p + SD_GRADIENT_EXT_OFFSET, 0);
+    store64(p + SD_GRADIENT_RAMP_OFFSET, 0);
+    store64(p + SD_GRADIENT_DIRTY_OFFSET, 0);
+    return p;
+}
+
+# @public — 1 if `p` is a pattern, else 0. Safe on 0 and on a gradient.
+fn sd_paint_is_pattern(p): i64 {
+    if (p == 0) { return 0; }
+    if (load64(p + SD_GRADIENT_KIND_OFFSET) == SD_PAINT_PATTERN) { return 1; }
+    return 0;
+}
+
+# @public — the surface a pattern samples, or 0 for a null paint or a gradient.
+fn sd_pattern_source(p): i64 {
+    if (sd_paint_is_pattern(p) == 0) { return 0; }
+    return load64(p + SD_GRADIENT_A_OFFSET);
+}
+
+# @public — the pattern's filter, or 0 for a null paint or a gradient (which is also
+# SD_FILTER_NEAREST — tell them apart with sd_paint_is_pattern, never by the value).
+fn sd_pattern_filter(p): i64 {
+    if (sd_paint_is_pattern(p) == 0) { return 0; }
+    return load64(p + SD_GRADIENT_B_OFFSET);
+}
+
+# @public — choose the pattern's filter. SADISH_OK, SADISH_ERR_BOUNDS for a null paint or a
+# gradient, or SADISH_ERR_UNSUPPORTED for a filter this release does not implement.
+# ⚠ Refusing is the point: a consumer that asks for bilinear and is silently given nearest has no
+# way to find out. See SD_FILTER_NEAREST.
+fn sd_pattern_set_filter(p, f): i64 {
+    if (p == 0) { return SADISH_ERR_BOUNDS; }
+    if (load64(p + SD_GRADIENT_KIND_OFFSET) != SD_PAINT_PATTERN) { return SADISH_ERR_BOUNDS; }
+    if (f != SD_FILTER_NEAREST) { return SADISH_ERR_UNSUPPORTED; }
+    store64(p + SD_GRADIENT_B_OFFSET, f);
+    return SADISH_OK;
+}
+
+# Map texel index `i` onto [0, n) under `spread`, n > 0. Returns the index, or -1 meaning "paint
+# nothing here" (SD_SPREAD_NONE outside the rect).
+# ⚠ FLOOR SEMANTICS ON NEGATIVES, matching the gradient spreads exactly: REPEAT sends -1 to n - 1
+# (not to 0), and REFLECT is the period-2n triangle, so -1 reads texel 0 and n reads texel n - 1.
+# A gradient's t = -0.25 reads 0.75 under REPEAT for the same reason; the two are the same rule at
+# different scales, which is what lets a consumer reason about a pattern the way it already reasons
+# about a gradient.
+fn _sd_pattern_wrap(i, n, spread): i64 {
+    if (i >= 0) {
+        if (i < n) { return i; }
+    }
+    if (spread == SD_SPREAD_NONE) { return 0 - 1; }
+    if (spread == SD_SPREAD_REPEAT) {
+        var m = i % n;
+        if (m < 0) { m = m + n; }
+        return m;
+    }
+    if (spread == SD_SPREAD_REFLECT) {
+        var period = n + n;
+        var v = i % period;
+        if (v < 0) { v = v + period; }
+        if (v < n) { return v; }
+        return period - 1 - v;
+    }
+    # PAD, and the defensive answer for any spread not named above.
+    if (i < 0) { return 0; }
+    return n - 1;
 }
 
 # The colour of `n` sorted stops at t (16.16, [0, SD_ONE]), given k = the LAST stop whose offset is
@@ -987,10 +1124,156 @@ fn _sd_paint_axis(ext, x0, y0, vx, vy): i64 {
 # paint_focal_test pass on them unedited. The premultiplied store is one call because its arithmetic
 # belongs to premul.cyr, which owns the formula and shares it with sd_canvas_blit_premul_at.
 # ================================================================
+# sd_canvas_blit_paint_at for a PATTERN (0.11.0): every covered pixel takes one source texel,
+# nearest-neighbour. Clip, stride, coverage and BOTH stores are _sd_paint_blit_run's, `pm` included
+# and meaning exactly the same thing — only the colour's origin differs, so a pattern and a gradient
+# composite identically and a one-texel pattern paints the bytes sd_canvas_blit_at would.
+#
+# ⭐ TWO PATHS, AND THE COMMON ONE IS FREE. Unmapped, paint space IS canvas space, so the texel for
+# canvas pixel (x, y) is (x, y) before spread — no arithmetic per pixel at all, which is the 1:1
+# tile blit a UI toolkit actually does. Mapped, each pixel centre is carried back through the
+# inverse of the caller's matrix: q = adj(J) (p - (e, f)) / det, in 16.16, by _sd_paint_divq — the
+# same exact long division the radial path uses, evaluated per pixel rather than DDA-stepped.
+# ⚠ WHY PER PIXEL AND NOT A DDA. The radial loop carries quotient+remainder because a gradient's t
+# feeds a 1,025-entry ramp where one LSB can change the colour. A NEAREST sample discards all 16
+# fraction bits, so sub-LSB drift can only matter for a pixel centre landing exactly on a texel
+# boundary — and the division here is floor-exact, so even that pixel takes the texel the algebra
+# says it does. The DDA would buy no accuracy; it is not omitted for simplicity alone.
+# ⚠ PRECISION BOUND, inherited: every matrix entry < 2^30 (sd_gradient_set_matrix enforces it) and
+# every pixel centre < 16,383 px, so each product below is < 2^60 and their difference < 2^61.
+fn _sd_pattern_blit(cv, surface, g, dx, dy, pm): i64 {
+    var ext = load64(g + SD_GRADIENT_EXT_OFFSET);
+    var xform = SD_GRADIENT_XFORM_NONE;
+    if (ext != 0) { xform = load64(ext + SD_GRADIENT_EXT_XFORM_OFFSET); }
+    if (xform == SD_GRADIENT_XFORM_BLOCKED) { return SADISH_OK; }
+    var src = load64(g + SD_GRADIENT_A_OFFSET);
+    if (src == 0) { return SADISH_ERR_BOUNDS; }
+    var pw = sd_surface_width(src);
+    var ph = sd_surface_height(src);
+    # A 0-area source paints nothing and is not an error — the gradient's "zero stops" answer.
+    if (pw <= 0) { return SADISH_OK; }
+    if (ph <= 0) { return SADISH_OK; }
+    var ppx = sd_surface_pixels(src);
+    var ppitch = sd_surface_stride(src);
+    var spread = load64(g + SD_GRADIENT_SPREAD_OFFSET);
+
+    var cw = sd_canvas_width(cv);
+    var ch = sd_canvas_height(cv);
+    var covbuf = sd_canvas_coverage(cv);
+    var covstride = sd_canvas_stride(cv);
+    var sw = sd_surface_width(surface);
+    var sh = sd_surface_height(surface);
+    var spx = sd_surface_pixels(surface);
+    var pitch = sd_surface_stride(surface);
+    var x0 = 0;
+    if (dx < 0) { x0 = 0 - dx; }
+    var y0 = 0;
+    if (dy < 0) { y0 = 0 - dy; }
+    var x1 = cw;
+    if (dx + x1 > sw) { x1 = sw - dx; }
+    var y1 = ch;
+    if (dy + y1 > sh) { y1 = sh - dy; }
+
+    var mapped = 0;
+    var ma = 0;
+    var mb = 0;
+    var mc = 0;
+    var md = 0;
+    var me = 0;
+    var mf = 0;
+    var mdet = 0;
+    if (xform == SD_GRADIENT_XFORM_MATRIX) {
+        ma = load64(ext + SD_GRADIENT_EXT_M_OFFSET);
+        mb = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 8);
+        mc = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 16);
+        md = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 24);
+        me = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 32);
+        mf = load64(ext + SD_GRADIENT_EXT_M_OFFSET + 40);
+        mdet = ma * md - mb * mc;
+        if (mdet == 0) { return SADISH_OK; }   # set_matrix already refuses this; belt and braces
+        if (mdet < 0) {
+            # adj(J) / det == (-adj(J)) / |det|: negate the 2x2 so _sd_paint_divq's divisor is > 0.
+            mdet = 0 - mdet;
+            ma = 0 - ma;
+            mb = 0 - mb;
+            mc = 0 - mc;
+            md = 0 - md;
+        }
+        mapped = 1;
+    }
+
+    var y = y0;
+    while (y < y1) {
+        var x = x0;
+        while (x < x1) {
+            var a = load8(covbuf + y * covstride + x);
+            if (a != 0) {
+                var tx = x;
+                var ty = y;
+                if (mapped != 0) {
+                    var ex = (x << SD_SHIFT) + (SD_ONE >> 1) - me;
+                    var ey = (y << SD_SHIFT) + (SD_ONE >> 1) - mf;
+                    # ⛔ sd_asr, NEVER `>>`. Cyrius's `>>` is LOGICAL, and a pattern-space
+                    # coordinate is negative for every canvas pixel left of or above the pattern's
+                    # origin — which is exactly what a translating matrix produces. A plain shift
+                    # zero-fills the sign bits and turns texel -3 into an enormous positive index,
+                    # which PAD then clamps to the last column: MEASURED as that mutation, the
+                    # three pixels left of the origin read texels 1, 2, 0 under REPEAT instead of
+                    # 0, 1, 2, and 2, 2, 2 under PAD instead of 0, 0, 0. Group D is the gate.
+                    tx = sd_asr(_sd_paint_divq(md * ex - mc * ey, mdet, SD_SHIFT), SD_SHIFT);
+                    ty = sd_asr(_sd_paint_divq(ma * ey - mb * ex, mdet, SD_SHIFT), SD_SHIFT);
+                }
+                var sx = _sd_pattern_wrap(tx, pw, spread);
+                var sy = _sd_pattern_wrap(ty, ph, spread);
+                # ⛔ -1 is SD_SPREAD_NONE outside the rect: the pixel is SKIPPED, not written
+                # transparent. The straight store below forces dst alpha 255, so writing a
+                # transparent source there would still stamp an opaque pixel.
+                if (sx >= 0) {
+                    if (sy >= 0) {
+                        var e = load32(ppx + sy * ppitch + sx * 4);
+                        var off = (y + dy) * pitch + (x + dx) * 4;
+                        if (pm != 0) {
+                            _sd_premul_paint_px(spx + off, covbuf + y * covstride + x, e);
+                        } else {
+                            var sa = a;
+                            var pa = (e >> 24) & 255;
+                            if (pa != 255) { sa = (a * pa) / 255; }
+                            var sr = (e >> 16) & 255;
+                            var sg = (e >> 8) & 255;
+                            var sb = e & 255;
+                            if (sa == 255) {
+                                store8(spx + off, sb);
+                                store8(spx + off + 1, sg);
+                                store8(spx + off + 2, sr);
+                                store8(spx + off + 3, 255);
+                            } else {
+                                var ia = 255 - sa;
+                                store8(spx + off, (sb * sa + load8(spx + off) * ia) / 255);
+                                store8(spx + off + 1, (sg * sa + load8(spx + off + 1) * ia) / 255);
+                                store8(spx + off + 2, (sr * sa + load8(spx + off + 2) * ia) / 255);
+                                store8(spx + off + 3, 255);
+                            }
+                        }
+                    }
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return SADISH_OK;
+}
+
 fn _sd_paint_blit_run(cv, surface, g, dx, dy, pm): i64 {
     if (cv == 0) { return SADISH_ERR_BOUNDS; }
     if (surface == 0) { return SADISH_ERR_BOUNDS; }
     if (g == 0) { return SADISH_ERR_BOUNDS; }
+    # ⛔ THE KIND IS READ BEFORE THE STOPS AND BEFORE THE RAMP (0.11.0), and it has to be: a pattern
+    # has neither, so the "no stops paints nothing" line below would reject every pattern and
+    # _sd_gradient_build_ramp would run on a 0 ramp pointer.
+    if (load64(g + SD_GRADIENT_KIND_OFFSET) == SD_PAINT_PATTERN) {
+        return _sd_pattern_blit(cv, surface, g, dx, dy, pm);
+    }
     if (load64(g + SD_GRADIENT_NSTOPS_OFFSET) == 0) { return SADISH_OK; }
     var ext = load64(g + SD_GRADIENT_EXT_OFFSET);
     var xform = SD_GRADIENT_XFORM_NONE;

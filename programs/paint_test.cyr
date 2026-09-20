@@ -638,7 +638,13 @@ fn main(): i64 {
     sd_gradient_set_spread(gf, SD_SPREAD_PAD);
     check(sd_gradient_color_at(gf, 0 - 5 * SD_ONE), 4294901760);        #80 — PAD: red
     check(sd_gradient_color_at(gf, 7 * SD_ONE), 4278190335);            #81 — PAD: blue
-    check(sd_gradient_set_spread(gf, 3), SADISH_ERR_BOUNDS);            #82
+    # ⚠ 3 IS SD_SPREAD_NONE SINCE 0.11.0, and it is refused DIFFERENTLY from a value outside the
+    # enum: a gradient has no rect to be outside of, so "paint nothing there" is a real request this
+    # paint kind cannot honour — SADISH_ERR_UNSUPPORTED, not SADISH_ERR_BOUNDS. (Through 0.10.0 this
+    # line read BOUNDS because 3 was simply one past the last spread.) 4 is now the first value that
+    # is merely out of range, and it keeps the old answer.
+    check(sd_gradient_set_spread(gf, SD_SPREAD_NONE), SADISH_ERR_UNSUPPORTED); #82
+    check(sd_gradient_set_spread(gf, 4), SADISH_ERR_BOUNDS);            #82b
     check(sd_gradient_set_spread(gf, 0 - 1), SADISH_ERR_BOUNDS);        #83
     check(sd_gradient_color_at(gf, 0 - 5 * SD_ONE), 4294901760);        #84 — still PAD
     # Radial REPEAT / REFLECT: centre (32, 32.5) px so row 32 has distance |x + 0.5 - 32| exactly;

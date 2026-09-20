@@ -182,8 +182,23 @@ jobs:
           done
           exit $MISSING
       - name: Verify version consistency
+        # ⛔ sadish_version() RETURNED 900 THROUGH 0.9.1 AND 0.10.0 — including across the 0.10.0
+        # ABI break, which is the one release a version probe exists to let a consumer detect — and
+        # programs/integration_test.cyr asserted that same stale literal, so the gate agreed with
+        # the bug. The probe is derived from VERSION here so it cannot drift again.
         run: |
           VERSION=$(tr -d '[:space:]' < VERSION)
           echo "VERSION file: $VERSION"
           grep -q "^## \[$VERSION\]" CHANGELOG.md || { echo "FAIL: version not in CHANGELOG.md"; exit 1; }
-          echo "Version consistent (manifest pulls VERSION via \${file:VERSION})"
+          MAJ=${VERSION%%.*}; REST=${VERSION#*.}; MIN=${REST%%.*}; PAT=${REST#*.}
+          PAT=${PAT%%-*}   # drop any -rc.N / -beta.N suffix
+          WANT=$((MAJ * 10000 + MIN * 100 + PAT))
+          GOT=$(grep -A1 '^fn sadish_version' src/raster.cyr | grep -oE 'return [0-9]+' | grep -oE '[0-9]+')
+          echo "sadish_version(): $GOT   expected from VERSION: $WANT"
+          [ "$GOT" = "$WANT" ] || {
+            echo "FAIL: sadish_version() is $GOT but VERSION ($VERSION) implies $WANT."
+            echo "      Update the 'return' in src/raster.cyr AND the check in programs/integration_test.cyr."
+            exit 1; }
+          grep -q "check(sadish_version(), $WANT)" programs/integration_test.cyr || {
+            echo "FAIL: programs/integration_test.cyr does not assert sadish_version() == $WANT"; exit 1; }
+          echo "Version consistent (manifest pulls VERSION via \${file:VERSION}; probe = $WANT)"

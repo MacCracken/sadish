@@ -1,0 +1,368 @@
+# programs/pattern_test.cyr — RUN test for 0.11.0's PATTERN PAINT: a paint whose colour at a point
+# is a TEXEL of a source surface, rather than an entry of a stop ramp.
+#
+# ⛔ WHAT THIS SUITE OWNS. paint_test owns the gradient kinds and the ramp; this owns the fourth
+# kind. What is unique to a pattern, and covered nowhere else:
+#   A  it is a PAINT, not a gradient — same record, same spread, same matrix, same two blit entries,
+#      and the blit must dispatch on the kind BEFORE it reads stops or ramp (a pattern has neither)
+#   B  the four spreads at TEXEL granularity, negatives included, with the floor semantics the
+#      gradient spreads already use — REPEAT sends -1 to n-1, REFLECT is the period-2n triangle
+#   C  SD_SPREAD_NONE SKIPS a pixel rather than writing it transparent. The straight store forces
+#      dst alpha 255, so "write transparent" and "write nothing" are different pictures, and only
+#      the second is what NONE means.
+#   D  the RAW alpha rule: a pattern composites byte 3 as it finds it, with no 0-means-opaque
+#      mapping — which is safe only because draw.cyr already resolved that mapping at STORE time
+#   E  the matrix path, including a NEGATIVE determinant (a flip), where the sampler negates the
+#      2x2 so its divisor stays positive
+#   F  a pattern is ONE allocation and a blit is ZERO — the 0.10.0 property, held for the new kind
+# Exit code = failed checks; each failure prints its check number.
+
+include "src/lib.cyr"
+
+var g_fails = 0;
+var g_n = 0;
+
+fn check(got, want): i64 {
+    g_n = g_n + 1;
+    if (got == want) { return 0; }
+    g_fails = g_fails + 1;
+    var m = "pattern_test: check failed at #";
+    syscall(1, 2, m, strlen(m));
+    fmt_int_fd(2, g_n);
+    syscall(1, 2, " got ", 5);
+    fmt_int_fd(2, got);
+    syscall(1, 2, " want ", 6);
+    fmt_int_fd(2, want);
+    syscall(1, 2, "\n", 1);
+    return 1;
+}
+
+# ---- hooks ----------------------------------------------------------------------------------
+var g_bytes = 0;
+var g_calls = 0;
+
+fn hook_count(n): i64 {
+    g_calls = g_calls + 1;
+    g_bytes = g_bytes + n;
+    return alloc(n);
+}
+
+fn reset_counts(): i64 {
+    g_bytes = 0;
+    g_calls = 0;
+    return 0;
+}
+
+# ---- fixtures -------------------------------------------------------------------------------
+# A 2x2 source: (0,0) red, (1,0) green, (0,1) blue, (1,1) white. Four distinguishable texels is the
+# smallest tile that can tell every spread apart on both axes at once.
+fn tile2(): i64 {
+    var s = sd_surface_new(2, 2);
+    if (s == 0) { return 0; }
+    sd_plot(s, 0, 0, sd_rgb(255, 0, 0));
+    sd_plot(s, 1, 0, sd_rgb(0, 255, 0));
+    sd_plot(s, 0, 1, sd_rgb(0, 0, 255));
+    sd_plot(s, 1, 1, sd_rgb(255, 255, 255));
+    return s;
+}
+
+# A 3x1 ramp of distinct greys — an ODD width, so REFLECT's period (6) and REPEAT's (3) differ
+# visibly and an off-by-one in either shows up.
+fn strip3(): i64 {
+    var s = sd_surface_new(3, 1);
+    if (s == 0) { return 0; }
+    sd_plot(s, 0, 0, sd_rgb(10, 10, 10));
+    sd_plot(s, 1, 0, sd_rgb(20, 20, 20));
+    sd_plot(s, 2, 0, sd_rgb(30, 30, 30));
+    return s;
+}
+
+fn cov_full(w, h): i64 {
+    var cv = sd_canvas_new(w, h);
+    if (cv == 0) { return 0; }
+    memset(sd_canvas_coverage(cv), 255, w * h);
+    return cv;
+}
+
+fn dest_of(w, h, c): i64 {
+    var s = sd_surface_new(w, h);
+    if (s == 0) { return 0; }
+    sd_clear(s, c);
+    return s;
+}
+
+# The grey level of a pixel whose three channels are equal; -1 if they are not.
+fn grey_at(s, x, y): i64 {
+    var c = sd_surface_pixel_at(s, x, y);
+    var r = sd_color_r(c);
+    if (sd_color_g(c) != r) { return 0 - 1; }
+    if (sd_color_b(c) != r) { return 0 - 1; }
+    return r;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var src = tile2();
+    check(src != 0, 1);                                                # 1
+
+    # ── A) IT IS A PAINT ──────────────────────────────
+    var p = sd_pattern_new(src);
+    check(p != 0, 1);                                                  # 2
+    check(sd_paint_is_pattern(p), 1);                                  # 3
+    check(sd_pattern_source(p), src);                                  # 4
+    check(sd_pattern_filter(p), SD_FILTER_NEAREST);                    # 5
+    check(sd_pattern_new(0), 0);                                       # 6 — a null source is refused
+    check(sd_paint_is_pattern(0), 0);                                  # 7 — and the query is safe
+    var grad = sd_gradient_linear(0, 0, 4 * SD_ONE, 0);
+    check(sd_paint_is_pattern(grad), 0);                               # 8
+    check(sd_pattern_source(grad), 0);                                 # 9 — a gradient has none
+    check(sd_pattern_source(0), 0);                                    # 10
+    # ⛔ THE STOPS AND RAMP FIELDS ARE 0, which is what the blit's kind-first dispatch protects. A
+    # pattern reaching the gradient path would read a 0 ramp pointer.
+    check(sd_gradient_stop_count(p), 0);                               # 11
+
+    # ── B) SPREAD PAD (the default) ──────────────────────────
+    var d = dest_of(4, 4, sd_rgb(9, 9, 9));
+    var cv = cov_full(4, 4);
+    check(sd_canvas_blit_paint_at(cv, d, p, 0, 0), SADISH_OK);         # 12
+    check(sd_surface_pixel_at(d, 0, 0), sd_rgb(255, 0, 0));            # 13 — texel (0,0)
+    check(sd_surface_pixel_at(d, 1, 0), sd_rgb(0, 255, 0));            # 14 — texel (1,0)
+    check(sd_surface_pixel_at(d, 2, 0), sd_rgb(0, 255, 0));            # 15 — PAD: clamped to x=1
+    check(sd_surface_pixel_at(d, 3, 0), sd_rgb(0, 255, 0));            # 16
+    check(sd_surface_pixel_at(d, 0, 1), sd_rgb(0, 0, 255));            # 17 — texel (0,1)
+    check(sd_surface_pixel_at(d, 0, 3), sd_rgb(0, 0, 255));            # 18 — PAD on y too
+    check(sd_surface_pixel_at(d, 3, 3), sd_rgb(255, 255, 255));        # 19 — the corner texel
+
+    # ── C) SPREAD REPEAT ──────────────────────────────
+    check(sd_gradient_set_spread(p, SD_SPREAD_REPEAT), SADISH_OK);     # 20
+    var d2 = dest_of(4, 4, sd_rgb(9, 9, 9));
+    sd_canvas_blit_paint_at(cv, d2, p, 0, 0);
+    check(sd_surface_pixel_at(d2, 2, 0), sd_rgb(255, 0, 0));           # 21 — the tile restarts
+    check(sd_surface_pixel_at(d2, 3, 0), sd_rgb(0, 255, 0));           # 22
+    check(sd_surface_pixel_at(d2, 2, 2), sd_rgb(255, 0, 0));           # 23 — on both axes
+    check(sd_surface_pixel_at(d2, 3, 1), sd_rgb(255, 255, 255));       # 24
+
+    # ── D) THE SPREADS ON NEGATIVE INDICES, AT TEXEL GRANULARITY ─
+    # ⛔ THE UNIT UNDER TEST IS _sd_pattern_wrap's FLOOR SEMANTICS, and the only way to reach a
+    # negative texel index through the public API is a matrix that translates the pattern right —
+    # so the canvas pixels to its left map to negative pattern space. A 3-wide strip makes REPEAT
+    # (period 3) and REFLECT (period 6) disagree everywhere, which is the point.
+    var strip = strip3();
+    var ps = sd_pattern_new(strip);
+    check(sd_gradient_set_matrix(ps, sd_matrix_translate(3 * SD_ONE, 0)), SADISH_OK);   # 25
+    # pattern-space x for canvas pixel i is i - 3, so pixels 0..2 are -3, -2, -1.
+    check(sd_gradient_set_spread(ps, SD_SPREAD_REPEAT), SADISH_OK);    # 26
+    var ds = dest_of(8, 1, sd_rgb(0, 0, 0));
+    var cs = cov_full(8, 1);
+    sd_canvas_blit_paint_at(cs, ds, ps, 0, 0);
+    check(grey_at(ds, 0, 0), 10);                                      # 27 — -3 -> 0
+    check(grey_at(ds, 1, 0), 20);                                      # 28 — -2 -> 1
+    check(grey_at(ds, 2, 0), 30);                                      # 29 — -1 -> 2 ⛔ NOT 0
+    check(grey_at(ds, 3, 0), 10);                                      # 30 —  0 -> 0
+    check(grey_at(ds, 7, 0), 20);                                      # 31 —  4 -> 1
+    check(sd_gradient_set_spread(ps, SD_SPREAD_REFLECT), SADISH_OK);   # 32
+    var ds2 = dest_of(8, 1, sd_rgb(0, 0, 0));
+    sd_canvas_blit_paint_at(cs, ds2, ps, 0, 0);
+    # period 6 triangle: -3 -> 3 -> mirrored to 2; -2 -> 4 -> 1; -1 -> 5 -> 0
+    check(grey_at(ds2, 0, 0), 30);                                     # 33
+    check(grey_at(ds2, 1, 0), 20);                                     # 34
+    check(grey_at(ds2, 2, 0), 10);                                     # 35
+    check(grey_at(ds2, 3, 0), 10);                                     # 36 — 0, the mirror seam
+    check(grey_at(ds2, 4, 0), 20);                                     # 37
+    check(grey_at(ds2, 5, 0), 30);                                     # 38
+    check(grey_at(ds2, 6, 0), 30);                                     # 39 — 3 mirrors back to 2
+    check(grey_at(ds2, 7, 0), 20);                                     # 40
+    check(sd_gradient_set_spread(ps, SD_SPREAD_PAD), SADISH_OK);       # 41
+    var ds3 = dest_of(8, 1, sd_rgb(0, 0, 0));
+    sd_canvas_blit_paint_at(cs, ds3, ps, 0, 0);
+    check(grey_at(ds3, 0, 0), 10);                                     # 42 — every negative clamps
+    check(grey_at(ds3, 2, 0), 10);                                     # 43   to texel 0
+    check(grey_at(ds3, 7, 0), 30);                                     # 44 — and past the end to 2
+
+    # ── E) SPREAD NONE SKIPS, IT DOES NOT WRITE ──────────────────
+    # ⛔ THE DISTINCTION THIS GROUP EXISTS FOR. The straight store forces dst alpha 255, so a pixel
+    # "written transparent" is still a pixel written — the destination's own colour would be gone.
+    # NONE must leave the byte the destination already had, sentinel and all.
+    check(sd_gradient_set_spread(p, SD_SPREAD_NONE), SADISH_OK);       # 45
+    var d3 = dest_of(4, 4, sd_rgb(9, 9, 9));
+    sd_canvas_blit_paint_at(cv, d3, p, 0, 0);
+    check(sd_surface_pixel_at(d3, 0, 0), sd_rgb(255, 0, 0));           # 46 — inside: painted
+    check(sd_surface_pixel_at(d3, 1, 1), sd_rgb(255, 255, 255));       # 47
+    check(sd_surface_pixel_at(d3, 2, 0), sd_rgb(9, 9, 9));             # 48 — outside: UNTOUCHED
+    check(sd_surface_pixel_at(d3, 0, 2), sd_rgb(9, 9, 9));             # 49
+    check(sd_surface_pixel_at(d3, 3, 3), sd_rgb(9, 9, 9));             # 50
+    # and a gradient may not have it at all
+    check(sd_gradient_set_spread(grad, SD_SPREAD_NONE), SADISH_ERR_UNSUPPORTED);   # 51
+    check(sd_gradient_set_spread(grad, 4), SADISH_ERR_BOUNDS);         # 52 — merely out of range
+    check(sd_gradient_set_spread(grad, 0 - 1), SADISH_ERR_BOUNDS);     # 53
+
+    # ── F) THE FILTER FIELD ─────────────────────────────
+    check(sd_pattern_set_filter(p, SD_FILTER_NEAREST), SADISH_OK);     # 54
+    check(sd_pattern_set_filter(p, 1), SADISH_ERR_UNSUPPORTED);        # 55 — ⛔ refused, not silent
+    check(sd_pattern_filter(p), SD_FILTER_NEAREST);                    # 56 — and unchanged by it
+    check(sd_pattern_set_filter(0, SD_FILTER_NEAREST), SADISH_ERR_BOUNDS);         # 57
+    check(sd_pattern_set_filter(grad, SD_FILTER_NEAREST), SADISH_ERR_BOUNDS);      # 58
+
+    # ── G) THE MATRIX PATH ─────────────────────────────
+    # Scale x2: each texel covers a 2x2 block of canvas pixels.
+    var p2 = sd_pattern_new(src);
+    check(sd_gradient_set_matrix(p2, sd_matrix_scale(2 * SD_ONE, 2 * SD_ONE)), SADISH_OK);  # 59
+    var d4 = dest_of(4, 4, sd_rgb(9, 9, 9));
+    sd_canvas_blit_paint_at(cv, d4, p2, 0, 0);
+    check(sd_surface_pixel_at(d4, 0, 0), sd_rgb(255, 0, 0));           # 60
+    check(sd_surface_pixel_at(d4, 1, 1), sd_rgb(255, 0, 0));           # 61 — the whole 2x2 block
+    check(sd_surface_pixel_at(d4, 2, 0), sd_rgb(0, 255, 0));           # 62
+    check(sd_surface_pixel_at(d4, 0, 2), sd_rgb(0, 0, 255));           # 63
+    check(sd_surface_pixel_at(d4, 3, 3), sd_rgb(255, 255, 255));       # 64
+    # ⭐ A NEGATIVE DETERMINANT — a horizontal flip. The sampler negates the 2x2 so _sd_paint_divq's
+    # divisor stays positive; get that wrong and every mapped pixel reads the wrong texel.
+    var p3 = sd_pattern_new(src);
+    var flip = sd_matrix_mul(sd_matrix_translate(2 * SD_ONE, 0), sd_matrix_scale(0 - SD_ONE, SD_ONE));
+    check(sd_gradient_set_matrix(p3, flip), SADISH_OK);                # 65
+    check(sd_gradient_set_spread(p3, SD_SPREAD_REPEAT), SADISH_OK);    # 66
+    var d5 = dest_of(2, 1, sd_rgb(0, 0, 0));
+    var cv2 = cov_full(2, 1);
+    sd_canvas_blit_paint_at(cv2, d5, p3, 0, 0);
+    # x' = 2 - x - 1 region: canvas 0 reads texel 1, canvas 1 reads texel 0.
+    check(sd_surface_pixel_at(d5, 0, 0), sd_rgb(0, 255, 0));           # 67 — mirrored
+    check(sd_surface_pixel_at(d5, 1, 0), sd_rgb(255, 0, 0));           # 68
+    # a BLOCKED matrix (singular) paints nothing and is not an error at blit time
+    var p4 = sd_pattern_new(src);
+    check(sd_gradient_set_matrix(p4, sd_matrix_scale(0, 0)), SADISH_ERR_BOUNDS);   # 69
+    var d6 = dest_of(2, 2, sd_rgb(7, 7, 7));
+    var cv3 = cov_full(2, 2);
+    check(sd_canvas_blit_paint_at(cv3, d6, p4, 0, 0), SADISH_OK);      # 70 — a no-op, like a
+    check(sd_surface_pixel_at(d6, 0, 0), sd_rgb(7, 7, 7));             # 71   blocked gradient's
+
+    # ── H) ALPHA: THE RAW BYTE, AND COVERAGE ─────────────────────
+    # ⛔ A surface drawn with sd_rgb holds alpha 255, because _sd_put_row stores sd_alpha_of(colour)
+    # — the legacy mapping happens at STORE time. So sampling the raw byte is safe, and #72 is what
+    # says so: an opaque tile composites opaque over a different destination colour.
+    var d7 = dest_of(2, 2, sd_rgb(1, 2, 3));
+    var pa = sd_pattern_new(src);
+    sd_canvas_blit_paint_at(cv3, d7, pa, 0, 0);
+    check(sd_surface_pixel_at(d7, 0, 0), sd_rgb(255, 0, 0));           # 72 — fully replaced
+    # a HALF-alpha texel blends; a zero-alpha texel leaves the destination colour but still stamps
+    # dst alpha 255 (the straight blit's documented rule — it is NOT the same as NONE skipping)
+    var tsrc = sd_surface_new(2, 1);
+    sd_plot(tsrc, 0, 0, sd_rgba(255, 255, 255, 128));
+    store32(sd_surface_pixels(tsrc) + 4, 0);      # texel 1: all four bytes 0 = transparent
+    var pt = sd_pattern_new(tsrc);
+    var d8 = dest_of(2, 1, sd_rgb(0, 0, 0));
+    sd_canvas_blit_paint_at(cv2, d8, pt, 0, 0);
+    var hv = sd_color_r(sd_surface_pixel_at(d8, 0, 0));
+    check(hv > 120, 1);                                                # 73 — ~128 over black
+    check(hv < 136, 1);                                                # 74
+    check(sd_surface_pixel_at(d8, 1, 0), sd_rgb(0, 0, 0));             # 75 — transparent texel
+    # COVERAGE scales the source alpha, and zero coverage writes nothing at all.
+    var cvh = sd_canvas_new(2, 1);
+    memset(sd_canvas_coverage(cvh), 128, 2);
+    store8(sd_canvas_coverage(cvh) + 1, 0);       # pixel 1: no coverage
+    var d9 = dest_of(2, 1, sd_rgb(0, 0, 0));
+    var po = sd_pattern_new(src);
+    sd_canvas_blit_paint_at(cvh, d9, po, 0, 0);
+    var cvv = sd_color_r(sd_surface_pixel_at(d9, 0, 0));
+    check(cvv > 120, 1);                                               # 76 — red at half coverage
+    check(cvv < 136, 1);                                               # 77
+    check(sd_surface_pixel_at(d9, 1, 0), sd_rgb(0, 0, 0));             # 78 — untouched
+
+    # ── I) EQUIVALENCE WITH THE SOLID BLIT ───────────────────────
+    # ⭐ A 1x1 OPAQUE PATTERN IS sd_canvas_blit_at OF THAT COLOUR, byte for byte, at every coverage.
+    # That is the strongest statement available about the compositing: it pins the pattern path to
+    # the one the rest of the library has used since 0.3.0, rather than to a re-derivation of it.
+    var one = sd_surface_new(1, 1);
+    sd_plot(one, 0, 0, sd_rgb(40, 90, 200));
+    var pone = sd_pattern_new(one);
+    var cvr = sd_canvas_new(8, 8);
+    var ci = 0;
+    while (ci < 64) {
+        store8(sd_canvas_coverage(cvr) + ci, (ci * 4) & 255);
+        ci = ci + 1;
+    }
+    var da = dest_of(8, 8, sd_rgb(20, 20, 20));
+    var db = dest_of(8, 8, sd_rgb(20, 20, 20));
+    sd_canvas_blit_paint_at(cvr, da, pone, 0, 0);
+    sd_canvas_blit_at(cvr, db, sd_rgb(40, 90, 200), 0, 0);
+    var diff = 0;
+    var bi = 0;
+    while (bi < 8 * 8 * 4) {
+        if (load8(sd_surface_pixels(da) + bi) != load8(sd_surface_pixels(db) + bi)) { diff = diff + 1; }
+        bi = bi + 1;
+    }
+    check(diff, 0);                                                    # 79 — ⛔ BYTE-IDENTICAL
+
+    # ── J) THE PREMULTIPLIED ENTRY ──────────────────────────
+    # The same paint through premul.cyr's store: a pattern over a TRANSPARENT window, which the
+    # straight blit cannot make because it forces dst alpha 255.
+    var dp = sd_surface_new(2, 2);
+    memset(sd_surface_pixels(dp), 0, 2 * 2 * 4);
+    var cvp = sd_canvas_new(2, 2);
+    memset(sd_canvas_coverage(cvp), 255, 4);
+    store8(sd_canvas_coverage(cvp) + 3, 0);       # one corner left uncovered
+    check(sd_canvas_blit_paint_premul_at(cvp, dp, pa, 0, 0), SADISH_OK);           # 80
+    check(sd_color_a(sd_surface_rgba_at(dp, 0, 0)), 255);              # 81 — covered: opaque
+    check(sd_surface_rgba_at(dp, 1, 1), 0);                            # 82 — uncovered: still
+    #                                                                    transparent, not black
+
+    # ── K) DEGENERATES ──────────────────────────────
+    var zero = sd_surface_new(0, 0);
+    if (zero != 0) {
+        var pz = sd_pattern_new(zero);
+        var dz = dest_of(2, 2, sd_rgb(5, 5, 5));
+        check(sd_canvas_blit_paint_at(cv3, dz, pz, 0, 0), SADISH_OK);  # 83 — paints nothing
+        check(sd_surface_pixel_at(dz, 0, 0), sd_rgb(5, 5, 5));         # 84
+    } else {
+        check(0, 0);                                                   # 83 — sd_surface_new refuses
+        check(0, 0);                                                   # 84   0x0; keep numbering
+    }
+    check(sd_canvas_blit_paint_at(0, d, p, 0, 0), SADISH_ERR_BOUNDS);  # 85
+    check(sd_canvas_blit_paint_at(cv, 0, p, 0, 0), SADISH_ERR_BOUNDS); # 86
+    check(sd_canvas_blit_paint_at(cv, d, 0, 0, 0), SADISH_ERR_BOUNDS); # 87
+
+    # ── L) ONE ALLOCATION, AND A BLIT COSTS NOTHING ──────────────
+    # ⭐ A pattern has no stops and no ramp: the 88 B record alone, against a gradient's three blocks
+    # and 4,100 B of ramp. And the blit itself is on 0.10.0's contract — nothing per pixel.
+    var prev = sd_alloc_set(&hook_count);
+    reset_counts();
+    var pm = sd_pattern_new(src);
+    sd_alloc_set(prev);
+    check(g_calls, 1);                                                 # 88 — ONE block
+    check(g_bytes, 88);                                                # 89 — the record, nothing else
+    prev = sd_alloc_set(&hook_count);
+    reset_counts();
+    var g2 = sd_gradient_linear(0, 0, SD_ONE, 0);
+    sd_alloc_set(prev);
+    check(g_calls, 3);                                                 # 90 — a gradient: record,
+    check(g_bytes, 88 + SD_GRADIENT_STOP_CAP * 16 + (SD_GRADIENT_RAMP_N + 1) * 4);  # 91 stops, ramp
+    var dm = dest_of(4, 4, sd_rgb(0, 0, 0));
+    prev = sd_alloc_set(&hook_count);
+    reset_counts();
+    sd_canvas_blit_paint_at(cv, dm, pm, 0, 0);
+    sd_canvas_blit_paint_at(cv, dm, p2, 0, 0);          # the mapped path too
+    sd_alloc_set(prev);
+    check(g_calls, 0);                                                 # 92 — ⛔ NOT ONE ALLOCATION
+    check(g_bytes, 0);                                                 # 93
+
+    # ── M) dx / dy PLACEMENT ────────────────────────────
+    # The canvas is offset onto the destination; the PAINT is in canvas space, so the pattern moves
+    # with the canvas — the contract gradients already keep.
+    var d10 = dest_of(6, 6, sd_rgb(9, 9, 9));
+    var pp = sd_pattern_new(src);
+    sd_canvas_blit_paint_at(cv, d10, pp, 2, 2);
+    check(sd_surface_pixel_at(d10, 2, 2), sd_rgb(255, 0, 0));          # 94 — texel (0,0) at (2,2)
+    check(sd_surface_pixel_at(d10, 3, 2), sd_rgb(0, 255, 0));          # 95
+    check(sd_surface_pixel_at(d10, 1, 1), sd_rgb(9, 9, 9));            # 96 — outside the canvas
+    check(sd_surface_pixel_at(d10, 0, 0), sd_rgb(9, 9, 9));            # 97
+
+    if (g_fails == 0) {
+        var ok = "pattern_test: PASS (pattern paint: spreads, matrix, alpha, premul, 0 B blits)\n";
+        syscall(1, 1, ok, strlen(ok));
+    } else {
+        var bad = "pattern_test: FAIL\n";
+        syscall(1, 2, bad, strlen(bad));
+    }
+    return g_fails;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

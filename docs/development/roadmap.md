@@ -1,6 +1,6 @@
 # sadish roadmap
 
-**Where we are:** 0.10.0. 32 RUN suites green, `fmt`/`lint`/`vet` clean, `dist/sadish.cyr` in
+**Where we are:** 0.11.0. 34 RUN suites green, `fmt`/`lint`/`vet` clean, `dist/sadish.cyr` in
 sync, toolchain pinned to **6.6.6**, and the host build is diagnostic-free. 0.10.0 took the
 `SdPolyline` ABI break this file filed under "What 1.0 freezes", so the library now stores points
 ONE way; a fill and a styled or dashed stroke allocate NOTHING on the consumer's seam. agnos's `tests/gpu/refagree.cyr` holds the default fill byte-identical
@@ -28,6 +28,7 @@ The measurements and contracts live in [`../../CHANGELOG.md`](../../CHANGELOG.md
 | v0.9.0 | `SdPath` stores its points inline — the ASCII glyph set 78,656 → 58,672 B, 2,783 → 285 allocations |
 | v0.9.1 | the 6.6.6 pin; a format gate that actually gates; portable syscall constants + an aarch64/AGNOS cross-build |
 | v0.10.0 | `SdPolyline` points inline — a flatten is 5 allocations, not 20,004; `sd_path_transform`; `sd_path_bounds` |
+| v0.11.0 | pattern paint + `SD_SPREAD_NONE`; `docs/api.md`; the `/dev/fb0` device line gated |
 
 ## The road to 1.0
 
@@ -37,13 +38,21 @@ are permanent.
 
 ### Capability gaps
 
-**Image / pattern paint.** VERIFIED: `src/paint.cyr` defines `SD_GRADIENT_LINEAR`, `_RADIAL`,
-`_FOCAL` and the three spreads — there is no paint that samples a source surface. A consumer can fill
-with a colour or a gradient and nothing else, so a canvas/SVG layer cannot draw a bitmap, a repeating
-pattern, or a cached tile. Blast radius: a new paint kind beside `SdGradient` plus a sampler in the
-blit loops; the coverage engine is untouched. ⚠ Needs a decision on filtering (nearest vs bilinear)
-and on what a pattern does outside its source rect — the same spread question gradients already
-answer, so the shape exists to copy.
+**~~Image / pattern paint.~~ CLOSED in 0.11.0** — `sd_pattern_new(src)` is a fourth paint kind
+(`SD_PAINT_PATTERN`) beside the three gradients, sharing the record, the spread, the matrix and both
+blit entries. The blast radius was exactly as predicted: a kind plus a sampler, and the coverage
+engine never moved.
+⭐ Cheaper than the entry assumed: a pattern is **one 88 B allocation** (no stops, no ramp) and a
+pattern blit allocates **nothing**, on both the plain and matrix-mapped paths.
+⚠ **The two decisions, as taken.** Filtering is **nearest only**, but through a FIELD —
+`sd_pattern_set_filter` answers `SADISH_ERR_UNSUPPORTED` for anything else, so bilinear lands later
+without an ABI break and a consumer is never silently given a filter it did not ask for. Outside the
+rect reuses the gradient spreads and adds `SD_SPREAD_NONE` ("paint nothing"), which SKIPS a pixel
+rather than writing it transparent — the straight blit forces dst alpha 255, so those are different
+pictures. ⛔ A gradient may not have `SD_SPREAD_NONE`: it is the library's first ever use of
+`SADISH_ERR_UNSUPPORTED`.
+⚠ **Still open, deliberately:** bilinear itself, and the question of whether a pattern should ever
+carry its own tile rect rather than taking the whole source surface.
 
 **Arcs.** VERIFIED: the verb set is `SD_VERB_MOVETO / LINETO / QUADTO / CUBICTO / CLOSE`. SVG's `A`
 and every rounded rectangle are hand-rolled by the caller into cubics today. Blast radius: a verb tag
@@ -96,9 +105,16 @@ stroker should be brought in line; `src/alloc.cyr` states it either way and
 
 ### Infrastructure
 
-**No API reference.** VERIFIED: `docs/` holds `development/{issues,proposals,prior-art.md}` and now
-this file. Every contract lives in a source header, so a consumer learns the library by reading
-`dist/sadish.cyr` — 7,866 lines. The headers are good; they are just not reachable as documentation.
+**~~No API reference.~~ CLOSED in 0.11.0** — [`../api.md`](../api.md) covers all 122 public
+functions by module and front-loads the six cross-cutting rules most consumer bugs come from (16.16
+and the logical `>>`; the allocation seam; what a hook can still refuse after 0.10.0; the integer
+error model and its overloaded codes; the 0-means-opaque alpha rule; and that none of it is thread
+safe).
+⚠ `cyrius doc` was NOT the answer and this is worth recording: it emits only the LAST LINE of each
+doc comment, which for this tree's multi-paragraph headers is usually a fragment or a bare URL. The
+reference is written by hand, its worked example is compiled and run, and its constant table is
+machine-checked — but it is a SECOND copy of facts the headers own, so it will rot. ⇒ The headers
+stay normative; where the two disagree the header is right and the reference is the bug.
 
 **~~CI builds the host target only.~~ CLOSED in 0.9.1** — `.github/workflows/ci.yml` now carries a
 "Cross-target link-check (aarch64 + AGNOS)" step that builds `programs/smoke.cyr` for both and fails
@@ -131,23 +147,25 @@ which composites coverage onto a surface and never touches a framebuffer. UNKNOW
 aethersafha wants sadish presenting at all, or only producing premultiplied surfaces for the
 compositor to blit. That answer decides whether this is a 1.0 item or not work at all.
 
-### `sd_present_open`'s device line — gateable, and wrongly written off
+### ~~`sd_present_open`'s device line~~ — GATED in 0.11.0
 
-MEASURED (0.8.0): pointing it at `/dev/fb1`, or replacing its body with `return 0;`, leaves all 31
-suites green, so the device path itself is unpinned. 0.8.0 made everything after the `open()` reachable
-through `sd_present_open_fd` and recorded the rest as needing a display.
+0.8.0 made everything after the `open()` reachable through `sd_present_open_fd` and recorded the rest
+as needing a display. ⛔ **That was wrong, and 0.11.0 is the correction shipped.** `sd_present_open`
+opens, probes geometry and allocates — it paints NOTHING. Only `sd_present_blit` writes pixels, and
+only that call ever needed the "no test may touch the live display" rule.
 
-⛔ **That was wrong, and this is the correction.** `sd_present_open` opens, probes geometry and
-allocates — it paints NOTHING. Only `sd_present_blit` writes pixels, and only that call has ever needed
-the "no test may touch the live display" rule. VERIFIED on this machine: a probe calling
-`sd_present_open()` then `sd_present_close()` opened the real framebuffer and read back
-**2560x1440, 32 bpp, pitch 10240**, with nothing drawn.
+`programs/present_geom_test.cyr` opens the real framebuffer, asserts the presenter's geometry against
+**its own independent ioctl** on its own read-only descriptor, checks the fd is held and given back,
+opens twice, and closes. ⭐ The independence is the point: a shared helper would agree with sadish by
+construction and prove nothing. VERIFIED on this machine at **2560x1440, 32 bpp, pitch 10240**, with
+nothing drawn. ⚠ It SKIPS, loudly, where there is no device or no permission, printing which branch
+it took — both branches verified.
 
-⇒ The gate is a suite that calls `sd_present_open()`, asserts the presenter's fields against the
-device's own geometry, and closes — never blitting. ⚠ It must SKIP cleanly where there is no
-framebuffer or no permission (`/dev/fb0` is `root:video`; CI has no device at all), and say which
-branch it took, so a skip is never mistaken for a pass. That leaves only the blit itself ungated,
-which is the call that genuinely needs a display.
+⇒ **What is left ungated is `sd_present_blit` alone**, the one call that genuinely needs a display,
+and the one line between this suite and a test that draws on the user's screen.
+⚠ UNKNOWN still: whether sadish should present at all on AGNOS — see the section above. A blit gate
+would need a display sadish is allowed to scribble on, which is a different kind of infrastructure
+(a virtual framebuffer, or a machine whose screen nobody minds), not a different test.
 
 ## Not sadish's
 

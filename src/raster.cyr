@@ -1240,9 +1240,19 @@ fn sd_canvas_clip_pop(cv): i64 {
 # ================================================================
 # Version probe — packed as major*10000 + minor*100 + patch.
 # 0.4.0 -> 400; 0.4.1 -> 401; 0.5.5 -> 505; 0.6.0 -> 600; 0.7.0 -> 700; 0.7.1 -> 701;
-# 0.7.2 -> 702; 0.8.0 -> 800; 0.9.0 -> 900.
+# 0.7.2 -> 702; 0.8.0 -> 800; 0.9.0 -> 900; 0.9.1 -> 901; 0.10.0 -> 1000; 0.11.0 -> 1100.
+#
+# ⛔⛔ THIS WAS STALE FOR TWO RELEASES AND NOW HAS A GATE THAT WILL NOT LET IT HAPPEN AGAIN.
+# It returned 900 through 0.9.1 AND 0.10.0 — a consumer probing the library it had linked was told
+# 0.9.0 by both, including across the 0.10.0 ABI BREAK, which is precisely the release a version
+# probe exists to let a consumer detect. programs/integration_test.cyr asserted the literal 900, so
+# the gate agreed with the bug and no suite could see it.
+# ⇒ CI now derives the expected number from the VERSION file and fails if this line disagrees
+# (.github/workflows/ci.yml, "Verify version consistency"). ⚠ A human reading this: the number here
+# and VERSION are ONE fact in two places, and the only reason it is duplicated at all is that a
+# Cyrius fn cannot read a file at compile time. Bump both, or CI stops you.
 # ================================================================
 # @public
 fn sadish_version(): i64 {
-    return 900;
+    return 1100;
 }
