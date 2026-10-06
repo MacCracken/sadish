@@ -209,3 +209,13 @@ closed when its remaining item landed in **rekha 0.4.3** (the adoption this repo
 estimate is exact across all 2,620 LiberationSans glyphs). ⚠ Archived is not deleted — a filing is
 the record of what was measured, and the measurement outlives the bug. What remains open is in this
 file, not in a filing.
+
+## Recorded by cyrius 6.6.17 (2026-10-05) — for the next cyrius pin move
+
+⛔ **Nothing to do until cyrius 6.6.17 is tagged and out.** Docs-only note from the cyrius 6.6.17 lanes; each item
+is this repo's to adopt when it pins ≥ 6.6.17. Nothing here gates a cyrius release.
+
+- **`cyrius coverage` can count the RUN programs from 6.6.17** (cyrius m7, P5-A): `[coverage] programs =
+  ["programs/*_test.cyr"]` in cyrius.cyml (or `cyrius coverage --programs <glob>`) adds them to the corpus,
+  and `--per-entry` names which program references which public fn. ⚠ TEXT coverage (references, as `.tcyr`
+  corpora get) — not execution coverage, which is cyrius P5-B (v6.7.x).
