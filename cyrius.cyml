@@ -5,7 +5,7 @@ description = "sadish (सदिश — vector) — pure-Cyrius low-level 2D vec
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sadish"
 language = "cyrius"
-cyrius = "6.7.9"
+cyrius = "6.7.18"
 
 # sadish is a library — no CLI binary. `cyrius build` targets a smoke
 # program that links the full include chain to prove lib.cyr parses clean.
@@ -78,6 +78,10 @@ stdlib = [
 
 # `cyrius coverage` reads tests/**/*.tcyr by default and this repo has none,
 # so without this it reports 0/155. Every RUN suite is a coverage entry.
-# ⚠ TEXT coverage — which public fns a suite NAMES, not what it executes.
+# `programs` is TEXT coverage: which public fns a suite NAMES (143/155).
+# `exec` (cyrius 6.7.10) builds each suite instrumented, runs it, and counts
+# the fns it actually ENTERED (153/155). It runs all 35 suites, so a bare
+# `cyrius coverage` takes seconds now. A failing suite fails it.
 [coverage]
 programs = ["programs/*_test.cyr"]
+exec = ["programs/*_test.cyr"]

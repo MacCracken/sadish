@@ -5,6 +5,71 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.1] - 2026-10-29 — the 6.7.18 pin, and what execution coverage found
+
+A patch release: **no API, no ABI, no rendering change.** The toolchain pin moves 6.7.9 → 6.7.18 and
+`lib/` is re-resolved: the same 25 files, every one byte-identical to the 6.7.18 store, 18 of them
+changed since 6.7.9. No source line changed for the bump beyond the version probe
+(`sadish_version()` → 1201). The sidecar is unchanged (`syscalls`, `alloc`, `string`). 35 RUN suites
+green; `lint`, `vet`, `fmt` and `distlib --check` clean; the aarch64 + AGNOS cross-builds clean. The
+host build prints no warning at all.
+
+⛔ **Output does not move.** The 152-measurement oracle, rebuilt under 6.7.18, diffs to **zero**
+against 6.7.9 and against 6.6.6. The 35 suites' output is identical, and builds stay
+byte-deterministic (one program built twice, same hash).
+
+**The migration notes for 6.7.10 – 6.7.18 were read in full against this tree.** They run to about
+6,700 lines, nine releases of the language minor. The build proves nothing 6.7.18 *refuses* is
+here. The notes were read for what it *compiles with a different meaning*. VERIFIED, none reaches
+sadish. The near-misses, each checked against the source rather than argued:
+- 6.7.13 MV-17: a `: (T1, T2)` fn that falls off its end now returns zeros. sadish has 4 such fns,
+  and every one ends in an unconditional `return (a, b);`.
+- 6.7.15 FE-13 / FE-15 and 6.7.12 FX-6: a global declared twice now takes the later constant from
+  program start, or warns. No global sadish declares is declared twice, in `src/`, in any program,
+  or against the stdlib.
+- 6.7.16 FE-16: enum members need a separator, and `cyrius lint` refuses them without one. Every
+  `SadishErrCode` member already ends in `;`.
+- 6.7.14 RC-10, 6.7.15 RC-10 and 6.7.16 ST-6: `callptr` results change for a known `&f` callee
+  typed `: f64` or `: *T`. sadish's one `callptr` takes its callee from a variable, which every one
+  of those notes leaves as "still a word".
+- 6.7.11 TL-3: `cyrius lint` now warns when a `syscall(1, fd, "…", N)` length is not the literal's
+  byte count. Lint is clean, so every such length in the tree is right.
+- 6.7.14 PL-6: the aarch64 "raw syscall" warning now reaches into included files, which is the
+  string CI's cross gate fails on. The `--aarch64` build prints none.
+
+⚠ **One reported finding was wrong, and it is recorded so nobody repeats it.** `programs/dash_test.cyr`
+is the only suite with no top-level `main()` call, which reads as a suite that never runs. It does
+run: cyrius calls a program's `main` itself when nothing else is at the top level, and passes its
+return through as the exit code. MEASURED: a 3-line program returning 7 exits 7, and dash_test
+with one check broken exits **1** with `check failed at #1`. The suite is a working gate.
+
+### Added — `[coverage] exec`: 153 of 155 public fns run
+
+0.11.3 made `cyrius coverage` count which public fns the suites *name* (143/155). From 6.7.10
+`[coverage] exec = ["programs/*_test.cyr"]` also builds every suite instrumented, runs it, and counts
+the fns it *entered*: **153 of 155 (98%)**, across 35 runs, 0 failed, in about 12 s. MEASURED: a
+failing suite fails `cyrius coverage` by name (exit 1, `1 of 1 corpus run(s) failed`), so the
+report cannot pass over a red suite. It is reported only. No `--min` floor gates CI.
+
+⭐ **The two that never run have no callers at all.** `sd_ray_cross` (`src/raster.cyr`) and
+`sd_pt_mid` (`src/path.cyr`) are called from nowhere in `src/` or `programs/`. Text coverage could
+not see this. `sd_pt_mid`'s header already says it is kept deliberately. `sd_ray_cross`'s says
+nothing. Both ship in the bundle, so whether they are a contract is now a question for the 1.0
+freeze in the roadmap.
+
+### Measured — what the pin costs
+
+| | 6.7.9 | 6.7.18 | |
+|---|---:|---:|---|
+| smoke, `CYRIUS_DCE=1` (CI's build) | 22,936 | **18,864** | **−17.8%** |
+| all 36 `programs/*.cyr` (no DCE) | 9,777,536 | 9,892,968 | +1.2% |
+| smoke, `--aarch64` | 334,136 | 334,168 | +32 B |
+| smoke, `--agnos` | 273,152 | 277,392 | +1.6% |
+| the oracle, median of 11 interleaved runs (6.6.6: 41.0) | 41.6 ms | 41.6 ms | unchanged |
+
+⚠ The DCE shrink is consistent with 6.7.14's dead-code notes ("a `CYRIUS_DCE=1` binary can
+shrink"). Which change produced it is **UNKNOWN**: it was not bisected across the nine releases.
+
 ## [0.12.0] - 2026-10-29 — the 6.7.9 pin: onto cyrius's language minor, and nothing moved
 
 The toolchain pin moves 6.6.20 → 6.7.9, which takes sadish onto cyrius's 6.7 line: the release
