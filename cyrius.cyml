@@ -5,7 +5,7 @@ description = "sadish (सदिश — vector) — pure-Cyrius low-level 2D vec
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/sadish"
 language = "cyrius"
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 # sadish is a library — no CLI binary. `cyrius build` targets a smoke
 # program that links the full include chain to prove lib.cyr parses clean.
@@ -70,3 +70,14 @@ stdlib = [
     "assert",
     "bench",
 ]
+# ⚠ This is what THIS repo's build vendors, not what a consumer inherits.
+# Since cyrius 6.6.18 `cyrius distlib` derives dist/sadish.deps by compiling
+# the bundle alone, and it names 3 leaves: syscalls, alloc, string. A
+# consumer that calls fmt/vec/str/io itself declares them in its own
+# [deps] stdlib.
+
+# `cyrius coverage` reads tests/**/*.tcyr by default and this repo has none,
+# so without this it reports 0/155. Every RUN suite is a coverage entry.
+# ⚠ TEXT coverage — which public fns a suite NAMES, not what it executes.
+[coverage]
+programs = ["programs/*_test.cyr"]

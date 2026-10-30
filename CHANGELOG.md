@@ -5,6 +5,85 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.3] - 2026-10-29 — the 6.6.20 pin: nothing moved, and the sidecar stops over-reporting
+
+A patch release: **no API, no ABI, no rendering change.** The toolchain pin moves 6.6.6 → 6.6.20 and
+`lib/` is re-resolved against it — 25 files, every one byte-identical to the 6.6.20 store (24 at
+6.6.6; `poison.cyr` joins, included by 6.6.20's `alloc.cyr`). No source line changed for the bump
+beyond the version probe (`sadish_version()` → 1103). 35 RUN suites
+green; `lint`, `vet`, `fmt` and `distlib --check` clean; the aarch64 + AGNOS cross-builds clean.
+
+⛔ **Output does not move, and that is measured rather than argued.** A toolchain move cannot use the
+hash proof a source refactor gets — all 36 built binaries differ, as they must with a new compiler
+and a new stdlib — so the proof is output instead. A 152-measurement oracle, built once per toolchain
+from the same source, diffs to **zero** between 6.6.6 and 6.6.20. It covers fills (both rules ×
+both AA engines × three paths), the plain stroker, styled strokes and dashes across all 3 caps × 3
+joins, clip rect + path + union, gradient paint (3 kinds × 4 spreads, the last under a rotation)
+into both an opaque and a premultiplied sink, pattern paint (4 spreads + a scale-and-flip matrix),
+coverage blits, a flattened polyline's points and verdict, a transformed path's bounds, a CORDIC
+sweep and `sd_isqrt`. The 35 suites' output is identical too. Builds stay byte-deterministic under
+6.6.20 (one program built twice, same hash).
+
+**The pre-flight against cyrius's migration notes for 6.6.7 – 6.6.20 is clean, item by item.**
+VERIFIED, not assumed:
+- 6.6.20 binds every call to a redefined fn's LAST definition. **Zero** fns are defined twice across
+  `src/` and `lib/`, and no program defines a fn the library also defines.
+- 6.6.20 reserves `sizeof`, `mulh64` and `fncall0`..`fncall8`. **Zero** uses.
+- 6.6.16 makes a named struct argument over 8 bytes a copy. **Zero** `struct` declarations.
+- 6.6.13 turns `f64_le` / `f64_ge` / `f64_trunc` into builtins. sadish vendors no `math.cyr`.
+
+### Changed — `dist/sadish.deps` is compile-verified: 9 leaves → 3
+
+Through 0.11.2 the sidecar was `[deps] stdlib` copied verbatim: `string fmt alloc vec str io
+syscalls assert bench`. That included the two **test-only** leaves, `assert` and `bench`, which
+then reached every consumer. Since cyrius 6.6.18 `cyrius distlib` derives the sidecar only by
+compiling the bundle alone on six targets, and what the bundle actually needs is **`syscalls`,
+`alloc`, `string`**. The bundle gains the matching compile-verified requires block, so
+`include "dist/sadish.cyr"` compiles alone.
+⛔ **This was not optional at the new pin.** MEASURED: 6.6.20's `distlib --check` reads the 0.11.2
+bundle as STALE ("predates cyrius 6.6.18's requires block"), so moving the pin without regenerating
+would have failed CI.
+⚠ **Downstream:** a consumer that relied on sadish's sidecar for `fmt`, `vec`, `str`, `io`,
+`assert` or `bench` now declares them in its own `[deps] stdlib`. VERIFIED for dhancha: its
+manifest already declares all six itself, so moving to this tag costs it nothing.
+
+### Added — `cyrius.lock` is tracked, and CI gates it
+
+Since cyrius 6.6.9 `cyrius deps` writes a lock for a stdlib-only project too. It is committed now,
+as rekha's is. CI's "Resolve dependencies" step does a clean resolve and **fails if the committed
+lock differs**. ⚠ Without that diff, CI's own `cyrius deps` would quietly overwrite a lock a pin move
+left stale, and nothing would report it.
+The dist gate widens from `dist/sadish.cyr` to all of `dist/`: the sidecar is now a
+compile-verified contract every consumer inherits, so a stale one matters as much as a stale bundle.
+
+### Added — `[coverage] programs`: `cyrius coverage` reads 0% → 92%
+
+`cyrius coverage` only reads `tests/**/*.tcyr`, and this repo has none, so it reported **0/155**.
+From 6.6.17 `[coverage] programs = ["programs/*_test.cyr"]` adds the RUN suites to its input, and
+it now reports **143/155 public fns referenced (92%)**. The 12 unreferenced fns are all internal
+building blocks that the suites exercise only through a caller: `sd_fill_impl`,
+`sd_fill_edges_from`, `sd_ray_cross`, `sd_span_add`, `sd_stroke_run`, `sd_cordic`,
+`sd_cordic_atan`, `sd_fixed_div`, `sd_pt_mid`, `sd_ppm_header`, `sd_ppm_put_dec`,
+`sadish_err_name`.
+⚠ **Text coverage**: it counts whether a suite names a fn, not whether the fn runs (execution
+coverage is cyrius's 6.7.x work). It is reported only. No `--min` floor gates CI.
+
+### Measured — what the pin costs in bytes and time
+
+| | 6.6.6 | 6.6.20 | |
+|---|---:|---:|---|
+| smoke, `CYRIUS_DCE=1` (CI's build) | 17,528 | 22,928 | +5,400 B |
+| smoke, no DCE | 230,520 | 256,400 | +11.2% |
+| all 36 `programs/*.cyr` | 8,972,384 | 9,773,152 | +8.9% |
+| smoke, `--aarch64` | 463,912 | 334,136 | −28.0% |
+| smoke, `--agnos` | 234,480 | 273,136 | +16.5% |
+| the oracle, median of 9 interleaved runs | 40.9 ms | 40.5 ms | within noise |
+
+⚠ **UNKNOWN which half of the toolchain the size change belongs to**, the compiler or the stdlib it
+vendors (`alloc.cyr` alone changed by 199 lines). Building 6.6.6's `lib/` under the 6.6.20 compiler
+to separate them does not work, because `cyrius build` re-vendors `lib/` at the moved pin first.
+Runtime did not move.
+
 ## [0.11.2] - 2026-09-20 — the optimization half: 8.5x on a styled stroke, 8.0x on a mapped pattern
 
 0.11.1 repaired the audit's correctness findings and deferred its performance ones. This is those,

@@ -1,10 +1,10 @@
 # sadish roadmap
 
-**Where we are:** 0.11.2. 35 RUN suites green; `fmt`, `lint`, `vet` and `distlib --check` clean;
-`dist/sadish.cyr` in sync; toolchain pinned to **6.6.6**; the host build diagnostic-free and the
-aarch64 + AGNOS cross-builds gated. agnos's `tests/gpu/refagree.cyr` holds the default fill
-byte-identical across 200 random paths — green through every release since 0.6.0, and the standing
-proof that a change did not move a pixel.
+**Where we are:** 0.11.3. 35 RUN suites green; `fmt`, `lint`, `vet` and `distlib --check` clean;
+`dist/` in sync and `cyrius.lock` gated; toolchain pinned to **6.6.20**; the host build
+diagnostic-free and the aarch64 + AGNOS cross-builds gated. agnos's `tests/gpu/refagree.cyr` holds
+the default fill byte-identical across 200 random paths — green through every release since 0.6.0,
+and the standing proof that a change did not move a pixel.
 
 ⛔ **THIS FILE IS WHAT IS LEFT, NOT WHAT WAS DONE.** Finished work is deleted from here once
 [`../../CHANGELOG.md`](../../CHANGELOG.md) carries its measurements and a source header carries its
@@ -36,6 +36,7 @@ The measurements and contracts live in [`../../CHANGELOG.md`](../../CHANGELOG.md
 | v0.11.0 | pattern paint + `SD_SPREAD_NONE`; `docs/api.md`; the `/dev/fb0` device line gated |
 | v0.11.1 | the audit release — four crashes, a heap overflow, a size-wrap and a non-terminating rotate |
 | v0.11.2 | the optimization half — 8.5x a styled stroke, 8.0x a mapped pattern, a quadratic sort made linear |
+| v0.11.3 | the 6.6.20 pin — output unchanged across 152 measurements; a 3-leaf compile-verified sidecar; a tracked, gated `cyrius.lock` |
 
 ---
 
@@ -171,8 +172,9 @@ formatter would still rewrite, while `cyrius audit`'s fmt stage fails them. CI f
 lets `git diff --exit-code` report.
 
 **Resolve `lib/` with `cyrius deps`, not `cyrius update`.** `deps` vendors the 9 declared stdlib
-leaves plus their transitive peers — 24 files, which is what `.gitignore` and CI describe. `update`
-vendors the whole 111-file snapshot: same versions, wrong shape.
+leaves plus their transitive peers — 25 files at 6.6.20 (24 at 6.6.6; `alloc.cyr` now includes
+`poison.cyr`), which is what `.gitignore` and CI describe, and `cyrius.lock` records and CI gates.
+`update` vendors the whole store snapshot: same versions, wrong shape.
 
 **`open` and `ioctl` stay raw in `src/present.cyr`; do NOT "finish" the syscall sweep.** 0.9.1
 replaced `1`/`3`/`8` with `SYS_WRITE` / `SYS_CLOSE` / `SYS_LSEEK` at 11 sites. The other two have no
@@ -210,12 +212,3 @@ estimate is exact across all 2,620 LiberationSans glyphs). ⚠ Archived is not d
 the record of what was measured, and the measurement outlives the bug. What remains open is in this
 file, not in a filing.
 
-## Recorded by cyrius 6.6.17 (2026-10-05) — for the next cyrius pin move
-
-⛔ **Nothing to do until cyrius 6.6.17 is tagged and out.** Docs-only note from the cyrius 6.6.17 lanes; each item
-is this repo's to adopt when it pins ≥ 6.6.17. Nothing here gates a cyrius release.
-
-- **`cyrius coverage` can count the RUN programs from 6.6.17** (cyrius m7, P5-A): `[coverage] programs =
-  ["programs/*_test.cyr"]` in cyrius.cyml (or `cyrius coverage --programs <glob>`) adds them to the corpus,
-  and `--per-entry` names which program references which public fn. ⚠ TEXT coverage (references, as `.tcyr`
-  corpora get) — not execution coverage, which is cyrius P5-B (v6.7.x).

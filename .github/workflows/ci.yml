@@ -31,14 +31,22 @@ jobs:
             CYRIUS_VERSION="$CYRIUS_VERSION" sh
           echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
 
-      - name: Resolve dependencies
+      - name: Resolve dependencies (lock gate)
         # `cyrius deps` copies the [deps].stdlib modules from the installed
         # toolchain into lib/. sadish is a pure-Cyrius leaf — no external libs.
         # Never symlink lib/ to a cyrius checkout (cross-repo writes).
+        # ⛔ The committed cyrius.lock must equal a clean resolve. `cyrius deps`
+        # rewrites it, so without the diff a lock left behind by a pin move
+        # would be silently replaced here and never caught.
         run: |
           rm -rf lib
           mkdir lib
           cyrius deps
+          if ! git diff --exit-code -- cyrius.lock; then
+            echo "ERROR: cyrius.lock does not match a clean resolve. Run 'rm -rf lib && mkdir lib && cyrius deps' and commit cyrius.lock."
+            exit 1
+          fi
+          echo "cyrius.lock matches a clean resolve"
 
       - name: Lint
         # Hard gate: any `warn` line (warning or untracked-deferral) fails CI.
@@ -78,14 +86,17 @@ jobs:
         run: cyrius vet programs/smoke.cyr
 
       - name: Verify dist bundle is in sync with src/
+        # The whole of dist/, not only the bundle: since cyrius 6.6.18
+        # dist/sadish.deps is compile-verified and is what every consumer
+        # inherits, so a stale sidecar matters as much as a stale bundle.
         run: |
           cyrius distlib
-          if ! git diff --quiet dist/sadish.cyr; then
-            echo "ERROR: dist/sadish.cyr is stale. Run 'cyrius distlib' and commit the result."
-            git --no-pager diff dist/sadish.cyr | head -40
+          if ! git diff --quiet -- dist/; then
+            echo "ERROR: dist/ is stale. Run 'cyrius distlib' and commit the result."
+            git --no-pager diff -- dist/ | head -40
             exit 1
           fi
-          echo "dist/sadish.cyr matches src/"
+          echo "dist/ matches src/"
 
       - name: Build (link-check, DCE on)
         run: |

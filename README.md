@@ -1,6 +1,6 @@
 # sadish
 
-Version: 0.11.2
+Version: 0.11.3
 
 **sadish** (सदिश — *sa* "with" + *diś* "direction" = "having direction":
 the modern Sanskrit/Hindi word for **vector**; antonym अदिश *adish* =
@@ -30,7 +30,7 @@ opt-in exact 2-axis coverage engine — on an allocation seam a consumer can poi
 own arena. Since 0.10.0 a fill, and a styled or dashed stroke, draw through that seam
 **without allocating at all**.
 
-Current release **0.11.2**. The full API — 129 public functions, and the six
+Current release **0.11.3**. The full API — 129 public functions, and the six
 cross-cutting rules most consumer bugs come from — is in
 [`docs/api.md`](./docs/api.md). What shipped in each version is in
 [`CHANGELOG.md`](./CHANGELOG.md); what is left, and what 1.0 still needs, is in
@@ -75,7 +75,8 @@ bounded fills as of **v0.7.2**; exact-size piece paths and a self-describing
 polyline as of **v0.8.0**; inline path points as of **v0.9.0**; portable syscall
 constants and an aarch64 + AGNOS cross-build gate as of **v0.9.1**; inline POLYLINE
 points, `sd_path_transform` and `sd_path_bounds` as of **v0.10.0**; pattern paint and
-an API reference as of **v0.11.0**; audited and hardened as of **v0.11.1**; optimized as of **v0.11.2**.
+an API reference as of **v0.11.0**; audited and hardened as of **v0.11.1**; optimized as of **v0.11.2**;
+on the cyrius 6.6.20 toolchain as of **v0.11.3**.
 ⚠ **v0.10.0 is an ABI break.** A consumer reading a flattened polyline through
 `sd_point_x(load64(sd_polyline_points(pl) + i * 8))` must move to
 `sd_polyline_point_x(pl, i)` / `_y` — the old spelling reads a coordinate as an
@@ -85,10 +86,15 @@ address. See [`CHANGELOG.md`](./CHANGELOG.md).
 
 - **Cyrius stdlib** — `string`, `fmt`, `alloc`, `io`, `vec`, `str`,
   `syscalls`, `assert`, `bench`. No external crate deps — sadish is a
-  leaf. Resolved by `cyrius deps` into `lib/`.
+  leaf. Resolved by `cyrius deps` into `lib/`, and locked in `cyrius.lock`.
+
+That list is what this repo builds with. A consumer inherits less: the
+compile-verified sidecar `dist/sadish.deps` names `syscalls`, `alloc` and
+`string` only, so a consumer that calls `fmt`, `vec`, `str` or `io` itself
+declares those in its own `[deps] stdlib`.
 
 All deps are pinned in `cyrius.cyml`; the toolchain pin is
-`cyrius = "6.6.6"`.
+`cyrius = "6.6.20"`.
 
 ## Quick Start
 
