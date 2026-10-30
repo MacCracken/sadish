@@ -1,7 +1,7 @@
 # sadish roadmap
 
-**Where we are:** 0.11.3. 35 RUN suites green; `fmt`, `lint`, `vet` and `distlib --check` clean;
-`dist/` in sync and `cyrius.lock` gated; toolchain pinned to **6.6.20**; the host build
+**Where we are:** 0.12.0. 35 RUN suites green; `fmt`, `lint`, `vet` and `distlib --check` clean;
+`dist/` in sync and `cyrius.lock` gated; toolchain pinned to **6.7.9**; the host build
 diagnostic-free and the aarch64 + AGNOS cross-builds gated. agnos's `tests/gpu/refagree.cyr` holds
 the default fill byte-identical across 200 random paths — green through every release since 0.6.0,
 and the standing proof that a change did not move a pixel.
@@ -37,6 +37,7 @@ The measurements and contracts live in [`../../CHANGELOG.md`](../../CHANGELOG.md
 | v0.11.1 | the audit release — four crashes, a heap overflow, a size-wrap and a non-terminating rotate |
 | v0.11.2 | the optimization half — 8.5x a styled stroke, 8.0x a mapped pattern, a quadratic sort made linear |
 | v0.11.3 | the 6.6.20 pin — output unchanged across 152 measurements; a 3-leaf compile-verified sidecar; a tracked, gated `cyrius.lock` |
+| v0.12.0 | the 6.7.9 pin — onto cyrius's 6.7 language line with no source change; output unchanged; the lock gated by `deps --locked` |
 
 ---
 
@@ -172,8 +173,9 @@ formatter would still rewrite, while `cyrius audit`'s fmt stage fails them. CI f
 lets `git diff --exit-code` report.
 
 **Resolve `lib/` with `cyrius deps`, not `cyrius update`.** `deps` vendors the 9 declared stdlib
-leaves plus their transitive peers — 25 files at 6.6.20 (24 at 6.6.6; `alloc.cyr` now includes
-`poison.cyr`), which is what `.gitignore` and CI describe, and `cyrius.lock` records and CI gates.
+leaves plus their transitive peers — 25 files at 6.6.20 and 6.7.9 (24 at 6.6.6; `alloc.cyr` now
+includes `poison.cyr`), which is what `.gitignore` and CI describe, and `cyrius.lock` records and CI
+gates.
 `update` vendors the whole store snapshot: same versions, wrong shape.
 
 **`open` and `ioctl` stay raw in `src/present.cyr`; do NOT "finish" the syscall sweep.** 0.9.1

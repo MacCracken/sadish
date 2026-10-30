@@ -5,6 +5,55 @@ All notable changes to sadish are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-10-29 — the 6.7.9 pin: onto cyrius's language minor, and nothing moved
+
+The toolchain pin moves 6.6.20 → 6.7.9, which takes sadish onto cyrius's 6.7 line: the release
+series where the language itself changes meaning (`!`, `true` / `false`, `const`, `trait`, `do`
+and `dyn` reserved or made real, typed-pointer arithmetic, struct values). That move is why this is a
+minor. **sadish's own API and ABI do not change**, and no source line changed for the bump beyond
+the version probe (`sadish_version()` → 1200). `lib/` is re-resolved: the same 25 files, every one
+byte-identical to the 6.7.9 store, 15 of them changed since 6.6.20. 35 RUN suites green; `lint`,
+`vet`, `fmt` and `distlib --check` clean; the aarch64 + AGNOS cross-builds clean. The host build
+prints no warning at all.
+
+⛔ **Output does not move.** The 152-measurement oracle from 0.11.3, rebuilt under 6.7.9, diffs to
+**zero** against both 6.6.20 and 6.6.6. The 35 suites' output is identical, and builds stay
+byte-deterministic (one program built twice, same hash).
+
+**The 6.7.0 – 6.7.9 migration notes were checked against the source, not just the build.** A build
+catches what 6.7 refuses. It cannot catch what 6.7 compiles **with a different meaning**, so those
+items were searched for, comments and string literals stripped. VERIFIED, zero sites each:
+- 6.7.3: a lone `!` was **silently dropped by the lexer** before 6.7.3, so `if (!ok)` meant
+  `if (ok)`. **Zero** `!` outside `!=`. Nothing in sadish was relying on the dropped `!`.
+- 6.7.9: unary `-` / `~` on a constant now binds tighter than a following literal operator
+  (`-K + 10` was 15, is 5). **Zero** `~`, and **zero** unary `-` on a name: sadish spells a
+  negation `0 - x` throughout. Its one `enum`, `SadishErrCode`, is never negated.
+- 6.7.8 / 6.7.9: narrow `*T` dereference and operator results on typed pointers. **Zero** typed
+  pointers: sadish's pointers are untyped `i64` addresses read through `load64` / `store64`.
+- 6.7.0 / 6.7.2 / 6.7.3 / 6.7.5 / 6.7.8: `trait`, `const`, `true` / `false`, `do` and `dyn` are
+  reserved, and bool writes are checked. **Zero** uses of any of them, and **zero** `bool`
+  declarations.
+
+### Changed — CI's lock gate is `cyrius deps --locked`
+
+0.11.3's gate ran `cyrius deps` and then diffed the lock with git. 6.7.6 has a dedicated mode:
+`cyrius deps --locked` resolves, **writes nothing**, and fails naming every difference. MEASURED
+both ways. Against the right lock it exits 0 and leaves the file untouched. Against 0.11.3's 6.6.20
+lock it exits 1 with 16 named differences (15 file hashes and the pin row) and does not rewrite
+the stale file. ⚠ It does not vendor `lib/` either, so CI runs it first and then `cyrius deps`.
+
+### Measured — what the pin costs
+
+| | 6.6.20 | 6.7.9 | |
+|---|---:|---:|---|
+| smoke, `CYRIUS_DCE=1` (CI's build) | 22,928 | 22,936 | +8 B |
+| all 36 `programs/*.cyr` | 9,773,152 | 9,777,536 | +0.04% |
+| smoke, `--aarch64` | 334,136 | 334,136 | identical |
+| smoke, `--agnos` | 273,136 | 273,152 | +16 B |
+| the oracle, median of 9 interleaved runs (6.6.6: 42.4) | 42.6 ms | 42.5 ms | within noise |
+
+`cyrius coverage` still reads 143/155 public fns referenced.
+
 ## [0.11.3] - 2026-10-29 — the 6.6.20 pin: nothing moved, and the sidecar stops over-reporting
 
 A patch release: **no API, no ABI, no rendering change.** The toolchain pin moves 6.6.6 → 6.6.20 and

@@ -35,18 +35,16 @@ jobs:
         # `cyrius deps` copies the [deps].stdlib modules from the installed
         # toolchain into lib/. sadish is a pure-Cyrius leaf — no external libs.
         # Never symlink lib/ to a cyrius checkout (cross-repo writes).
-        # ⛔ The committed cyrius.lock must equal a clean resolve. `cyrius deps`
-        # rewrites it, so without the diff a lock left behind by a pin move
-        # would be silently replaced here and never caught.
+        # ⛔ The committed cyrius.lock must equal a clean resolve. `--locked`
+        # (cyrius 6.7.6) resolves, writes nothing, and fails naming every
+        # difference. It vendors nothing either, so `cyrius deps` runs after it
+        # to fill lib/. Without the gate, that `cyrius deps` would quietly
+        # rewrite a lock a pin move left stale.
         run: |
           rm -rf lib
           mkdir lib
+          cyrius deps --locked
           cyrius deps
-          if ! git diff --exit-code -- cyrius.lock; then
-            echo "ERROR: cyrius.lock does not match a clean resolve. Run 'rm -rf lib && mkdir lib && cyrius deps' and commit cyrius.lock."
-            exit 1
-          fi
-          echo "cyrius.lock matches a clean resolve"
 
       - name: Lint
         # Hard gate: any `warn` line (warning or untracked-deferral) fails CI.
